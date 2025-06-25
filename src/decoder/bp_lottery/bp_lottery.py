@@ -154,8 +154,12 @@ class create(torch.nn.Module):
         self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
 
         if self.random_machine.lower() == 'sobol':
-            sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-            self.r = sobol.draw(self.max_iter).to(self.device).to(self.dtype)
+            if self.dtype in {'float32', 'float64'}:
+                sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
+                self.r = sobol.draw(self.max_iter).to(self.device).to(self.dtype)
+            else: 
+                sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
+                self.r = sobol.draw(self.max_iter, dtype=torch.float32).to(self.device).to(self.dtype)
         
         logger.info(f'Complete.')
 

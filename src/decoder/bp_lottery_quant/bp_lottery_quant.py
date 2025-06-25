@@ -158,7 +158,13 @@ class create(torch.nn.Module):
 
         if self.random_machine.lower() == 'sobol':
             sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-            self.r = fp2fxp(sobol.draw(self.max_iter).to(self.device).to(self.dtype), self.intwidth, self.fracwidth)
+            if self.dtype in {'float32', 'float64'}:
+                self.r = sobol.draw(self.max_iter).to(self.device).to(self.dtype)
+                self.r = fp2fxp(self.r, self.intwidth, self.fracwidth)
+            else: 
+                self.r = sobol.draw(self.max_iter, dtype=torch.float32).to(self.device).to(self.dtype)
+                self.r = fp2fxp(self.r, self.intwidth, self.fracwidth)
+            
         
         logger.info(f'Complete.')
 

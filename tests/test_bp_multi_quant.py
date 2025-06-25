@@ -75,7 +75,7 @@ def main():
                     '-c=examples/alist/lz.check.yaml',
                     '-s=examples/alist/perfect.syndrome.yaml',
                     '-bs=100000',
-                    '-ss=1000000',
+                    '-te=1000',
                     '-o=examples/alist/output.yaml'
                 ]
                 print('Command: ', ' '.join(cmd))
