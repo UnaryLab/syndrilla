@@ -144,8 +144,8 @@ def generate_output(base_path: str):
     template_path = 'examples/alist/'
     generated_path = base_path
     
-    configuration_dict = template_path + 'output.yaml'
-    target_file = os.path.join(generated_path, 'output.yaml')
+    configuration_dict = template_path + 'save_error_llr.yaml'
+    target_file = os.path.join(generated_path, 'save_error_llr.yaml')
 
     # Read, and write
     config = read_yaml(configuration_dict)

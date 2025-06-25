@@ -15,7 +15,7 @@ from src.logical_check import create_check
 
 
 def test_batch_alist_hx(target_error=1000, batch_size=1000):
-    with open('examples/alist/output.yaml', 'r') as f:
+    with open('examples/alist/save_error_llr.yaml', 'r') as f:
         config = yaml.safe_load(f)
     save_error = config['output'].get('error_llr', False)
 

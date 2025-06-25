@@ -35,7 +35,7 @@ def main(decoder, batch_size, target_error, output_dir):
             f'-s={syndrome_yaml}',
             f'-bs={batch_size}',
             f'-te={target_error}',
-            f'-o={output_dir}'
+            f'-se={output_dir}'
         ]
 
         print('Command: ', ' '.join(cmd))
@@ -50,6 +50,6 @@ if __name__ == '__main__':
     decoder_list = ["bposd", "bp", "lottery_bp", "bp_quant", "lottery_bp_quant"]
     batch_size = 50000
     target_error = 1000
-    output_dir = 'examples/alist/output.yaml'
+    output_dir = 'examples/alist/save_error_llr.yaml'
     for decoder in decoder_list:
         main(decoder, batch_size, target_error, output_dir)

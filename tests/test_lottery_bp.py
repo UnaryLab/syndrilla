@@ -26,7 +26,7 @@ def test_batch_alist_hz(target_error=1000, batch_size=1000):
         '-s=examples/txt/perfect.syndrome.yaml',
         f'-bs={batch_size}',
         f'-te={target_error}',
-        '-o=examples/alist/output.yaml'
+        '-se=examples/alist/save_error_llr.yaml'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -48,7 +48,7 @@ def test_batch_alist_hz_quant(target_error=1000, batch_size=1000):
         '-s=examples/txt/perfect.syndrome.yaml',
         f'-bs={batch_size}',
         f'-te={target_error}',
-        '-o=examples/alist/output.yaml'
+        '-se=examples/alist/save_error_llr.yaml'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)

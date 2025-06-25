@@ -42,8 +42,8 @@ def parse_commandline_args():
                         help = 'The total number of error to stop.')
     parser.add_argument('-l', '--log_level', type=str, default='INFO',
                         help = 'Level of logger.')
-    parser.add_argument('-o', '--output_yaml', type=str, default='INFO',
-                        help = 'Path to save method yaml.')
+    parser.add_argument('-se', '--save_error_llr', type=str, default='INFO',
+                        help = 'Whether to save error llr.')
 
     return parser.parse_args()
 
@@ -77,7 +77,7 @@ def main():
     ascii_banner = pyfiglet.figlet_format('https://github.com/UNARY-Lab/syndrilla', font='term')
     print(bcolors.UNDERLINE + bcolors.Green + ascii_banner + bcolors.ENDC)
 
-    with open(args.output_yaml, 'r') as f:
+    with open(args.save_error_llr, 'r') as f:
         config = yaml.safe_load(f)
     save_error = config['output'].get('error_llr', False)
     logger.success(f'\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------')
@@ -102,6 +102,7 @@ def main():
 
     e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
+    llr_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
     
     converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
@@ -132,6 +133,7 @@ def main():
         if not save_error: 
             e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
+            llr_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
             
             converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
@@ -185,6 +187,7 @@ def main():
                 if decoder_idx + 1 < num_decoders:
                     converge_all[decoder_idx] = torch.cat((converge_all[decoder_idx+1], io_dict['converge']), dim=0)
                 decoder_idx += 1    
+            llr_all = torch.cat((llr_all, io_dict['llr']))
 
             logger.success(f'\n----------------------------------------------\nStep 8: Check logical error rate\n----------------------------------------------')
             if not save_error:        

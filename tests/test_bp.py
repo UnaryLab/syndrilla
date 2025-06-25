@@ -25,7 +25,7 @@ def test_batch_alist_hx(target_error=1000, batch_size=1000):
         '-s=examples/alist/perfect.syndrome.yaml',
         f'-bs={batch_size}',
         f'-te={target_error}',
-        '-o=examples/alist/output.yaml'
+        '-se=examples/alist/save_error_llr.yaml'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -47,7 +47,7 @@ def test_batch_alist_hz(target_error=1000, batch_size=1000):
         '-s=examples/alist/perfect.syndrome.yaml',
         f'-bs={batch_size}',
         f'-te={target_error}',
-        '-o=examples/alist/output.yaml'
+        '-se=examples/alist/save_error_llr.yaml'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -69,7 +69,7 @@ def test_batch_txt_hx(target_error=1000, batch_size=1000):
         '-s=examples/txt/perfect.syndrome.yaml',
         f'-bs={batch_size}',
         f'-te={target_error}',
-        '-o=examples/txt/output.yaml'
+        '-se=examples/txt/save_error_llr.yaml'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -92,7 +92,7 @@ def test_batch_txt_hz(target_error=1000, batch_size=1000):
         '-s=examples/txt/perfect.syndrome.yaml',
         f'-bs={batch_size}',
         f'-te={target_error}',
-        '-o=examples/txt/output.yaml'
+        '-se=examples/txt/save_error_llr.yaml'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)

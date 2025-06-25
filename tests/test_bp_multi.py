@@ -69,7 +69,7 @@ def main():
                 '-s=examples/alist/perfect.syndrome.yaml',
                 '-bs=100000',
                 '-te=1000',
-                '-o=examples/alist/output.yaml'
+                '-se=examples/alist/save_error_llr.yaml'
             ]
             print('Command: ', ' '.join(cmd))
             result = subprocess.run(cmd, capture_output=True, text=True)
