@@ -14,19 +14,19 @@ from src.metric import report_metric
 from src.logical_check import create_check
 
 
-def test_batch_alist_hz(sample_size=1000, batch_size=1000):    
-    decoder_yaml = 'examples/txt/lottery_bp_hz.decoder.yaml'
-    logical_check_yaml = 'examples/txt/lz.check.yaml'
+def test_batch_alist_hz(batch_size=1000, target_error=1000, save_error_llr=False):    
+    decoder_yaml = 'examples/alist/lottery_bp_hz.decoder.yaml'
+    logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
         f'-d={decoder_yaml}',
-        '-e=examples/txt/bsc.error.yaml',
+        '-e=examples/alist/bsc.error.yaml',
         f'-c={logical_check_yaml}',
-        '-s=examples/txt/perfect.syndrome.yaml',
+        '-s=examples/alist/perfect.syndrome.yaml',
         f'-bs={batch_size}',
-        f'-ss={sample_size}',
-        '-o=examples/alist/output.yaml'
+        f'-te={target_error}',
+        f'-se={save_error_llr}'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -36,19 +36,19 @@ def test_batch_alist_hz(sample_size=1000, batch_size=1000):
     print('STDERR:\n', result.stderr)
 
 
-def test_batch_alist_hz_quant(sample_size=1000, batch_size=1000):    
-    decoder_yaml = 'examples/txt/lottery_bp_hz_qaunt.decoder.yaml'
-    logical_check_yaml = 'examples/txt/lz.check.yaml'
+def test_batch_alist_hz_quant(batch_size=1000, target_error=1000, save_error_llr=False):    
+    decoder_yaml = 'examples/alist/lottery_bp_quant_hz.decoder.yaml'
+    logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
         f'-d={decoder_yaml}',
-        '-e=examples/txt/bsc.error.yaml',
+        '-e=examples/alist/bsc.error.yaml',
         f'-c={logical_check_yaml}',
-        '-s=examples/txt/perfect.syndrome.yaml',
+        '-s=examples/alist/perfect.syndrome.yaml',
         f'-bs={batch_size}',
-        f'-ss={sample_size}',
-        '-o=examples/alist/output.yaml'
+        f'-te={target_error}',
+        f'-se={save_error_llr}'
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -60,6 +60,7 @@ def test_batch_alist_hz_quant(sample_size=1000, batch_size=1000):
 
 if __name__ == '__main__':
     batch_size = 100000
-    sample_size = 1000000
-    test_batch_alist_hz(sample_size, batch_size)
-    test_batch_alist_hz_quant(sample_size, batch_size)
+    target_error = 1000
+    save_error_llr = False
+    test_batch_alist_hz(batch_size, target_error, save_error_llr)
+    test_batch_alist_hz_quant(batch_size, target_error, save_error_llr)

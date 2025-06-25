@@ -27,7 +27,7 @@ def modify_yaml(file_path, changes):
         yaml.safe_dump(config, f)
 
 
-def main():
+def main(batch_size, target_error, save_error_llr):
     # Paths to your YAML files (adjust to your actual paths)
     decoder_yaml = 'examples/alist/bp_hz.decoder.yaml'
     error_yaml   = 'examples/alist/bsc.error.yaml'
@@ -67,9 +67,9 @@ def main():
                 f'-e={error_yaml}',
                 '-c=examples/alist/lz.check.yaml',
                 '-s=examples/alist/perfect.syndrome.yaml',
-                '-bs=100000',
-                '-ss=1000000',
-                '-o=examples/alist/output.yaml'
+                f'-bs={batch_size}',
+                f'-te={target_error}',
+                f'-se={save_error_llr}'
             ]
             print('Command: ', ' '.join(cmd))
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -80,4 +80,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    batch_size = 100000
+    target_error = 1000
+    save_error_llr = False
+    main(batch_size, target_error, save_error_llr)

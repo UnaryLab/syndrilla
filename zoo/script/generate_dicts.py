@@ -33,6 +33,7 @@ def generate_decoder(base_path: str, code, type, distance, float, decoder):
             config['decoder']['max_iter'] = distance*2*(distance)
         config['decoder']['parity_matrix_hx'] = base_path + 'hx.matrix.yaml'
         config['decoder']['parity_matrix_hz'] = base_path + 'hz.matrix.yaml'
+        config['decoder']['logical_check_matrix'] = True
         config['decoder']['logical_check_lx'] = base_path + 'lx.matrix.yaml'
         config['decoder']['logical_check_lz'] = base_path + 'lz.matrix.yaml'
 
@@ -135,22 +136,6 @@ def generate_checker(base_path: str, type):
     write_yaml(target_file, config)
 
 
-def generate_output(base_path: str):
-    """
-        Generate output yaml file from examples
-    """
-    base_path = base_path if base_path.endswith('/') else base_path + '/'
-    template_path = 'examples/alist/'
-    generated_path = base_path
-    
-    configuration_dict = template_path + 'output.yaml'
-    target_file = os.path.join(generated_path, 'output.yaml')
-
-    # Read, and write
-    config = read_yaml(configuration_dict)
-    write_yaml(target_file, config)
-
-
 def main():
     logger.remove()
     base_dir = 'zoo/'
@@ -174,7 +159,6 @@ def main():
                                 generate_error(base_path, probability)
                                 generate_matrix(base_path, code, distance)
                                 generate_checker(base_path, type)
-                                generate_output(base_path)
                                 
 
 if __name__ == '__main__':

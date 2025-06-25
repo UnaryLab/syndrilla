@@ -1,7 +1,7 @@
-import torch
+import torch, yaml
 import re
 import sys, os, time
-import yaml
+import numpy as np
 import subprocess
 from loguru import logger
 
@@ -12,14 +12,9 @@ from src.error_model import create_error_model
 from src.syndrome import create_syndrome
 from src.metric import report_metric, compute_avg_metrics
 from src.logical_check import create_check
-from src.utils import call_func_from_yaml
 
 
-def test_batch_alist_hx(sample_size=1000, batch_size=1000):
-    with open('examples/alist/output.yaml', 'r') as f:
-        config = yaml.safe_load(f)
-    save_error = config['output'].get('error_llr', False)
-
+def test_batch_alist_hx(batch_size=1000, target_error=1000, save_error_llr=False):
     decoders = create_decoder(yaml_path='examples/alist/bposd_hx.decoder.yaml')
     
     num_decoders = len(decoders)
@@ -30,19 +25,21 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
     H_matrix = decoders[0].H_matrix
-    lx_matrix = decoders[0].lx_matrix
+    l_matrix = decoders[0].lx_matrix
 
-    num_batches = sample_size/batch_size
+    num_err = 0
+    num_batches = 0
     
     e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
+    llr_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
     
     converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     time_iter_all = [[] for _ in range(num_decoders)]
 
-    check = []
-    if not save_error:
+    check = [[]for _ in range(num_decoders)]
+    if not save_error_llr:
         total_time_all = [0.0 for _ in range(num_decoders)]
         average_time_sample_all = [0.0 for _ in range(num_decoders)]
         average_iter_all = [0.0 for _ in range(num_decoders)]
@@ -51,12 +48,20 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
         correction_acc_all = [0.0 for _ in range(num_decoders)]
         logical_error_rate_all = [0.0 for _ in range(num_decoders)]
         invoke_rate_all = [0.0 for _ in range(num_decoders)]
+    
+    error_model = create_error_model(yaml_path='examples/alist/bsc.error.yaml')
+
+    # create syndrome
+    syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
         
-    for _ in range(int(num_batches)): 
+    logical_check = create_check(yaml_path = './examples/alist/lx.check.yaml')
+        
+    while num_err < target_error:
         # create error
-        if not save_error: 
+        if not save_error_llr: 
             e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
+            llr_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
             
             converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
@@ -66,13 +71,11 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
         
         error_model = create_error_model(yaml_path='examples/alist/bsc.error.yaml')
         error_vector, error_dataloader = error_model.inject_error(zero_qubits, batch_size)
+        num_batches += 1
 
         avg_error_rate = torch.mean(torch.sum(error_vector, 1) / shape[1])
         logger.info(f'Specified error rate <{error_model.rate}>.')
         logger.info(f'Generated error rate <{avg_error_rate}>.')
-
-        # create syndrome
-        syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
 
         for err, llr, _ in error_dataloader:
             err = err.to(e_all.device)
@@ -99,6 +102,7 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
                 if decoder_idx + 1 < num_decoders:
                     converge_all[decoder_idx+1] = torch.cat((converge_all[decoder_idx+1], io_dict['converge']), dim=0)
                 decoder_idx += 1
+            llr_all = torch.cat((llr_all, io_dict['llr']))
 
             while decoder_idx < num_decoders:
                 # second decoder
@@ -112,12 +116,13 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
                     converge_all[decoder_idx+1] = torch.cat((converge_all[decoder_idx+1], io_dict['converge']), dim=0)
                 decoder_idx += 1              
 
-            if not save_error: 
-                logical_check = create_check(yaml_path = './examples/alist/lx.check.yaml')
-                check.append(logical_check.check(e_v_all[0], e_all, lx_matrix))
+            if not save_error_llr: 
+                check[0] = logical_check.check(e_v_all[0], e_all, l_matrix)
                 for i in range(1, num_decoders):
-                    check.append(logical_check.check_osd(e_v_all[i], e_all, lx_matrix, converge_all[i]))
-                # # report metric
+                    check[i] = logical_check.check_osd(e_v_all[i], e_all, l_matrix, converge_all[i])
+                num_err += int(torch.sum(check[num_decoders-1]))
+
+                # report metric
                 for i in range(num_decoders):
                     batch_total_time, batch_average_time_sample, batch_average_iter, batch_average_time_sample_iter, batch_data_qubit_acc, batch_correction_acc, batch_logical_error_rate, batch_invoke_rate = report_metric(e_all, e_v_all[i], iter_all[i], time_iter_all[i], check[i], converge_all[i], i)
                     total_time_all[i] += batch_total_time
@@ -128,13 +133,21 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
                     correction_acc_all[i] += batch_correction_acc
                     logical_error_rate_all[i] += batch_logical_error_rate
                     invoke_rate_all[i] += batch_invoke_rate
+            else:
+                if num_decoders > 1:
+                    logical_check_result = logical_check.check_osd(e_v_all[num_decoders-1], e_all, l_matrix, converge_all[num_decoders-1])
+                    num_err = int(torch.sum(logical_check_result))
+                else:
+                    logical_check_result = logical_check.check(e_v_all[0], e_all, l_matrix)
+                    num_err = int(torch.sum(logical_check_result))
+            logger.info(f'number of error exits up to current iteration {num_err}/{target_error}')
 
     all_metrics = []
-    if save_error:
+    if save_error_llr:
         logical_check = create_check(yaml_path = './examples/alist/lx.check.yaml')
-        check.append(logical_check.check(e_v_all[0], e_all, lx_matrix))
+        check[0] = logical_check.check(e_v_all[0], e_all, l_matrix)
         for i in range(1, num_decoders):
-            check.append(logical_check.check_osd(e_v_all[i], e_all, lx_matrix, converge_all[i]))
+            check[i] = logical_check.check_osd(e_v_all[i], e_all, l_matrix, converge_all[i])
         
         for i in range(num_decoders):
             total_time, average_time_sample, average_iter, average_time_sample_iter, data_qubit_acc, correction_acc, logical_error_rate, invoke_rate = report_metric(e_all, e_v_all[i], iter_all[i], time_iter_all[i], check[i], converge_all[i], i)
@@ -152,7 +165,7 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
     else:
         for i in range(num_decoders):
             total_time, average_time_sample, average_iter, average_time_sample_iter, data_qubit_acc, \
-                correction_acc, logical_error_rate, invoke_rate = compute_avg_metrics(sample_size, i, num_batches, total_time_all,
+                correction_acc, logical_error_rate, invoke_rate = compute_avg_metrics(target_error, i, num_batches, total_time_all,
                                                                                 average_time_sample_all,
                                                                                 average_iter_all,
                                                                                 average_time_sample_iter_all,
@@ -174,6 +187,7 @@ def test_batch_alist_hx(sample_size=1000, batch_size=1000):
 
 
 if __name__ == '__main__':
-    batch_size = 500
-    sample_size = 5000
-    test_batch_alist_hx(sample_size, batch_size)
+    batch_size = 100000
+    target_error = 100
+    save_error_llr = False
+    test_batch_alist_hx(batch_size, target_error, save_error_llr)

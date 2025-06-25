@@ -51,7 +51,7 @@ def report_metric(e_estimated, e_actual, iteration, time_iteration, check, conve
     else:
         correction_acc = 1 - float(num_error)/float(total_ones)
         logger.info(f'Correction accuracy: {correction_acc}')
-
+    
     if int(torch.sum(check)) == 0:
         logical_error_rate = 0
         logger.info(f'Output logical check error rate is {logical_error_rate}')
@@ -75,7 +75,7 @@ def report_metric(e_estimated, e_actual, iteration, time_iteration, check, conve
     return total_time, average_time_sample, average_iter, average_time_sample_iter, data_qubit_acc, correction_acc, logical_error_rate, invoke_rate
 
 
-def save_metric(out_dict, curr_dir, batch_size, sample_size, physical_error_rate):
+def save_metric(out_dict, curr_dir, batch_size, target_error, physical_error_rate):
     """
     Saves decoding metrics for all decoders into a single YAML file.
     
@@ -87,8 +87,11 @@ def save_metric(out_dict, curr_dir, batch_size, sample_size, physical_error_rate
 
     logger.info('Saving all decoding metrics to a YAML file.')
 
+    def float_representer(dumper, value):
+        return dumper.represent_scalar('tag:yaml.org,2002:float', f"{value:.17e}")
+
     def format_time(value):
-        return f'{float(value):.6f}(s)'
+        return f'{float(value):.17e}(s)'
 
     all_metrics_results = {}
 
@@ -112,24 +115,26 @@ def save_metric(out_dict, curr_dir, batch_size, sample_size, physical_error_rate
             'logical error rate': float(decoder_metrics['logical_error_rate']),
             'decoder invoke rate': float(decoder_metrics['invoke_rate'])
         }
+
     all_metrics_results['decoder_full'] = {
-    'total time (all decoders)': format_time(total_time_sum),
-    'final logical error rate': last_logical_error_rate,
-    'batch size': batch_size,
-    'sample size': sample_size,
-    'physical error rate': physical_error_rate
-}
+        'total time (all decoders)': format_time(total_time_sum),
+        'final logical error rate': last_logical_error_rate,
+        'batch size': batch_size,
+        'target error': target_error,
+        'physical error rate': physical_error_rate
+    }
 
     os.makedirs(curr_dir, exist_ok=True)  # Ensure directory exists
     output_path = os.path.join(curr_dir, f'result_phy_err_{physical_error_rate}.yaml')
 
+    yaml.add_representer(float, float_representer)
     with open(output_path, 'w') as f:
         yaml.safe_dump(all_metrics_results, f, sort_keys=False)
 
     logger.info(f'Saved all decoder metrics to: {output_path}')
 
 
-def compute_avg_metrics(sample_size, i, num_batches,
+def compute_avg_metrics(target_error, i, num_batches,
                         total_time_all,
                         average_time_sample_all,
                         average_iter_all,
@@ -147,7 +152,7 @@ def compute_avg_metrics(sample_size, i, num_batches,
     correction_acc = correction_acc_all[i] / num_batches
     logical_error_rate = logical_error_rate_all[i] / num_batches
     invoke_rate = invoke_rate_all[i] / num_batches
-    logger.info(f'Total time for <{sample_size}> samples: {total_time} seconds.')
+    logger.info(f'Total time for having <{target_error}> errors: {total_time} seconds.')
     logger.info(f'Average time per sample: {average_time_sample} seconds.')
     logger.info(f'Average iterations per sample: {average_iter}')
     logger.info(f'Average time per iteration per sample: {average_time_sample_iter}')

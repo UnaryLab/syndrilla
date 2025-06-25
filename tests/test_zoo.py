@@ -4,9 +4,10 @@ import re
 import csv
 import os
 import shutil
+import sys
 
 
-def main(decoder):
+def main(decoder, batch_size, target_error, save_error_llr):
     base_dir = f'zoo/{decoder}_sweeping'
     subdirs = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))])
 
@@ -32,9 +33,9 @@ def main(decoder):
             f'-e={error_yaml}',
             f'-c={check_yaml}',
             f'-s={syndrome_yaml}',
-            '-bs=100000',
-            '-ss=1000000',
-            '-o=examples/alist/output.yaml'
+            f'-bs={batch_size}',
+            f'-te={target_error}',
+            f'-se={save_error_llr}'
         ]
 
         print('Command: ', ' '.join(cmd))
@@ -47,6 +48,8 @@ def main(decoder):
 
 if __name__ == '__main__':
     decoder_list = ["bposd", "bp", "lottery_bp", "bp_quant", "lottery_bp_quant"]
-
+    batch_size = 50000
+    target_error = 1000
+    save_error_llr = False
     for decoder in decoder_list:
-        main(decoder)
+        main(decoder, batch_size, target_error, save_error_llr)

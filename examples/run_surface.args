@@ -1,1 +1,1 @@
--r=tests/test_outputs -d=examples/alist/lottery_bp_hz.decoder.yaml -e=examples/alist/bsc.error.yaml -c=examples/alist/lz.check.yaml -s=examples/alist/perfect.syndrome.yaml -o=examples/alist/output.yaml -bs=10000 -ss=20000
+-r=tests/test_outputs -d=examples/alist/lottery_bp_hz.decoder.yaml -e=examples/alist/bsc.error.yaml -c=examples/alist/lz.check.yaml -s=examples/alist/perfect.syndrome.yaml -se=false -bs=10000 -te=1000

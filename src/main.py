@@ -38,12 +38,12 @@ def parse_commandline_args():
                         help = 'Path to syndrome yaml.')
     parser.add_argument('-bs', '--batch_size', type=int, default=1000,
                         help = 'The number of samples run each batch.')
-    parser.add_argument('-ss', '--sample_size', type=int, default=1000,
-                        help = 'The total number of samples to run.')
+    parser.add_argument('-te', '--target_error', type=int, default=1000,
+                        help = 'The total number of error to stop.')
     parser.add_argument('-l', '--log_level', type=str, default='INFO',
                         help = 'Level of logger.')
-    parser.add_argument('-o', '--output_yaml', type=str, default='INFO',
-                        help = 'Path to save method yaml.')
+    parser.add_argument('-se', '--save_error_llr', type=str, default=False,
+                        help = 'Whether to save error llr.')
 
     return parser.parse_args()
 
@@ -77,9 +77,6 @@ def main():
     ascii_banner = pyfiglet.figlet_format('https://github.com/UNARY-Lab/syndrilla', font='term')
     print(bcolors.UNDERLINE + bcolors.Green + ascii_banner + bcolors.ENDC)
 
-    with open(args.output_yaml, 'r') as f:
-        config = yaml.safe_load(f)
-    save_error = config['output'].get('error_llr', False)
     logger.success(f'\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------')
     decoders = create_decoder(args.decoder_yaml)
     
@@ -97,17 +94,19 @@ def main():
     else:
         l_matrix = decoders[0].lz_matrix
 
-    num_batches = args.sample_size/args.batch_size
+    num_err = 0
+    num_batches = 0
 
     e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
+    llr_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
     
     converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     time_iter_all = [[] for _ in range(num_decoders)]
 
-    check = []
-    if not save_error:
+    check = [[]for _ in range(num_decoders)]
+    if not args.save_error_llr:
         total_time_all = [0.0 for _ in range(num_decoders)]
         average_time_sample_all = [0.0 for _ in range(num_decoders)]
         average_iter_all = [0.0 for _ in range(num_decoders)]
@@ -116,33 +115,38 @@ def main():
         correction_acc_all = [0.0 for _ in range(num_decoders)]
         logical_error_rate_all = [0.0 for _ in range(num_decoders)]
         invoke_rate_all = [0.0 for _ in range(num_decoders)]
+    
+    logger.success(f'\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------')
+    error_model = create_error_model(args.error_yaml)
+
+    logger.success(f'\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------')
+    syndrome_generator = create_syndrome(args.syndrome_yaml)
+
+    logger.success(f'\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------')
+    logical_check = create_check(args.logical_yaml)
         
-    for _ in range(int(num_batches)):
-        logger.success(f'\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------')
-        if not save_error: 
+    while num_err < args.target_error:
+        logger.success(f'\n----------------------------------------------\nStep 5: Generate error\n----------------------------------------------')
+        if not args.save_error_llr: 
             e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
+            llr_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
             
             converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
             time_iter_all = [[] for _ in range(num_decoders)]
- 
-        error_model = create_error_model(args.error_yaml)
         
         # create error
         zero_qubits = torch.zeros([args.batch_size, shape[1]], dtype=dtype)
         error_vector, error_dataloader = error_model.inject_error(zero_qubits, args.batch_size)
+        num_batches += 1
 
         avg_error_rate = torch.mean(torch.sum(error_vector, 1) / shape[1])
         logger.info(f'Specified error rate <{error_model.rate}>.')
         logger.info(f'Generated error rate <{avg_error_rate}>.')
-
-        logger.success(f'\n----------------------------------------------\nStep 3: Create sydrome generator\n----------------------------------------------')
-        syndrome_generator = create_syndrome(args.syndrome_yaml)
-
-        logger.success(f'\n----------------------------------------------\nStep 4: Decode\n----------------------------------------------')
         
         for err, llr, _ in error_dataloader:
+            logger.success(f'\n----------------------------------------------\nStep 6: Measure syndrome\n----------------------------------------------')
             # generate the syndrome for decoder
             err = err.to(e_all.device)
             e_all = torch.cat((e_all, err))
@@ -153,8 +157,9 @@ def main():
                 'llr0': llr,
                 'H_matrix': H_matrix
             }
+
+            logger.success(f'\n----------------------------------------------\nStep 7: Decode\n----------------------------------------------')
             decoder_idx = 0
-            
             if decoder_idx == 0:
             # first decoder
                 start_time = time.time()
@@ -178,17 +183,19 @@ def main():
                 iter_all[decoder_idx] = torch.cat((iter_all[decoder_idx], io_dict['iter']))
                 if decoder_idx + 1 < num_decoders:
                     converge_all[decoder_idx] = torch.cat((converge_all[decoder_idx+1], io_dict['converge']), dim=0)
-                decoder_idx += 1      
-            
-            if not save_error: 
-                logger.success(f'\n----------------------------------------------\nStep 5: Check logical error rate\n----------------------------------------------')
-                logical_check = create_check(yaml_path = './examples/alist/lx.check.yaml')
-                check.append(logical_check.check(e_v_all[0], e_all, l_matrix))
+                decoder_idx += 1    
+            llr_all = torch.cat((llr_all, io_dict['llr']))
+
+            logger.success(f'\n----------------------------------------------\nStep 8: Check logical error rate\n----------------------------------------------')
+            if not args.save_error_llr:        
+                check[0] = logical_check.check(e_v_all[0], e_all, l_matrix)
                 for i in range(1, num_decoders):
-                    check.append(logical_check.check_osd(e_v_all[i], e_all, l_matrix, converge_all[i]))
+                    check[i] = logical_check.check_osd(e_v_all[i], e_all, l_matrix, converge_all[i])
+                num_err += int(torch.sum(check[num_decoders-1]))
+                logger.info(f'number of error exits up to current iteration {num_err}/{args.target_error}')
 
                 # # report metric
-                logger.success(f'\n----------------------------------------------\nStep 6: Save log\n----------------------------------------------')
+                logger.success(f'\n----------------------------------------------\nStep 9: Save log\n----------------------------------------------')
                 for i in range(num_decoders):
                     batch_total_time, batch_average_time_sample, batch_average_iter, batch_average_time_sample_iter, batch_data_qubit_acc, batch_correction_acc, batch_logical_error_rate, batch_invoke_rate = report_metric(e_all, e_v_all[i], iter_all[i], time_iter_all[i], check[i], converge_all[i], i)
                     total_time_all[i] += batch_total_time
@@ -199,16 +206,23 @@ def main():
                     correction_acc_all[i] += batch_correction_acc
                     logical_error_rate_all[i] += batch_logical_error_rate
                     invoke_rate_all[i] += batch_invoke_rate
-    
+            else:
+                if num_decoders > 1:
+                    logical_check_result = logical_check.check_osd(e_v_all[num_decoders-1], e_all, l_matrix, converge_all[num_decoders-1])
+                    num_err = int(torch.sum(logical_check_result))
+                else:
+                    logical_check_result = logical_check.check(e_v_all[0], e_all, l_matrix)
+                    num_err = int(torch.sum(logical_check_result))
+                logger.info(f'number of error exits upto current iteration {num_err}/{args.target_error}')
+
     all_metrics = []
-    if save_error:
-        logger.success(f'\n----------------------------------------------\nStep 5: Check logical error rate\n----------------------------------------------')
-        logical_check = create_check(yaml_path = './examples/alist/lx.check.yaml')
-        check.append(logical_check.check(e_v_all[0], e_all, l_matrix))
+    if args.save_error_llr:
+        logger.success(f'\n----------------------------------------------\nStep 8: Check logical error rate\n----------------------------------------------')
+        check[0] = logical_check.check(e_v_all[0], e_all, l_matrix)
         for i in range(1, num_decoders):
-            check.append(logical_check.check_osd(e_v_all[i], e_all, l_matrix, converge_all[i]))
+            check[i] = logical_check.check_osd(e_v_all[i], e_all, l_matrix, converge_all[i])
         
-        logger.success(f'\n----------------------------------------------\nStep 6: Save log\n----------------------------------------------')
+        logger.success(f'\n----------------------------------------------\nStep 9: Save log\n----------------------------------------------')
         for i in range(num_decoders):
             total_time, average_time_sample, average_iter, average_time_sample_iter, data_qubit_acc, correction_acc, logical_error_rate, invoke_rate = report_metric(e_all, e_v_all[i], iter_all[i], time_iter_all[i], check[i], converge_all[i], i)
             metrics_dict = {
@@ -222,12 +236,14 @@ def main():
                 'logical_error_rate': logical_error_rate,
                 'invoke_rate': invoke_rate
             }
+            logger.info(f'average_time_sample check: {average_time_sample}')
+            logger.info(f'average_time_sample_iter check: {average_time_sample_iter}')
             all_metrics.append(metrics_dict)
     else:
-        logger.success(f'\n----------------------------------------------\nStep 6: Save Final log\n----------------------------------------------')
+        logger.success(f'\n----------------------------------------------\nStep 10: Save Final log\n----------------------------------------------')
         for i in range(num_decoders):
             total_time, average_time_sample, average_iter, average_time_sample_iter, data_qubit_acc, \
-                correction_acc, logical_error_rate, invoke_rate = compute_avg_metrics(args.sample_size, i, num_batches, total_time_all,
+                correction_acc, logical_error_rate, invoke_rate = compute_avg_metrics(args.target_error, i, num_batches, total_time_all,
                                                                                 average_time_sample_all,
                                                                                 average_iter_all,
                                                                                 average_time_sample_iter_all,
@@ -250,11 +266,10 @@ def main():
 
     logger.success(f'Saved log to <{output_log}>.')
 
-    logger.success(f'\n----------------------------------------------\nStep 7: Save metric results\n----------------------------------------------')
-    for i in range(num_decoders):
-        save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.sample_size, error_model.rate)
+    logger.success(f'\n----------------------------------------------\nStep 11: Save metric results\n----------------------------------------------')
+    save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.target_error, error_model.rate)
     
-    logger.success(f'Saved results to <{output_log}>.')
+    logger.success(f'Saved metric results to <{args.run_dir}>.')
 
 
 if __name__ == '__main__':
