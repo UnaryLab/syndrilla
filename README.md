@@ -21,7 +21,9 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
       - [2.3. Matrix module](#23-matrix-module)
       - [2.4. Decoder module](#24-decoder-module)
       - [2.5. Logical check module](#25-logical-check-module)
-      - [2.6. Metric module](#26-metric-module)
+      - [2.6. Interface module](#26-interface-module)
+      - [2.7. Vote module](#27-vote-module)
+      - [2.8. Metric module](#28-metric-module)
     - [3. Output format and metrics](#3-output-format-and-metrics)
       - [3.1. Per-decoder metrics](#31-per-decoder-metrics)
       - [3.2. Final metrics](#32-final-metrics)
@@ -44,6 +46,7 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
 6. Hardware awareness: support for **quantization** simulation
 7. Fine-grained measurement: support for a broad range of metrics, with **degeneracy errors** highlighted
 8. Multi-purpose: allowing researching **new codes, new decoders, new error models**, and beyond
+9. Circuit-level simulation: support Stim for **circuit-level modeling**, enabling fair and reproducible benchmarking across different decoders and noise models
 
 ## Installation
 All provided installation methods allow running ```syndrilla``` in the command line and ```import syndrilla``` as a python module.
@@ -154,7 +157,7 @@ syndrome:
 The following table details the configuration parameters used in the syndrome module YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
-| `syndrome.measure`| Model for syndrome measurement                       | `perfect`                     |
+| `syndrome.measure`| Model for syndrome measurement                       | `perfect` or `phenomenological`                    |
 
 
 #### 2.3. Matrix module
@@ -236,7 +239,30 @@ The following table provides a detailed explanation of the configuration paramet
 |------------------|---------------------------------------------------------------|---------------------------|
 | `check.check_type`| Method used on logical check computation                     | `lx` or `lz`                     |
 
-#### 2.6. Metric module
+#### 2.6. Interface module
+This module can be used with a quantum circuit simulator such as Stim to generate circuits that include various types of errors.
+An example configuration file using Stim is provided in ```stim_generated.interface.yaml```. (Using interface will cause other modules having different format, which will be shown on )
+```
+interface:
+  backend: stim
+  device:
+    device_type: cpu
+    device_idx: 0
+  dtype: float64
+```
+
+The following table provides a detailed explanation of the configuration parameters used in the check module YAML file.
+| Key              | Description                                                   | Example                   |
+|------------------|---------------------------------------------------------------|---------------------------|
+| `interface.backend`| The quantum circuit simulator is used            | `stim`                     |
+| `interface.device.device_type`| Type of the device where the output result will be processed           | `cpu` or `cude`                  |
+| `interface.device.device_idx`| The indice of the device where the output result will be processed           | `0`                     |
+| `interface.dtype`| The data type which the output result will be set as           | `0`                     |
+#### 2.7. Vote module
+This module does not take any YAML file as inputs, it will specified by ```-vs``` option. 
+For example, ```decoder_0``` will do the majority voting on the output result of first decoder.
+
+#### 2.8. Metric module
 This module does not take any YAML file as inputs, it will report default metrics as output, which will be described in the output.
 
 ### 3. Output format and metrics

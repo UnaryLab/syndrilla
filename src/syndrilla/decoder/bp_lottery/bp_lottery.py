@@ -4,8 +4,6 @@ from loguru import logger
 
 import numpy as np
 
-from syndrilla.matrix import create_parity_matrix
-from syndrilla.utils import compute_lz
 
 
 class create(torch.nn.Module):
@@ -35,7 +33,6 @@ class create(torch.nn.Module):
         super(create, self).__init__()
 
         logger.info(f'Creating lotterybp decoder.')
-
         # set up default device
         device_cfg = decoder_cfg.get('device', {})
         self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
@@ -76,28 +73,14 @@ class create(torch.nn.Module):
             logger.warning(f'Invalid input machine type <{self.random_machine}>, default to <sobol>.')
             self.random_machine = 'sobol'
 
-        # get the column and row index for all 1s in parity check matrix
-        logger.info(f'Creating hx parity check matrix.')
-        self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device, dtype=self.dtype)
-
-        logger.info(f'Creating hz parity check matrix.')
-        self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device, dtype=self.dtype)
-
-        if self.check_type.lower() == 'hx':
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hx_matrix.get_index()
-        else: 
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hz_matrix.get_index()
-
-        # compute lx, switch hx and hz position can compute lz
-        # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
-        logger.info(f'Creating lx and lz parity check matrix.')
-        logical_check_matrix =  decoder_cfg.get('logical_check_matrix', False)
-        if logical_check_matrix:
-            self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device, dtype=self.dtype).get_dense()
-            self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device, dtype=self.dtype).get_dense()
-        else:
-            self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
-            self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
+        bundle = kwargs.get('bundle')
+        if bundle is None:
+            raise ValueError('bp_lottery requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+        self.Hx_matrix = bundle.Hx_matrix
+        self.Hz_matrix = bundle.Hz_matrix
+        self.lx_matrix = bundle.lx_matrix
+        self.lz_matrix = bundle.lz_matrix
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
         
@@ -109,7 +92,8 @@ class create(torch.nn.Module):
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
         self.algo = 'bp_lottery'
-        
+        self.num_max_iter = self.max_iter
+
         logger.info(f'Complete.')
 
 
@@ -132,6 +116,7 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
+
         logger.info(f'Initializing lotterybp (normailized min sum) decoding.')
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
         
@@ -174,6 +159,7 @@ class create(torch.nn.Module):
 
         logger.info(f'Starting decoding iterations.')
 
+        flip_start_iter = 4
         self.i = 0
         while self.i < self.max_iter:
             self.i += 1
@@ -216,8 +202,9 @@ class create(torch.nn.Module):
                 })
                 return io_dict
             
-            l_v = self.sign_flip(syndrome, s_est, l_v)
-           
+            if self.i > flip_start_iter:
+                l_v = self.sign_flip_cn_rand_new(syndrome, s_est, l_v)
+
         checker = torch.where(num_iters == -1)[0]
         e_out[checker] = e_v[checker]
         l_out[checker] = l_v[checker]
@@ -313,4 +300,78 @@ class create(torch.nn.Module):
         
         l_v[valid_mask, selected_indices[valid_mask]] *= -1.0
         return l_v
-    
+
+    def sign_flip_cn_rand_new(self, syndrome, s_est, l_v):
+        # Syndrome Residual
+        synd_diff = (syndrome + s_est) % 2.0  # [B, M]
+        unsat_cn_mask = synd_diff.bool()
+        
+        batch_size, M = unsat_cn_mask.shape
+        
+        total_unsat = unsat_cn_mask.sum(dim=1)
+        valid_mask = total_unsat > 0 
+        
+        # random selection setup
+        if self.random_machine.lower() == 'system':
+            r = torch.rand(batch_size, device=self.device)
+        else: # sobol
+            r = self.r[(self.i-1)].repeat(batch_size)
+            
+        total_unsat_safe = total_unsat + (total_unsat == 0).float() 
+        
+        unsat_cumsum = unsat_cn_mask.cumsum(dim=1)
+        
+        # CN Selection: Random
+        rand_pos = torch.floor(r * total_unsat_safe).long() + 1
+        chosen_cn = ((unsat_cumsum >= rand_pos.unsqueeze(1)) & unsat_cn_mask).float() # [B, M]
+        chosen_cn_idx = torch.argmax(chosen_cn, dim=1) # [B]
+        
+        # VN Selection: 1. Unsat CN count priority ->  2. Min LLR priority
+        H_expanded = self.H_matrix.unsqueeze(0).expand(batch_size, -1, -1) # [B, M, N]
+        candidate_vn_mask = H_expanded[torch.arange(batch_size), chosen_cn_idx, :].bool()
+        
+        vn_unsat_counts = torch.matmul(unsat_cn_mask.float(), self.H_matrix.float())
+
+        llr = torch.abs(l_v[:, :-1]) # [B, N]
+        score = vn_unsat_counts * 1e6 - llr
+
+        masked_score = score + (~candidate_vn_mask).float() * -1e9
+        selected_vn = torch.argmax(masked_score, dim=1)
+        
+        l_v[valid_mask, selected_vn[valid_mask]] *= -1.0
+        
+        return l_v
+
+    def sign_flip_cn_random(self, syndrome, s_est, l_v):
+        # synd_diff: [B, M]
+        synd_diff = (syndrome + s_est) % 2.0
+        unsat_cn_mask = synd_diff.bool()  # [B, M]
+
+        batch_size, M = unsat_cn_mask.shape
+        
+        total_unsat = unsat_cn_mask.sum(dim=1)      # [B]
+        valid_mask = total_unsat > 0 
+
+        if self.random_machine.lower() == 'system':
+            r = torch.rand(batch_size, device=self.device)
+        elif self.random_machine.lower() == 'sobol':
+            r = self.r[(self.i-1)].repeat(batch_size)
+
+        unsat_cumsum = unsat_cn_mask.cumsum(dim=1)  # [B, M]
+        
+        total_unsat_safe = total_unsat + (~valid_mask).float()
+        
+        rand_pos = torch.floor(r * total_unsat_safe).long() + 1
+
+        chosen_cn = ((unsat_cumsum >= rand_pos.unsqueeze(1)) & unsat_cn_mask).float()
+        chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
+
+        cn_mask = self.H_matrix[chosen_cn_idx, :].bool() # [B, N]
+
+        llr = l_v[:, :-1]  # [B, N]
+        masked_llr = llr + (~cn_mask).float() * 1e9
+        selected_vn = torch.argmin(masked_llr, dim=1)
+
+        l_v[valid_mask, selected_vn[valid_mask]] *= -1.0
+
+        return l_v

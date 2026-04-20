@@ -1,0 +1,14 @@
+matrix:
+  parity_matrix_hx:
+    file_type: alist
+    path: examples/alist/surface/surface_9_hx.alist
+  parity_matrix_hz:
+    file_type: alist
+    path: examples/alist/surface/surface_9_hz.alist
+  logical_check_matrix: True
+  logical_check_lx:
+    file_type: alist
+    path: examples/alist/surface/surface_9_lx.alist
+  logical_check_lz:
+    file_type: alist
+    path: examples/alist/surface/surface_9_lz.alist

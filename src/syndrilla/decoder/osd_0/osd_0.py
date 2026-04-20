@@ -113,6 +113,12 @@ class create(torch.nn.Module):
             self.dtype = 'float64'
         self.dtype = torch.__dict__[self.dtype]
         self.algo = 'osd_0'
+        bundle = kwargs.get('bundle')
+        if bundle is None:
+            raise ValueError('osd_0 requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+        check_type = decoder_cfg.get('check_type', 'hx')
+        H_shape = bundle.select(check_type)[0]
+        self.num_max_iter = H_shape[1]
 
         logger.info(f'Complete.')
 

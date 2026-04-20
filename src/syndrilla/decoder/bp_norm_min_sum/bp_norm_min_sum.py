@@ -4,8 +4,6 @@ from loguru import logger
 
 import numpy as np
 
-from syndrilla.matrix import create_parity_matrix
-from syndrilla.utils import compute_lz
 
 
 class create(torch.nn.Module):
@@ -71,39 +69,34 @@ class create(torch.nn.Module):
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
-        # get the column and row index for all 1s in parity check matrix
-        logger.info(f'Creating hx parity check matrix.')
-        self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device, dtype=self.dtype)
-
-        logger.info(f'Creating hz parity check matrix.')
-        self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device, dtype=self.dtype)
-
-        if self.check_type.lower() == 'hx':
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hx_matrix.get_index()
-        else: 
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hz_matrix.get_index()
-        
-        # compute lx, switch hx and hz position can compute lz
-        # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
-        logger.info(f'Creating lx and lz parity check matrix.')
-        logical_check_matrix =  decoder_cfg.get('logical_check_matrix', False)
-        if logical_check_matrix:
-            self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device, dtype=self.dtype).get_dense()
-            self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device, dtype=self.dtype).get_dense()
-        else:
-            self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
-            self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
+        bundle = kwargs.get('bundle')
+        if bundle is None:
+            raise ValueError('bp_norm_min_sum requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+        self.Hx_matrix = bundle.Hx_matrix
+        self.Hz_matrix = bundle.Hz_matrix
+        self.lx_matrix = bundle.lx_matrix
+        self.lz_matrix = bundle.lz_matrix
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
 
         # set iteration
         self.i = 0
-        
+
         # convert to as the parameters in a model
         self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
+        # trainable per-iteration weights
+        self.trainable = decoder_cfg.get('trainable', False)
+        if self.trainable:
+            # per-iteration CN scaling (replaces hardcoded beta = 1 - 2^(-i))
+            self.weights_cn = torch.nn.Parameter(torch.ones(self.max_iter, dtype=self.dtype, device=self.device))
+            # per-iteration LLR combination weight
+            self.weights_llr = torch.nn.Parameter(torch.ones(self.max_iter, dtype=self.dtype, device=self.device))
+
         self.algo = 'bp_norm_min_sum'
+        self.num_max_iter = self.max_iter
         
         logger.info(f'Complete.')
 
@@ -162,7 +155,7 @@ class create(torch.nn.Module):
         logger.info(f'Complete.')
 
         logger.info(f'Starting decoding iterations.')
-        
+
         self.i = 0
         while self.i < self.max_iter:
             # variable node update update v2c
@@ -182,7 +175,11 @@ class create(torch.nn.Module):
 
             s_est = self.syndrome_estimation(e_v)
 
-            # different samples from the same batch may terminated at different iteration (pick the smallest one) 
+            if self.training:
+                # during training, run all iterations to preserve gradient flow
+                continue
+
+            # different samples from the same batch may terminated at different iteration (pick the smallest one)
             indices = torch.all(s_est == syndrome, 1).nonzero()
             checker = torch.where(num_iters == -1.0)[0]
             indices = indices[torch.isin(indices, checker)]
@@ -205,13 +202,20 @@ class create(torch.nn.Module):
                     'converge': converges
                 })
                 return io_dict
-           
-        checker = torch.where(num_iters == -1)[0]
-        e_out[checker] = e_v[checker]
-        l_out[checker] = l_v[checker]
-        num_iters[checker] = self.max_iter
-        e_out = e_out[:, :-1]
-        l_out = l_out[:, :-1]
+
+        if self.training:
+            # return soft LLR from final iteration for differentiable loss computation
+            e_out = e_v[:, :-1]
+            l_out = l_v[:, :-1]
+            num_iters[:] = self.max_iter
+        else:
+            checker = torch.where(num_iters == -1)[0]
+            e_out[checker] = e_v[checker]
+            l_out[checker] = l_v[checker]
+            num_iters[checker] = self.max_iter
+            e_out = e_out[:, :-1]
+            l_out = l_out[:, :-1]
+
         logger.info(f'Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
@@ -232,18 +236,19 @@ class create(torch.nn.Module):
         
 
     def cn_update(self, a_v2c):
-        base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype) 
-
-        # Compute the power in PyTorch:
-        beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
+        if self.trainable:
+            beta = self.weights_cn[self.i - 1]
+        else:
+            base = torch.tensor(2.0, dtype=self.dtype)
+            exponent = torch.tensor(-(self.i), dtype=self.dtype)
+            beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
 
         # compute sgn
         sign = torch.sgn(a_v2c)
         sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=2, keepdim=True)
         Q_sign = self.syndrome_neg * sign_prod
-        
+
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
         sorted, _ = torch.sort(abs_a_v2c, dim=2)
@@ -251,7 +256,7 @@ class create(torch.nn.Module):
         min_1 = sorted[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
-        return beta * sign * Q_sign  * min_result
+        return beta * sign * Q_sign * min_result
 
 
     def llr_update(self, u_init, b_c2v):
@@ -259,10 +264,15 @@ class create(torch.nn.Module):
         data_flat = b_c2v.flatten(start_dim=1)
         partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
         sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
-        # Use index_add to accumulate sums in the result tensor
-        
-        sum_b_c2v = u_init + sum_b_c2v
-        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+
+        if self.trainable:
+            w = self.weights_llr[self.i - 1]
+            sum_b_c2v = u_init + sum_b_c2v
+            sum_b_c2v.scatter_add_(1, partitions_flat, data_flat * w)
+        else:
+            sum_b_c2v = u_init + sum_b_c2v
+            sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+
         return sum_b_c2v
 
 

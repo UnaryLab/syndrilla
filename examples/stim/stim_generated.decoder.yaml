@@ -1,0 +1,8 @@
+decoder:
+  algorithm: [bp_norm_min_sum, osd_0]
+  check_type: hx
+  max_iter: 100
+  dtype: float64
+  device:
+    device_type: cpu
+    device_idx: 0

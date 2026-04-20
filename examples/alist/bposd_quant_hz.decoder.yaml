@@ -4,14 +4,9 @@ decoder:
   - osd_0
   check_type: hz
   max_iter: 131
-  parity_matrix_hx: examples/alist/hx.matrix.yaml
-  parity_matrix_hz: examples/alist/hz.matrix.yaml
   dtype: float64
   int_width: 3
   frac_width: 4
-  device: 
+  device:
     device_type: cuda
     device_idx: 0
-  logical_check_matrix: True
-  logical_check_lx: examples/alist/lx.matrix.yaml
-  logical_check_lz: examples/alist/lz.matrix.yaml

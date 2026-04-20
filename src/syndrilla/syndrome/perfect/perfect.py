@@ -9,6 +9,7 @@ class create():
     """
     def __init__(self, syndrome_cfg, **kwargs) -> None:
         self.syndrome_cfg = syndrome_cfg
+        self.syndrome_actual = None
 
 
     def measure_syndrome(self, error, decoder):
@@ -32,5 +33,6 @@ class create():
             syndrome = torch.gather(error_expanded, dim=3, index=v_c_col_expanded).sum(dim=3)
             syndrome = torch.where((syndrome%2) > 0, 1, 0)
             logger.info(f'Syndrome measurement complete.')
+        self.syndrome_actual = syndrome
         return syndrome
     
