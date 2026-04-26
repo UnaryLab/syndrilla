@@ -1,0 +1,10 @@
+decoder:
+  algorithm: bp_lottery_policy
+  check_type: hx
+  max_iter: 181
+  dtype: float64
+  random_machine: sobol
+  sign_flip_policy: Proposed
+  device:
+    device_type: cpu
+    device_idx: 0

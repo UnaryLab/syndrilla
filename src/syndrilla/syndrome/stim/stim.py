@@ -1,27 +1,3 @@
-"""
-Stim syndrome measurer.
-
-Generates syndromes (detection events) and observable flips by sampling from a
-stim circuit. Uses the shared circuit cache so the circuit is parsed only once.
-
-When ``d_rounds > 1`` the sampler draws ``batch_size * d_rounds`` shots in one
-call and reshapes the output to ``[B, d_rounds, num_detectors]``, giving an
-extra round dimension that main.py can majority-vote over.
-
-Dimension convention (channel dim always before rounds dim)::
-
-    d_rounds == 1, 1 channel:  [B, M]
-    d_rounds >  1, 1 channel:  [B, d_rounds, M]
-    d_rounds >  1, C channels: [B, d_rounds, C, M]   (future)
-
-YAML config::
-
-    syndrome:
-      measure: stim
-      circuit: <inline stim circuit string>
-      d_rounds: 1          # optional, default 1
-"""
-
 import torch
 from loguru import logger
 

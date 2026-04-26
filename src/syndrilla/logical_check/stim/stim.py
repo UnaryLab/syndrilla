@@ -1,19 +1,3 @@
-"""
-Stim logical check.
-
-Compares the decoder's predicted observable flips ``(L @ e_v) % 2`` against
-the actual observable flips sampled by the stim syndrome measurer.
-
-When ``observable_flips`` carries a rounds dimension (d_rounds > 1), the check
-is performed independently per round and the results are majority-voted into a
-single flag per sample.
-
-YAML config::
-
-    check:
-      check_type: stim
-"""
-
 import torch
 from loguru import logger
 

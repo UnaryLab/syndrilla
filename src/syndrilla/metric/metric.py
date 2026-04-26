@@ -105,6 +105,41 @@ class MetricState:
         for field in self._channel_fields:
             setattr(self, field, [[0.0] * number_channel for _ in range(num_decoders)])
 
+        # vote tracking: per-round full-match counts accumulated across batches
+        self.vote_active = False
+        self.vote_stage = None
+        self.vote_d_rounds = 0
+        self.vote_match_counts = None
+        self.vote_sample_count = 0
+
+    def accumulate_vote(self, match_counts, sample_count, stage, d_rounds):
+        """Add per-round full-match counts from one voting application."""
+        if match_counts is None or sample_count <= 0 or d_rounds <= 0:
+            return
+        if not self.vote_active:
+            self.vote_active = True
+            self.vote_stage = stage
+            self.vote_d_rounds = int(d_rounds)
+            self.vote_match_counts = [0] * self.vote_d_rounds
+        counts = list(match_counts)
+        for k in range(min(self.vote_d_rounds, len(counts))):
+            self.vote_match_counts[k] += int(counts[k])
+        self.vote_sample_count += int(sample_count)
+
+    def get_vote_info(self):
+        """Return aggregated vote stats, or None if no voting was applied."""
+        if not self.vote_active or self.vote_sample_count == 0:
+            return None
+        rates = [c / self.vote_sample_count for c in self.vote_match_counts]
+        return {
+            'active': True,
+            'stage': self.vote_stage,
+            'd_rounds': self.vote_d_rounds,
+            'sample_count': self.vote_sample_count,
+            'match_counts': list(self.vote_match_counts),
+            'per_round_match_rate': rates,
+        }
+
     def accumulate(self, decoder_idx, batch_metrics):
         """Add one batch's report_metric result for a decoder."""
         i = decoder_idx
@@ -239,6 +274,34 @@ class MetricState:
                 state.logical_error_rate[idx][ch_idx] = float(ch_entry.get('logical error rate', 0.0)) * bc
                 state.converge_fail[idx][ch_idx] = float(ch_entry.get('converge failure rate', 0.0)) * bc
                 state.converge_succ[idx][ch_idx] = float(ch_entry.get('converge success rate', 0.0)) * bc
+
+        if 'vote' in data:
+            v = data['vote']
+            state.vote_active = True
+            state.vote_stage = v.get('stage')
+            state.vote_d_rounds = int(v.get('d_rounds', 0))
+            state.vote_sample_count = int(v.get('total samples', 0))
+            percentages = v.get('match percentage')
+            if percentages is None:
+                # legacy keys, kept for older checkpoints
+                counts = v.get('match counts')
+                if counts is not None:
+                    state.vote_match_counts = [int(x) for x in counts]
+                else:
+                    rates = v.get('per round match rate', [])
+                    if isinstance(rates, dict):
+                        rates = list(rates.values())
+                    state.vote_match_counts = [
+                        int(round(float(r) * state.vote_sample_count)) for r in rates
+                    ]
+            else:
+                if isinstance(percentages, dict):
+                    percentages = list(percentages.values())
+                state.vote_match_counts = [
+                    int(round(float(p) * state.vote_sample_count / 100.0)) for p in percentages
+                ]
+            if state.vote_d_rounds and len(state.vote_match_counts) < state.vote_d_rounds:
+                state.vote_match_counts += [0] * (state.vote_d_rounds - len(state.vote_match_counts))
 
         return state, ckpt_meta
 
@@ -396,7 +459,7 @@ def report_metric(num_max_iter, e_estimated, e_actual, iteration, time_iteration
     })
 
 
-def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_error_rate, num_batches, error_reach, file_name, check_num, done=0):
+def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_error_rate, num_batches, error_reach, file_name, check_num, done=0, vote_info=None):
     """
     Saves decoding metrics for all decoders into a single YAML file.
 
@@ -479,6 +542,16 @@ def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_er
     }
     for idx, check_name in enumerate(check_types[:len(final_list)]):
         all_metrics_results['decoder_full'][f'{check_name}'] = final_list[idx]
+
+    if vote_info is not None and vote_info.get('active'):
+        rates = vote_info.get('per_round_match_rate', [])
+        match_percentage = [float(r) * 100.0 for r in rates]
+        all_metrics_results['vote'] = {
+            'stage': vote_info['stage'],
+            'd_rounds': int(vote_info['d_rounds']),
+            'total samples': int(vote_info['sample_count']),
+            'match percentage': match_percentage,
+        }
 
     os.makedirs(curr_dir, exist_ok=True)
     output_path = os.path.join(curr_dir, f'result_phy_err_{physical_error_rate}.yaml')

@@ -47,8 +47,9 @@ def parse_commandline_args():
                         help = 'Level of logger.')
     parser.add_argument('-dr', '--d_rounds', type=int, default=1,
                         help = 'Number of syndrome measurement rounds (majority vote when > 1).')
-    parser.add_argument('-vs', '--vote_stage', type=str, default='syndrome',
-                        help = 'Where to apply majority vote: '
+    parser.add_argument('-vs', '--vote_stage', type=str, default=None,
+                        help = 'Where to apply majority vote. If not set, no voting is invoked '
+                               '(syndromes/decoder outputs keep the rounds dimension). '
                                '"syndrome" = vote on syndromes then decode, '
                                '"decoder_N" = vote after decoder N (0-based), '
                                'remaining decoders run once on voted result. '
@@ -165,10 +166,14 @@ def main():
             bt.record_error(err)
 
             d_rounds = getattr(syndrome_generator, 'd_rounds', 1)
+            vote_recorded = False
 
             logger.success(f'\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------')
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
             synd = voter.apply(synd, number_channel, d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage='syndrome')
+            if not vote_recorded and voter.last_sample_count > 0:
+                metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_d_rounds)
+                vote_recorded = True
 
             io_dict = {
                 'synd': synd,
@@ -181,9 +186,12 @@ def main():
                 start_time = time.time()
                 io_dict = decoders[decoder_idx](io_dict)
                 elapsed = time.time() - start_time
-                
+
                 decoder_stage = f'decoder_{decoder_idx}'
                 io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
+                if not vote_recorded and voter.last_sample_count > 0:
+                    metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_d_rounds)
+                    vote_recorded = True
                 io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
                 for key in ('llr', 'converge', 'iter'):
                     if key in io_dict and io_dict[key].ndim > 1:
@@ -213,13 +221,13 @@ def main():
             if num_batches % 100 == 0:
                 logger.success(f'\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------')
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name)
-                save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.target_error, str(dtype), error_model.rate, num_batches, num_err, H_file_name, check_num)
+                save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.target_error, str(dtype), error_model.rate, num_batches, num_err, H_file_name, check_num, vote_info=metrics.get_vote_info())
                 logger.success(f'Saved log to <{output_log}>.')
                 logger.success(f'Saved metric results to <{args.run_dir}>.')
 
     logger.success(f'\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------')
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)
-    save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.target_error, str(dtype), error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
+    save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.target_error, str(dtype), error_model.rate, num_batches, num_err, H_file_name, check_num, 1, vote_info=metrics.get_vote_info())
     logger.success(f'Saved log to <{output_log}>.')
     logger.success(f'Saved metric results to <{args.run_dir}>.')
 

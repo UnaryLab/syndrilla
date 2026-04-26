@@ -135,26 +135,6 @@ The following table details the options accepted by the `-vs` flag.
 | `decoder_1`  | Vote after the second decoder (e.g., after OSD)                             |
 | `decoder`    | Vote after the last decoder                                                 |
 
-### 4. Phenomenological noise model
-For alist-based simulations (not stim), the phenomenological syndrome measurer adds measurement noise to otherwise perfect syndromes.
-An example syndrome configuration file using the phenomenological model is provided in ```phenomenological.syndrome.yaml```:
-
-```
-syndrome:
-  measure: phenomenological
-  d_rounds: 3
-  measurement_error_rate: 0.01
-```
-
-The following table details the configuration parameters used in the phenomenological syndrome YAML file.
-| Key                              | Description                                                                                         | Example            |
-|----------------------------------|-----------------------------------------------------------------------------------------------------|--------------------|
-| `syndrome.measure`               | Model for syndrome measurement                                                                      | `phenomenological` |
-| `syndrome.d_rounds`              | Number of syndrome rounds replicated from the true syndrome                                         | `3`                |
-| `syndrome.measurement_error_rate`| Per-bit bit-flip probability applied independently to each replicated round                         | `0.01`             |
-
-This computes the true syndrome (H*e), replicates it `d_rounds` times, and independently flips each bit with probability `measurement_error_rate`.
-The true syndrome is stored in `syndrome_actual` for analysis.
 
 ## Pipeline flow
 

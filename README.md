@@ -138,7 +138,7 @@ The following table details the configuration parameters used in the error YAML 
 | `error.device.device_idx`       | Index of the device where the error injection will happen. This option only works when `device_type = cuda`.                                                        | 0                           |
 | `error.rate`      | Physical error rate                                          | `0.05`                    |
 
-The following table details all types of error model Syndrilla supports.
+The following table details all types of error model Syndrilla supports. (Using different error model may need different configuration format, which will be shown on [Error module](docs/error.md).)
 
 | Error Model      | Number of channels                                         |Example                                            |
 |------------------|------------------------------------------------------------|---------------------------------------------------|
@@ -154,10 +154,18 @@ syndrome:
   measure: perfect
 ```
 
-The following table details the configuration parameters used in the syndrome module YAML file.
+The following table details the configuration parameters used in the syndrome module YAML file. 
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
-| `syndrome.measure`| Model for syndrome measurement                       | `perfect` or `phenomenological`                    |
+| `syndrome.measure`| Model for syndrome measurement                       | `perfect`, `phenomenological`, or `stim`                    |
+
+The following table details all types of syndrome measurement Syndrilla supports. (Using different syndrome measurement model may need different configuration format, which will be shown on [Syndrome module](docs/syndrome.md).)
+
+| Syndrome model            | Description                                                                                                | Example            |
+|---------------------------|------------------------------------------------------------------------------------------------------------|--------------------|
+| Perfect                   | Ideal (error-free) syndrome measurement: returns `H * e mod 2`                                             | `perfect`          |
+| Phenomenological          | Replicates the true syndrome over `d_rounds` and flips each bit with probability `measurement_error_rate`  | `phenomenological` |
+| Stim                      | Circuit-level syndrome sampler driven by a stim circuit (used with the stim interface)                     | `stim`             |
 
 
 #### 2.3. Matrix module
@@ -177,8 +185,17 @@ matrix:
 The following table details the configuration parameters used in the matrix module YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
-|`matrix.file_type`| Format of the parity-check matrix file                        | `alist` or `npz` or `txt` |
-|`matrix.path`     | Path to the parity-check matrix file                          | `examples/alist/surface/surface_10_hx.alist`                     |
+|`matrix.file_type`| Format of the parity-check matrix file                        | `alist`, `npz`, `txt`, or `stim` |
+|`matrix.path`     | Path to the parity-check matrix file (file-based formats)     | `examples/alist/surface/surface_10_hx.alist`                     |
+
+The following table details all matrix formats Syndrilla supports. (Using different matrix formats may need different configuration format, which will be shown on [Matrix module](docs/matrix.md).)
+
+| Matrix format | Description                                                                                                       | Example |
+|---------------|-------------------------------------------------------------------------------------------------------------------|---------|
+| alist         | Sparse format from MacKay/Davey/Lafferty; lists nonzero neighbor indices per check node                            | `alist` |
+| npz           | NumPy/SciPy compressed archive containing a sparse parity-check matrix                                             | `npz`   |
+| txt           | Plain-text dense 2D matrix; each row is a check node with `1`s marking connected variable nodes                    | `txt`   |
+| stim          | Built directly from a stim circuit's detector error model; selects either the `check` (H) or `observable` (L) matrix | `stim`  |
 
 
 #### 2.4. Decoder module
@@ -216,7 +233,7 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.logical_check_lx` | Path to the X-type logical check matrix in YAML format               | `examples/alist/lx.matrix.yaml`                   |
 | `decoder.logical_check_lz` | Path to the Z-type logical check matrix in YAML format               | `examples/alist/lz.matrix.yaml`                   |
 
-The following table details the different types of decoding algorithms Syndrilla supports.
+The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 
 | Error Model                       | #Channel                                          | Example                                            | Reference         |
 |-----------------------------------|-------------------------------------------------------------|----------------------------------------------------|---------------------|
@@ -241,7 +258,7 @@ The following table provides a detailed explanation of the configuration paramet
 
 #### 2.6. Interface module
 This module can be used with a quantum circuit simulator such as Stim to generate circuits that include various types of errors.
-An example configuration file using Stim is provided in ```stim_generated.interface.yaml```. (Using interface will cause other modules having different format, which will be shown on )
+An example configuration file using Stim is provided in ```stim_generated.interface.yaml```. (Using interface will cause other modules having different format, which will be shown on [Interface module](docs/interface.md).)
 ```
 interface:
   backend: stim

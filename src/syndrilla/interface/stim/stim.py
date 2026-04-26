@@ -84,6 +84,15 @@ class create():
                 if nk in error_cfg:
                     circuit_gen_cfg[nk] = error_cfg[nk]
 
+            syn_meas_rate = syndrome_cfg.get('measurement_error_rate', None)
+            if syn_meas_rate is not None:
+                if 'before_measure_flip_probability' in circuit_gen_cfg:
+                    logger.warning(
+                        f'syndrome.measurement_error_rate=<{syn_meas_rate}> overrides '
+                        f"error.before_measure_flip_probability=<{circuit_gen_cfg['before_measure_flip_probability']}>."
+                    )
+                circuit_gen_cfg['before_measure_flip_probability'] = float(syn_meas_rate)
+
         self.circuit = get_stim_circuit(circuit_str=circuit_inline, circuit_cfg=circuit_gen_cfg)
 
         logger.info(f'Stim interface: channels={number_channel}, device={device}, dtype={dtype}')

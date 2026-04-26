@@ -6,6 +6,12 @@ class create():
 
     def __init__(self, vote_cfg, **kwargs) -> None:
         self._best_round_idx = None
+        # Per-round full-match counts populated by the most recent apply() that
+        # actually performed voting. Consumed by the metric module.
+        self.last_match_counts = None
+        self.last_sample_count = 0
+        self.last_d_rounds = 0
+        self.last_voted_stage = None
 
     def apply(self, tensor, number_channel=1, d_rounds=1, vote_stage='syndrome', current_stage='syndrome'):
         """
@@ -15,6 +21,10 @@ class create():
             tensor with the rounds dimension collapsed, or unchanged
         """
         if d_rounds <= 1 or vote_stage != current_stage:
+            self.last_match_counts = None
+            self.last_sample_count = 0
+            self.last_d_rounds = 0
+            self.last_voted_stage = None
             return tensor
 
         rounds_dim = 1
@@ -22,11 +32,19 @@ class create():
 
         if tensor.ndim >= 3:
             flat = tensor.flatten(start_dim=2)
-            voted_flat = voted.flatten(start_dim=1)
-            hamming = (flat != voted_flat.unsqueeze(1)).sum(dim=-1)
+            voted_flat = voted.flatten(start_dim=1).unsqueeze(1)
+            eq = (flat == voted_flat)
+            match_full = eq.all(dim=-1)
+            hamming = (~eq).sum(dim=-1)
             self._best_round_idx = hamming.argmin(dim=1)
         else:
+            match_full = (tensor == voted.unsqueeze(1))
             self._best_round_idx = None
+
+        self.last_match_counts = match_full.sum(dim=0).int().tolist()
+        self.last_sample_count = int(tensor.size(0))
+        self.last_d_rounds = int(tensor.size(1))
+        self.last_voted_stage = current_stage
 
         return voted
 
