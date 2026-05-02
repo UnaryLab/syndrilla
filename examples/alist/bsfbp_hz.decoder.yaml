@@ -6,5 +6,5 @@ decoder:
   dtype: float64
   random_machine: sobol
   device:
-    device_type: cpu
+    device_type: cuda
     device_idx: 0

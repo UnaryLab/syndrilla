@@ -5,5 +5,5 @@ decoder:
   max_b_iter: 181
   dtype: float64
   device:
-    device_type: cpu
+    device_type: cuda
     device_idx: 0

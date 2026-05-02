@@ -6,5 +6,5 @@ decoder:
   random_machine: sobol
   sign_flip_policy: Proposed
   device:
-    device_type: cpu
+    device_type: cuda
     device_idx: 0
