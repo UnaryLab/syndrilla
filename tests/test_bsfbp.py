@@ -16,7 +16,7 @@ from syndrilla.utils import read_yaml, get_path, parse_device_dtype
 def test_batch_alist_hx(batch_size=1000, target_error=1000,
                         run_dir='tests/test_outputs', vote_stage='syndrome'):
     decoder_yaml = 'examples/alist/bsfbp_hx.decoder.yaml'
-    matrix_yaml = 'examples/alist/surface_10.matrix.yaml'
+    matrix_yaml = 'examples/alist/surface_11.matrix.yaml'
 
     decoder_cfg = read_yaml(get_path(decoder_yaml))['decoder']
     matrix_cfg = read_yaml(get_path(matrix_yaml))['matrix']

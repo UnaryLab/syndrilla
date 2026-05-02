@@ -59,7 +59,8 @@ class BatchTracker:
         converge = io_dict['converge'].to(device=self.device, dtype=self.converge_all[i + 1].dtype)
         iter_val = io_dict['iter'].to(device=self.device, dtype=self.iter_all[i].dtype)
 
-        if e_v.ndim > 2:
+        expected_ndim = 3 if self.number_channel > 1 else 2
+        if e_v.ndim > expected_ndim:
             e_v = e_v[:, 0]
         if converge.ndim > 1:
             converge = converge[:, 0]

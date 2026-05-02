@@ -99,7 +99,7 @@ class create(torch.nn.Module):
 
 
     def forward(self, io_dict):
-        """Iterative bp4 (normalized min sum) decoding algorithm
+        """Iterative bp4 (Quaternary BP) decoding algorithm
         Input:
             syndrome: estimated syndrome for c-th code node
 
@@ -117,7 +117,7 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f'Initializing bp (normailized min sum) decoding.')
+        logger.info(f'Initializing bp4 (Quaternary BP) decoding.')
 
 
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)

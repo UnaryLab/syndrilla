@@ -15,3 +15,6 @@ dependencies:
   - nvidia-ml-py
   - pytorch
   - matplotlib
+  - stim
+  - pip:
+    - ldpc
