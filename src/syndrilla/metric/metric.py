@@ -31,6 +31,10 @@ class BatchTracker:
         self.number_channel = number_channel
         self.shape = shape
         self.dtype = dtype
+        device = torch.device(device) if not isinstance(device, torch.device) else device
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            logger.warning('BatchTracker: CUDA device requested but unavailable; using CPU.')
+            device = torch.device('cpu')
         self.device = device
         self.reset()
 
@@ -93,6 +97,11 @@ class MetricState:
     def __init__(self, num_decoders, number_channel, device):
         self.num_decoders = num_decoders
         self.number_channel = number_channel
+        # Same CUDA-unavailable fallback as BatchTracker.
+        device = torch.device(device) if not isinstance(device, torch.device) else device
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            logger.warning('MetricState: CUDA device requested but unavailable; using CPU.')
+            device = torch.device('cpu')
         self.device = device
 
         # scalar accumulators: list[float] indexed by decoder
