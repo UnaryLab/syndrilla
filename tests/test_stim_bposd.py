@@ -10,7 +10,6 @@ from ldpc import BpOsdDecoder
 sys.path.append(os.getcwd())
 
 from syndrilla.interface import create_interface
-from syndrilla.vote import create_vote
 
 
 # ----------------------------------------------------------------------------
@@ -20,28 +19,24 @@ def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
     return create_interface(
         cfg={
             'backend': 'stim',
+            'code': 'surface_code:rotated_memory_z',
+            'distance': distance,
             'device': {'device_type': 'cpu', 'device_idx': 0},
             'dtype': 'float64',
         },
         error_cfg={
             'model': 'stim_circuit',
-            'after_clifford_depolarization': p,
-            'after_reset_flip_probability': p,
             'before_measure_flip_probability': p,
-            'before_round_data_depolarization': p,
             'number_channel': 1,
         },
         syndrome_cfg={
             'measure': 'stim',
-            'd_rounds': 1,
+            'rounds': rounds,
         },
         decoder_cfg={
             'algorithm': ['bp_norm_min_sum', 'osd_0'],
             'check_type': 'hx',
             'max_iter': max_iter,
-            'code': 'surface_code:rotated_memory_z',
-            'distance': distance,
-            'rounds': rounds,
             'dtype': 'float64',
             'device': {'device_type': 'cpu', 'device_idx': 0},
         },
@@ -54,16 +49,12 @@ def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
 def decode_syndrilla(iface, n_shots, batch_size=500):
     error_model = iface.error_model
     syndrome_generator = iface.syndrome_generator
-    logical_check = iface.logical_check
     bundle = iface.matrix_bundle
     decoders = iface.decoders
-    voter = create_vote(cfg={'method': 'majority_vote'})
 
-    number_channel = error_model.number_channel
     check_type = 'hx'
     shape, _, _, _ = bundle.Hx_matrix.get_index()
     H_matrix = bundle.select(check_type)[3]
-    l_matrix = bundle.get_l_matrix(check_type, number_channel)
     dtype = decoders[0].dtype
 
     all_syndromes = []
@@ -77,15 +68,12 @@ def decode_syndrilla(iface, n_shots, batch_size=500):
         _, error_dataloader = error_model.inject_error(zero_qubits, b)
 
         for err, llr, _ in error_dataloader:
-            d_rounds = getattr(syndrome_generator, 'd_rounds', 1)
-
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, d_rounds=d_rounds,
-                               vote_stage='syndrome', current_stage='syndrome')
+            obs_flips = syndrome_generator.observable_flips
 
             all_syndromes.append(synd.cpu().numpy())
-            if hasattr(syndrome_generator, 'observable_flips') and syndrome_generator.observable_flips is not None:
-                all_obs_flips.append(syndrome_generator.observable_flips.cpu().numpy())
+            if obs_flips is not None:
+                all_obs_flips.append(obs_flips.cpu().numpy())
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
             for decoder in decoders:
@@ -174,4 +162,4 @@ def test_stim_bposd(distance=3, rounds=1, p=0.05,
 
 
 if __name__ == '__main__':
-    test_stim_bposd(distance=3, rounds=3, p=0.05, n_shots=100000)
+    test_stim_bposd(distance=3, rounds=3, p=0.001, n_shots=1000000)

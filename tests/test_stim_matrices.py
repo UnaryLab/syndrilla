@@ -31,7 +31,7 @@ def make_interface_from_circuit(circuit):
         },
         decoder_cfg={},
         error_cfg={'number_channel': 1},
-        syndrome_cfg={'measure': 'stim', 'd_rounds': 1},
+        syndrome_cfg={'measure': 'stim', 'rounds': 1},
     )
 
 

@@ -78,7 +78,7 @@ class create():
             circuit_gen_cfg = {
                 'code': interface_cfg['code'],
                 'distance': interface_cfg['distance'],
-                'rounds': int(syndrome_cfg.get('d_rounds', 1)),
+                'rounds': int(syndrome_cfg.get('rounds', 1)),
             }
             for nk in noise_keys:
                 if nk in error_cfg:
@@ -107,9 +107,9 @@ class create():
         }
         self.error_model = create_error_model(cfg=em_cfg)
 
-        d_rounds = syndrome_cfg.get('d_rounds', 1)
+        rounds = syndrome_cfg.get('rounds', 1)
 
-        syn_cfg = {'measure': 'stim', 'd_rounds': d_rounds, **circuit_ref}
+        syn_cfg = {'measure': 'stim', 'rounds': rounds, **circuit_ref}
 
         self.syndrome_generator = create_syndrome(cfg=syn_cfg)
 

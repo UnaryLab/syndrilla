@@ -65,9 +65,9 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
 
-            d_rounds = getattr(syndrome_generator, 'd_rounds', 1)
+            rounds = getattr(syndrome_generator, 'rounds', 1)
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, d_rounds=d_rounds,
+            synd = voter.apply(synd, number_channel, rounds=rounds,
                                vote_stage=vote_stage, current_stage='syndrome')
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
@@ -78,13 +78,13 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 elapsed = time.time() - start_time
 
                 decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, d_rounds=d_rounds,
+                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds,
                                              vote_stage=vote_stage, current_stage=decoder_stage)
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, d_rounds=d_rounds,
+                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds,
                                               vote_stage=vote_stage, current_stage=decoder_stage)
                 for key in ('llr', 'converge', 'iter'):
                     if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], d_rounds=d_rounds,
+                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds,
                                                           vote_stage=vote_stage, current_stage=decoder_stage)
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
 

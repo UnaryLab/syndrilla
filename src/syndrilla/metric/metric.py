@@ -55,9 +55,9 @@ class BatchTracker:
         i = decoder_idx
         self.time_iter_all[i].append(elapsed)
 
-        e_v = io_dict['e_v']
-        converge = io_dict['converge']
-        iter_val = io_dict['iter']
+        e_v = io_dict['e_v'].to(device=self.device, dtype=self.e_v_all[i].dtype)
+        converge = io_dict['converge'].to(device=self.device, dtype=self.converge_all[i + 1].dtype)
+        iter_val = io_dict['iter'].to(device=self.device, dtype=self.iter_all[i].dtype)
 
         if e_v.ndim > 2:
             e_v = e_v[:, 0]
@@ -108,21 +108,26 @@ class MetricState:
         # vote tracking: per-round full-match counts accumulated across batches
         self.vote_active = False
         self.vote_stage = None
-        self.vote_d_rounds = 0
+        self.vote_rounds = 0
         self.vote_match_counts = None
         self.vote_sample_count = 0
 
-    def accumulate_vote(self, match_counts, sample_count, stage, d_rounds):
-        """Add per-round full-match counts from one voting application."""
-        if match_counts is None or sample_count <= 0 or d_rounds <= 0:
+    def accumulate_vote(self, match_counts, sample_count, stage, rounds, total_bits=None):
+        """Add per-prefix per-sample full-match counts from one voting application.
+
+        ``total_bits`` is accepted but ignored (kept for callers that still
+        pass it).  Each entry of ``match_counts`` is a sample count where the
+        prefix-k vote matched the full vote on every bit.
+        """
+        if match_counts is None or sample_count <= 0 or rounds <= 0:
             return
         if not self.vote_active:
             self.vote_active = True
             self.vote_stage = stage
-            self.vote_d_rounds = int(d_rounds)
-            self.vote_match_counts = [0] * self.vote_d_rounds
+            self.vote_rounds = int(rounds)
+            self.vote_match_counts = [0] * self.vote_rounds
         counts = list(match_counts)
-        for k in range(min(self.vote_d_rounds, len(counts))):
+        for k in range(min(self.vote_rounds, len(counts))):
             self.vote_match_counts[k] += int(counts[k])
         self.vote_sample_count += int(sample_count)
 
@@ -134,7 +139,7 @@ class MetricState:
         return {
             'active': True,
             'stage': self.vote_stage,
-            'd_rounds': self.vote_d_rounds,
+            'rounds': self.vote_rounds,
             'sample_count': self.vote_sample_count,
             'match_counts': list(self.vote_match_counts),
             'per_round_match_rate': rates,
@@ -279,9 +284,9 @@ class MetricState:
             v = data['vote']
             state.vote_active = True
             state.vote_stage = v.get('stage')
-            state.vote_d_rounds = int(v.get('d_rounds', 0))
+            state.vote_rounds = int(v.get('rounds', 0))
             state.vote_sample_count = int(v.get('total samples', 0))
-            percentages = v.get('match percentage')
+            percentages = v.get('prefix vote convergence rate', v.get('match percentage'))
             if percentages is None:
                 # legacy keys, kept for older checkpoints
                 counts = v.get('match counts')
@@ -300,8 +305,8 @@ class MetricState:
                 state.vote_match_counts = [
                     int(round(float(p) * state.vote_sample_count / 100.0)) for p in percentages
                 ]
-            if state.vote_d_rounds and len(state.vote_match_counts) < state.vote_d_rounds:
-                state.vote_match_counts += [0] * (state.vote_d_rounds - len(state.vote_match_counts))
+            if state.vote_rounds and len(state.vote_match_counts) < state.vote_rounds:
+                state.vote_match_counts += [0] * (state.vote_rounds - len(state.vote_match_counts))
 
         return state, ckpt_meta
 
@@ -548,9 +553,9 @@ def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_er
         match_percentage = [float(r) * 100.0 for r in rates]
         all_metrics_results['vote'] = {
             'stage': vote_info['stage'],
-            'd_rounds': int(vote_info['d_rounds']),
+            'rounds': int(vote_info['rounds']),
             'total samples': int(vote_info['sample_count']),
-            'match percentage': match_percentage,
+            'prefix vote convergence rate': match_percentage,
         }
 
     os.makedirs(curr_dir, exist_ok=True)

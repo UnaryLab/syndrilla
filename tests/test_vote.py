@@ -37,7 +37,7 @@ def make_matrix_cfg(distance):
 
 
 def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
-               target_error, batch_size, d_rounds, vote_stage='syndrome'):
+               target_error, batch_size, rounds, vote_stage='syndrome'):
     voter = create_vote(cfg={'method': 'majority_vote'})
     number_channel = error_model.number_channel
     check_type = 'hx'
@@ -56,7 +56,7 @@ def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
         for err, llr, _ in error_dataloader:
             synd = syndrome_gen.measure_syndrome(err, decoders[0])
 
-            synd = voter.apply(synd, number_channel, d_rounds=d_rounds,
+            synd = voter.apply(synd, number_channel, rounds=rounds,
                                vote_stage=vote_stage, current_stage='syndrome')
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
@@ -64,11 +64,11 @@ def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
             for decoder_idx, decoder in enumerate(decoders):
                 io_dict = decoder(io_dict)
                 decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, d_rounds=d_rounds, vote_stage=vote_stage, current_stage=decoder_stage)
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, d_rounds=d_rounds, vote_stage=vote_stage, current_stage=decoder_stage)
+                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds, vote_stage=vote_stage, current_stage=decoder_stage)
+                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds, vote_stage=vote_stage, current_stage=decoder_stage)
                 for key in ('llr', 'converge', 'iter'):
                     if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], d_rounds=d_rounds, vote_stage=vote_stage, current_stage=decoder_stage)
+                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds, vote_stage=vote_stage, current_stage=decoder_stage)
 
             check = logical_chk.check(io_dict['e_v'].to(dtype), err, l_matrix)
             total_logical_errors += int(check.sum())
@@ -77,11 +77,11 @@ def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
     return total_logical_errors, total_shots
 
 
-def test_lottery_vote_stages(distance=DISTANCE, rate=0.05, d_rounds=3,
+def test_lottery_vote_stages(distance=DISTANCE, rate=0.05, rounds=3,
                              target_error=100, batch_size=1000):
     print(f'\n=== Lottery BP + OSD: vote stage comparison ===')
     print(f'  surface code hx, distance={distance}, rate={rate}')
-    print(f'  d_rounds={d_rounds}, target_error={target_error}')
+    print(f'  rounds={rounds}, target_error={target_error}')
 
     dec_cfg = make_decoder_cfg(distance)
     mat_cfg = make_matrix_cfg(distance)
@@ -96,7 +96,7 @@ def test_lottery_vote_stages(distance=DISTANCE, rate=0.05, d_rounds=3,
     })
     syndrome_gen = create_syndrome(cfg={
         'measure': 'phenomenological',
-        'd_rounds': d_rounds,
+        'rounds': rounds,
         'measurement_error_rate': 0.01,
     })
     logical_chk = create_check(cfg={'check_type': 'lx'})
@@ -110,13 +110,13 @@ def test_lottery_vote_stages(distance=DISTANCE, rate=0.05, d_rounds=3,
         }[vote_stage]
 
         errors, shots = run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
-                                   target_error, batch_size, d_rounds, vote_stage=vote_stage)
+                                   target_error, batch_size, rounds, vote_stage=vote_stage)
         ler = errors / shots
         results[vote_stage] = (errors, shots, ler)
         print(f'\n  [{vote_stage}] {label}')
         print(f'    logical errors = {errors} / {shots}  (LER = {ler:.6f})')
 
-    print(f'\n  Summary (distance={distance}, rate={rate}, d_rounds={d_rounds}):')
+    print(f'\n  Summary (distance={distance}, rate={rate}, rounds={rounds}):')
     for stage, (errors, shots, ler) in results.items():
         print(f'    {stage:12s}: {errors} errors / {shots} shots  (LER = {ler:.6f})')
 
@@ -125,7 +125,7 @@ def test_lottery_no_vote(distance=DISTANCE, rate=0.05,
                          target_error=100, batch_size=1000):
     print(f'\n=== Lottery BP + OSD: no vote (baseline) ===')
     print(f'  surface code hx, distance={distance}, rate={rate}')
-    print(f'  d_rounds=1, target_error={target_error}')
+    print(f'  rounds=1, target_error={target_error}')
 
     dec_cfg = make_decoder_cfg(distance)
     mat_cfg = make_matrix_cfg(distance)
@@ -140,18 +140,18 @@ def test_lottery_no_vote(distance=DISTANCE, rate=0.05,
     })
     syndrome_gen = create_syndrome(cfg={
         'measure': 'phenomenological',
-        'd_rounds': 1,
+        'rounds': 1,
         'measurement_error_rate': 0.01,
     })
     logical_chk = create_check(cfg={'check_type': 'lx'})
 
     errors, shots = run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
-                               target_error, batch_size, d_rounds=1, vote_stage='syndrome')
+                               target_error, batch_size, rounds=1, vote_stage='syndrome')
     ler = errors / shots
     print(f'  logical errors = {errors} / {shots}  (LER = {ler:.6f})')
 
 
 if __name__ == '__main__':
     test_lottery_no_vote(distance=9, rate=0.05, target_error=100, batch_size=1000)
-    test_lottery_vote_stages(distance=9, rate=0.05, d_rounds=9,
+    test_lottery_vote_stages(distance=9, rate=0.05, rounds=9,
                              target_error=100, batch_size=1000)

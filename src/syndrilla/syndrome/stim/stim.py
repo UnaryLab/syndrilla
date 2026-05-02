@@ -15,7 +15,12 @@ class create():
         self.num_detectors = self.circuit.num_detectors
         self.num_observables = self.circuit.num_observables
 
-        self.d_rounds = int(syndrome_cfg.get('d_rounds', 1))
+        # qec_rounds: number of QEC rounds baked into the stim circuit. The
+        # circuit's detectors already cover all rounds, so the syndrome output
+        # has no separate rounds dimension. Exposed under a different name so
+        # main.py's getattr(syndrome_generator, 'rounds', 1) returns 1 and the
+        # voter doesn't try to majority-vote a non-existent rounds axis.
+        self.qec_rounds = int(syndrome_cfg.get('rounds', 1))
         self.number_channel = int(syndrome_cfg.get('number_channel', 1))
 
         self.observable_flips = None
@@ -23,44 +28,31 @@ class create():
 
         logger.info(
             f'Stim syndrome measurer ready: '
-            f'{self.num_detectors} detectors, {self.num_observables} observables, '
-            f'{self.d_rounds} round(s).'
+            f'{self.num_detectors} detectors (across {self.qec_rounds} QEC round(s)), '
+            f'{self.num_observables} observables.'
         )
 
     def measure_syndrome(self, error, decoder):
         """
         Sample syndromes from the stim circuit.
 
-        Returns:
-            d_rounds == 1: syndrome [B, num_detectors]
-            d_rounds >  1: syndrome [B, d_rounds, num_detectors]
+        The stim detector vector already encodes every QEC round of the
+        circuit, so the output is always 2-D:
 
-        Side-effect:
-            ``self.observable_flips`` is set with matching shape:
-            d_rounds == 1: [B, num_observables]
-            d_rounds >  1: [B, d_rounds, num_observables]
+            syndrome:        [B, num_detectors]
+            observable_flips:[B, num_observables]
         """
         batch_size = error.shape[0]
         device = error.device
-        d = self.d_rounds
 
-        total_shots = batch_size * d
-        logger.info(f'Sampling {total_shots} shots ({batch_size} x {d} rounds) from stim circuit.')
+        logger.info(f'Sampling {batch_size} shots from stim circuit.')
 
         det_np, obs_np = self.sampler.sample(
-            shots=total_shots, separate_observables=True,
+            shots=batch_size, separate_observables=True,
         )
 
-        det = torch.from_numpy(det_np.astype('int64')).to(device)
-        obs = torch.from_numpy(obs_np.astype('uint8')).to(device)
-
-        if d > 1:
-            syndrome = det.reshape(batch_size, d, self.num_detectors)
-            self.observable_flips = obs.reshape(batch_size, d, self.num_observables)
-        else:
-            syndrome = det
-            self.observable_flips = obs
-
+        syndrome = torch.from_numpy(det_np.astype('int64')).to(device)
+        self.observable_flips = torch.from_numpy(obs_np.astype('uint8')).to(device)
         self.syndrome_actual = syndrome
 
         logger.info(f'Stim syndrome measurement complete.')

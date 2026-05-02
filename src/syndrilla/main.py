@@ -45,7 +45,7 @@ def parse_commandline_args():
                         help = 'Path to interface yaml (replaces -e, -c, -s and matrix configs).')
     parser.add_argument('-l', '--log_level', type=str, default='INFO',
                         help = 'Level of logger.')
-    parser.add_argument('-dr', '--d_rounds', type=int, default=1,
+    parser.add_argument('-dr', '--rounds', type=int, default=1,
                         help = 'Number of syndrome measurement rounds (majority vote when > 1).')
     parser.add_argument('-vs', '--vote_stage', type=str, default=None,
                         help = 'Where to apply majority vote. If not set, no voting is invoked '
@@ -125,7 +125,7 @@ def main():
     for decoder in decoders:
         decoder.eval()
         algo_name.append(decoder.algo)
-        num_max_iter.append(decoder.num_max_iter)
+        num_max_iter.append(getattr(decoder, 'num_max_iter', 0))
 
     H_file_name = bundle.get_H_file_name(check_type, number_channel)
     l_matrix = bundle.get_l_matrix(check_type, number_channel)
@@ -165,14 +165,14 @@ def main():
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
 
-            d_rounds = getattr(syndrome_generator, 'd_rounds', 1)
+            rounds = getattr(syndrome_generator, 'rounds', 1)
             vote_recorded = False
 
             logger.success(f'\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------')
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage='syndrome')
+            synd = voter.apply(synd, number_channel, rounds=rounds, vote_stage=args.vote_stage, current_stage='syndrome')
             if not vote_recorded and voter.last_sample_count > 0:
-                metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_d_rounds)
+                metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_rounds)
                 vote_recorded = True
 
             io_dict = {
@@ -188,14 +188,14 @@ def main():
                 elapsed = time.time() - start_time
 
                 decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
+                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
                 if not vote_recorded and voter.last_sample_count > 0:
-                    metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_d_rounds)
+                    metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_rounds)
                     vote_recorded = True
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
+                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
                 for key in ('llr', 'converge', 'iter'):
                     if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], d_rounds=d_rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
+                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
                 
             logger.success(f'\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------')

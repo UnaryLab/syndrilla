@@ -14,7 +14,7 @@ class RoundFlattenWrapper(torch.nn.Module):
     all outputs back to [B, d, ...] afterwards.  No-op when syndrome is 2D
     (1-channel, 1 round) or 3D with no rounds (2-channel, 1 round).
 
-    Rounds dim convention: [B, d_rounds, (C), M]
+    Rounds dim convention: [B, rounds, (C), M]
     """
 
     def __init__(self, decoder):

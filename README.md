@@ -164,7 +164,7 @@ The following table details all types of syndrome measurement Syndrilla supports
 | Syndrome model            | Description                                                                                                | Example            |
 |---------------------------|------------------------------------------------------------------------------------------------------------|--------------------|
 | Perfect                   | Ideal (error-free) syndrome measurement: returns `H * e mod 2`                                             | `perfect`          |
-| Phenomenological          | Replicates the true syndrome over `d_rounds` and flips each bit with probability `measurement_error_rate`  | `phenomenological` |
+| Phenomenological          | Replicates the true syndrome over `rounds` and flips each bit with probability `measurement_error_rate`  | `phenomenological` |
 | Stim                      | Circuit-level syndrome sampler driven by a stim circuit (used with the stim interface)                     | `stim`             |
 
 

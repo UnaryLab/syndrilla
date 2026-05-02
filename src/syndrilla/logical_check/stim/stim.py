@@ -28,16 +28,16 @@ class create():
 
         predicted_obs = (e_v @ L.T) % 2
 
-        d_rounds = observable_flips.shape[1] if observable_flips.ndim > 2 else 1
+        rounds = observable_flips.shape[1] if observable_flips.ndim > 2 else 1
 
-        if d_rounds > 1:
+        if rounds > 1:
             rounds_dim = 1
             round_checks = []
-            for r in range(d_rounds):
+            for r in range(rounds):
                 obs_r = observable_flips.select(rounds_dim, r).to(device).to(torch.float32)
                 round_checks.append(self._check_single(predicted_obs, obs_r, converge))
             logical_check = self.voter.apply(
-                torch.stack(round_checks, dim=1), number_channel=1, d_rounds=d_rounds,
+                torch.stack(round_checks, dim=1), number_channel=1, rounds=rounds,
                 vote_stage='check', current_stage='check'
             )
         else:

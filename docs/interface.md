@@ -56,7 +56,7 @@ The check and matrix YAML files used in the alist workflow are not needed here, 
 #### 2.1. Interface module
 The interface YAML file defines the backend and the code structure.
 The interface uses `code` and `distance` to generate the stim circuit and extract parity-check (H) and observable (L) matrices from its detector error model.
-The number of syndrome measurement rounds in the generated circuit is taken from the syndrome module's `d_rounds` field (see section 2.4).
+The number of syndrome measurement rounds in the generated circuit is taken from the syndrome module's `rounds` field (see section 2.4).
 An example interface configuration file is provided in ```stim_generated.interface.yaml```:
 
 ```
@@ -108,23 +108,23 @@ The following table details the configuration parameters used in the error modul
 
 #### 2.4. Syndrome module
 The syndrome YAML file defines the syndrome measurement settings.
-`d_rounds` also dictates the number of QEC rounds used when the stim circuit is generated.
+`rounds` also dictates the number of QEC rounds used when the stim circuit is generated.
 An example syndrome configuration file is provided in ```stim_generated.syndrome.yaml```:
 
 ```
 syndrome:
   measure: stim
-  d_rounds: 1
+  rounds: 1
 ```
 
 The following table details the configuration parameters used in the syndrome module YAML file.
 | Key                 | Description                                                                                         | Example  |
 |---------------------|-----------------------------------------------------------------------------------------------------|----------|
 | `syndrome.measure`  | Model for syndrome measurement                                                                      | `stim`   |
-| `syndrome.d_rounds` | Number of QEC rounds in the generated stim circuit and syndrome samples taken per error instance   | `1`      |
+| `syndrome.rounds` | Number of QEC rounds in the generated stim circuit and syndrome samples taken per error instance   | `1`      |
 
 ### 3. Vote stage
-When `d_rounds > 1`, each round is an independent sample from the stim circuit.
+When `rounds > 1`, each round is an independent sample from the stim circuit.
 The `-vs` flag controls where majority voting is applied across the rounds.
 
 The following table details the options accepted by the `-vs` flag.
@@ -148,7 +148,7 @@ error.yaml         →  noise rates                    → circuit noise paramet
                                     ├── LLR priors (per-error probabilities)
                                     └── syndrome sampler
                                            ↓
-syndrome.yaml      →  d_rounds             → [B, d, M] syndromes
+syndrome.yaml      →  rounds             → [B, d, M] syndromes
                    →  vote_stage           → majority vote placement
                                            ↓
                                     decode → logical check → metrics

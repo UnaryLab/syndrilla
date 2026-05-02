@@ -1,14 +1,14 @@
 """
 Phenomenological syndrome measurer.
 
-Computes the true syndrome (H*e), then replicates it ``d_rounds`` times
+Computes the true syndrome (H*e), then replicates it ``rounds`` times
 with independent random bit flips at rate ``measurement_error_rate``.
 
 YAML config::
 
     syndrome:
       measure: phenomenological
-      d_rounds: 3
+      rounds: 3
       measurement_error_rate: 0.01
 """
 
@@ -19,14 +19,14 @@ from loguru import logger
 class create():
 
     def __init__(self, syndrome_cfg, **kwargs) -> None:
-        self.d_rounds = int(syndrome_cfg.get('d_rounds', 1))
+        self.rounds = int(syndrome_cfg.get('rounds', 1))
         self.measurement_error_rate = float(syndrome_cfg.get('measurement_error_rate', 0.0))
         self.observable_flips = None
         self.syndrome_actual = None
 
         logger.info(
             f'Phenomenological syndrome measurer ready: '
-            f'{self.d_rounds} round(s), '
+            f'{self.rounds} round(s), '
             f'measurement_error_rate={self.measurement_error_rate}.'
         )
 
@@ -53,7 +53,7 @@ class create():
         self.syndrome_actual = syndrome
         logger.info(f'Syndrome measurement complete.')
 
-        d = self.d_rounds
+        d = self.rounds
         if d <= 1:
             return self._apply_noise(syndrome)
 

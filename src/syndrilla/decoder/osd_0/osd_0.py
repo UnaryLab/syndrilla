@@ -113,6 +113,7 @@ class create(torch.nn.Module):
             self.dtype = 'float64'
         self.dtype = torch.__dict__[self.dtype]
         self.algo = 'osd_0'
+
         bundle = kwargs.get('bundle')
         if bundle is None:
             raise ValueError('osd_0 requires a pre-loaded MatrixBundle via the `bundle` kwarg.')

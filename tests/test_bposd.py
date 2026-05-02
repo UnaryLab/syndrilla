@@ -41,7 +41,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
     for decoder in decoders:
         decoder.eval()
         algo_name.append(decoder.algo)
-        num_max_iter.append(decoder.num_max_iter)
+        num_max_iter.append(getattr(decoder, 'num_max_iter', 0))
 
     H_file_name = bundle.get_H_file_name(check_type, number_channel)
     l_matrix = bundle.get_l_matrix(check_type, number_channel)
@@ -61,10 +61,16 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
 
-            d_rounds = getattr(syndrome_generator, 'd_rounds', 1)
+            rounds = getattr(syndrome_generator, 'rounds', 1)
+            vote_recorded = False
+
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, d_rounds=d_rounds,
+            synd = voter.apply(synd, number_channel, rounds=rounds,
                                vote_stage=vote_stage, current_stage='syndrome')
+            if not vote_recorded and voter.last_sample_count > 0:
+                metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count,
+                                        voter.last_voted_stage, voter.last_rounds)
+                vote_recorded = True
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
 
@@ -74,13 +80,17 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 elapsed = time.time() - start_time
 
                 decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, d_rounds=d_rounds,
+                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds,
                                              vote_stage=vote_stage, current_stage=decoder_stage)
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, d_rounds=d_rounds,
+                if not vote_recorded and voter.last_sample_count > 0:
+                    metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count,
+                                            voter.last_voted_stage, voter.last_rounds)
+                    vote_recorded = True
+                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds,
                                               vote_stage=vote_stage, current_stage=decoder_stage)
                 for key in ('llr', 'converge', 'iter'):
                     if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], d_rounds=d_rounds,
+                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds,
                                                           vote_stage=vote_stage, current_stage=decoder_stage)
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
 
@@ -104,11 +114,13 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
             if num_batches % 100 == 0:
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name)
                 save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                            error_model.rate, num_batches, num_err, H_file_name, check_num)
+                            error_model.rate, num_batches, num_err, H_file_name, check_num,
+                            vote_info=metrics.get_vote_info())
 
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)
     save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
+                error_model.rate, num_batches, num_err, H_file_name, check_num, 1,
+                vote_info=metrics.get_vote_info())
 
 
 if __name__ == '__main__':

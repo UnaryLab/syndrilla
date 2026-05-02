@@ -1,15 +1,3 @@
-"""
-Stim DEM matrix loader.
-
-A syndrilla matrix file_type that builds its dense GF(2) matrix directly from a
-stim circuit's detector error model:
-
-    matrix:
-      file_type: stim
-      circuit: <inline stim circuit string>
-      target: check                        # 'check' (H) or 'observable' (L)
-"""
-
 import numpy as np
 from loguru import logger
 
@@ -18,8 +6,11 @@ from syndrilla.matrix.matrix import dense_to_index_format, STIM_CIRCUIT_CACHE
 
 
 def _build_dem_matrices(circuit):
-    """Extract (H, obs_mat, priors) from a stim circuit. Cached by circuit id."""
-    key = id(circuit)
+    """Extract (H, obs_mat, priors) from a stim circuit. Cached by circuit content
+    (string form) — id() can be recycled by CPython when a Circuit is freed,
+    causing a fresh Circuit to alias an unrelated cached entry.
+    """
+    key = str(circuit)
     if key in STIM_CIRCUIT_CACHE:
         return STIM_CIRCUIT_CACHE[key]
 

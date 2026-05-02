@@ -1,9 +1,3 @@
-"""
-Tests that tensor dimensions are correct at every pipeline stage for
-different combinations of d_rounds, number_channel, and vote_stage.
-All circuits and configs are generated programmatically — no file dependencies.
-"""
-
 import sys, os
 import stim
 import torch
@@ -41,7 +35,7 @@ _CIRCUIT_STR_1CH, NUM_DETECTORS, NUM_ERRORS, NUM_OBSERVABLES = _circuit_and_cons
 
 
 # ── helpers ──────────────────────────────────────────────────────────
-def make_interface(d_rounds=1, measurement_error_rate=0.0):
+def make_interface(rounds=1, measurement_error_rate=0.0):
     return create_interface(
         cfg={
             'backend': 'stim',
@@ -62,7 +56,7 @@ def make_interface(d_rounds=1, measurement_error_rate=0.0):
         },
         syndrome_cfg={
             'measure': 'stim',
-            'd_rounds': d_rounds,
+            'rounds': rounds,
             'measurement_error_rate': measurement_error_rate,
         },
     )
@@ -135,7 +129,7 @@ def make_2ch_components():
 class TestSyndromeDimensions:
 
     def test_stim_d1(self):
-        iface = make_interface(d_rounds=1)
+        iface = make_interface(rounds=1)
         err = torch.zeros(BATCH_SIZE, NUM_ERRORS, dtype=torch.float64)
         synd = iface.syndrome_generator.measure_syndrome(err, None)
         obs = iface.syndrome_generator.observable_flips
@@ -143,25 +137,29 @@ class TestSyndromeDimensions:
         assert obs.shape == (BATCH_SIZE, NUM_OBSERVABLES)
 
     def test_stim_d3(self):
-        iface = make_interface(d_rounds=3)
+        # Stim bakes all QEC rounds into the detector vector, so the output is
+        # always 2-D [B, num_detectors] regardless of rounds.
+        iface = make_interface(rounds=3)
         _, nd3, ne3, no3 = _circuit_and_constants(3)
         err = torch.zeros(BATCH_SIZE, ne3, dtype=torch.float64)
         synd = iface.syndrome_generator.measure_syndrome(err, None)
         obs = iface.syndrome_generator.observable_flips
-        assert synd.shape == (BATCH_SIZE, 3, nd3)
-        assert obs.shape == (BATCH_SIZE, 3, no3)
+        assert synd.shape == (BATCH_SIZE, nd3)
+        assert obs.shape == (BATCH_SIZE, no3)
 
-    def test_phenomenological_d3(self):
-        iface = make_interface(d_rounds=3, measurement_error_rate=0.05)
+    def test_stim_d3_noisy(self):
+        # measurement_error_rate is folded into the stim circuit's
+        # before_measure_flip_probability; output shape is unchanged.
+        iface = make_interface(rounds=3, measurement_error_rate=0.05)
         _, nd3, ne3, no3 = _circuit_and_constants(3)
         err = torch.zeros(BATCH_SIZE, ne3, dtype=torch.float64)
         synd = iface.syndrome_generator.measure_syndrome(err, None)
         obs = iface.syndrome_generator.observable_flips
-        assert synd.shape == (BATCH_SIZE, 3, nd3)
-        assert obs.shape == (BATCH_SIZE, 3, no3)
+        assert synd.shape == (BATCH_SIZE, nd3)
+        assert obs.shape == (BATCH_SIZE, no3)
 
-    def test_phenomenological_d1(self):
-        iface = make_interface(d_rounds=1, measurement_error_rate=0.05)
+    def test_stim_d1_noisy(self):
+        iface = make_interface(rounds=1, measurement_error_rate=0.05)
         err = torch.zeros(BATCH_SIZE, NUM_ERRORS, dtype=torch.float64)
         synd = iface.syndrome_generator.measure_syndrome(err, None)
         assert synd.shape == (BATCH_SIZE, NUM_DETECTORS)
@@ -173,35 +171,35 @@ class TestVoterDimensions:
     def test_noop_d1(self):
         voter = make_voter()
         t = torch.zeros(BATCH_SIZE, NUM_DETECTORS)
-        out = voter.apply(t, number_channel=1, d_rounds=1,
+        out = voter.apply(t, number_channel=1, rounds=1,
                           vote_stage='syndrome', current_stage='syndrome')
         assert out.shape == (BATCH_SIZE, NUM_DETECTORS)
 
     def test_vote_syndrome_1ch(self):
         voter = make_voter()
         t = torch.zeros(BATCH_SIZE, 3, NUM_DETECTORS)
-        out = voter.apply(t, number_channel=1, d_rounds=3,
+        out = voter.apply(t, number_channel=1, rounds=3,
                           vote_stage='syndrome', current_stage='syndrome')
         assert out.shape == (BATCH_SIZE, NUM_DETECTORS)
 
     def test_vote_syndrome_2ch(self):
         voter = make_voter()
         t = torch.zeros(BATCH_SIZE, 3, 2, NUM_DETECTORS)
-        out = voter.apply(t, number_channel=2, d_rounds=3,
+        out = voter.apply(t, number_channel=2, rounds=3,
                           vote_stage='syndrome', current_stage='syndrome')
         assert out.shape == (BATCH_SIZE, 2, NUM_DETECTORS)
 
     def test_vote_stage_mismatch_noop(self):
         voter = make_voter()
         t = torch.zeros(BATCH_SIZE, 3, NUM_DETECTORS)
-        out = voter.apply(t, number_channel=1, d_rounds=3,
+        out = voter.apply(t, number_channel=1, rounds=3,
                           vote_stage='decoder_0', current_stage='syndrome')
         assert out.shape == (BATCH_SIZE, 3, NUM_DETECTORS)
 
     def test_vote_decoder_e_v(self):
         voter = make_voter()
         t = torch.zeros(BATCH_SIZE, 5, NUM_ERRORS)
-        out = voter.apply(t, number_channel=1, d_rounds=5,
+        out = voter.apply(t, number_channel=1, rounds=5,
                           vote_stage='decoder_0', current_stage='decoder_0')
         assert out.shape == (BATCH_SIZE, NUM_ERRORS)
 
@@ -281,8 +279,8 @@ class TestMatrixBundleDimensions:
 # ── end-to-end pipeline dimension tests ─────────────────────────────
 class TestPipelineDimensions:
 
-    def _run_pipeline(self, d_rounds, vote_stage, measurement_error_rate=0.0):
-        iface = make_interface(d_rounds=d_rounds,
+    def _run_pipeline(self, rounds, vote_stage, measurement_error_rate=0.0):
+        iface = make_interface(rounds=rounds,
                                measurement_error_rate=measurement_error_rate)
         # decoders must share the interface's circuit so their H matrix matches
         # the syndrome size produced by `syndrome_generator.measure_syndrome`.
@@ -305,12 +303,12 @@ class TestPipelineDimensions:
 
         shapes = {}
         for err, llr, _ in error_dataloader:
-            dr = getattr(syndrome_generator, 'd_rounds', 1)
+            dr = getattr(syndrome_generator, 'rounds', 1)
 
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
             shapes['synd_raw'] = list(synd.shape)
 
-            synd = voter.apply(synd, number_channel, d_rounds=dr,
+            synd = voter.apply(synd, number_channel, rounds=dr,
                                vote_stage=vote_stage, current_stage='syndrome')
             shapes['synd_after_vote'] = list(synd.shape)
 
@@ -319,7 +317,7 @@ class TestPipelineDimensions:
             for decoder_idx in range(len(decoders)):
                 io_dict = decoders[decoder_idx](io_dict)
                 decoder_stage = f'decoder_{decoder_idx}'
-                vote_kwargs = dict(d_rounds=dr, vote_stage=vote_stage, current_stage=decoder_stage)
+                vote_kwargs = dict(rounds=dr, vote_stage=vote_stage, current_stage=decoder_stage)
                 io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel=1, **vote_kwargs)
                 io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, **vote_kwargs)
                 for key in ('llr', 'converge', 'iter'):
@@ -336,7 +334,7 @@ class TestPipelineDimensions:
         return shapes
 
     def test_d1_vote_syndrome(self):
-        s = self._run_pipeline(d_rounds=1, vote_stage='syndrome')
+        s = self._run_pipeline(rounds=1, vote_stage='syndrome')
         assert s['synd_raw'] == [BATCH_SIZE, NUM_DETECTORS]
         assert s['synd_after_vote'] == [BATCH_SIZE, NUM_DETECTORS]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, NUM_ERRORS]
@@ -346,8 +344,8 @@ class TestPipelineDimensions:
 
     def test_d3_vote_syndrome(self):
         _, nd3, ne3, _ = _circuit_and_constants(3)
-        s = self._run_pipeline(d_rounds=3, vote_stage='syndrome')
-        assert s['synd_raw'] == [BATCH_SIZE, 3, nd3]
+        s = self._run_pipeline(rounds=3, vote_stage='syndrome')
+        assert s['synd_raw'] == [BATCH_SIZE, nd3]
         assert s['synd_after_vote'] == [BATCH_SIZE, nd3]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, ne3]
         assert s['e_v_after_decoder_1'] == [BATCH_SIZE, ne3]
@@ -355,35 +353,35 @@ class TestPipelineDimensions:
 
     def test_d3_vote_decoder_0(self):
         _, nd3, ne3, _ = _circuit_and_constants(3)
-        s = self._run_pipeline(d_rounds=3, vote_stage='decoder_0')
-        assert s['synd_raw'] == [BATCH_SIZE, 3, nd3]
-        assert s['synd_after_vote'] == [BATCH_SIZE, 3, nd3]
+        s = self._run_pipeline(rounds=3, vote_stage='decoder_0')
+        assert s['synd_raw'] == [BATCH_SIZE, nd3]
+        assert s['synd_after_vote'] == [BATCH_SIZE, nd3]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, ne3]
         assert s['e_v_after_decoder_1'] == [BATCH_SIZE, ne3]
         assert s['check'] == [BATCH_SIZE]
 
     def test_d3_vote_decoder_1(self):
         _, nd3, ne3, _ = _circuit_and_constants(3)
-        s = self._run_pipeline(d_rounds=3, vote_stage='decoder_1')
-        assert s['synd_raw'] == [BATCH_SIZE, 3, nd3]
-        assert s['synd_after_vote'] == [BATCH_SIZE, 3, nd3]
-        assert s['e_v_after_decoder_0'] == [BATCH_SIZE, 3, ne3]
+        s = self._run_pipeline(rounds=3, vote_stage='decoder_1')
+        assert s['synd_raw'] == [BATCH_SIZE, nd3]
+        assert s['synd_after_vote'] == [BATCH_SIZE, nd3]
+        assert s['e_v_after_decoder_0'] == [BATCH_SIZE, ne3]
         assert s['e_v_after_decoder_1'] == [BATCH_SIZE, ne3]
         assert s['check'] == [BATCH_SIZE]
 
     def test_d3_noisy_vote_syndrome(self):
         _, nd3, ne3, _ = _circuit_and_constants(3)
-        s = self._run_pipeline(d_rounds=3, vote_stage='syndrome',
+        s = self._run_pipeline(rounds=3, vote_stage='syndrome',
                                measurement_error_rate=0.05)
-        assert s['synd_raw'] == [BATCH_SIZE, 3, nd3]
+        assert s['synd_raw'] == [BATCH_SIZE, nd3]
         assert s['synd_after_vote'] == [BATCH_SIZE, nd3]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, ne3]
         assert s['check'] == [BATCH_SIZE]
 
     def test_d5_vote_decoder_0(self):
         _, nd5, ne5, _ = _circuit_and_constants(5)
-        s = self._run_pipeline(d_rounds=5, vote_stage='decoder_0')
-        assert s['synd_raw'] == [BATCH_SIZE, 5, nd5]
+        s = self._run_pipeline(rounds=5, vote_stage='decoder_0')
+        assert s['synd_raw'] == [BATCH_SIZE, nd5]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, ne5]
         assert s['e_v_after_decoder_1'] == [BATCH_SIZE, ne5]
         assert s['check'] == [BATCH_SIZE]
@@ -392,7 +390,7 @@ class TestPipelineDimensions:
 # ── 2-channel dimension tests ───────────────────────────────────────
 class TestTwoChannelDimensions:
 
-    def _run_2ch_pipeline(self, d_rounds=1, vote_stage='syndrome'):
+    def _run_2ch_pipeline(self, rounds=1, vote_stage='syndrome'):
         decoders, error_model, syndrome_gen, logical_chk, bundle = make_2ch_components()
         voter = make_voter()
 
@@ -417,11 +415,11 @@ class TestTwoChannelDimensions:
             synd = syndrome_gen.measure_syndrome(err, decoders[0])
             shapes['synd_raw'] = list(synd.shape)
 
-            if d_rounds > 1:
-                synd = synd.unsqueeze(1).expand(B, d_rounds, *synd.shape[1:]).clone()
+            if rounds > 1:
+                synd = synd.unsqueeze(1).expand(B, rounds, *synd.shape[1:]).clone()
                 shapes['synd_with_rounds'] = list(synd.shape)
 
-            synd = voter.apply(synd, number_channel, d_rounds=d_rounds,
+            synd = voter.apply(synd, number_channel, rounds=rounds,
                                vote_stage=vote_stage, current_stage='syndrome')
             shapes['synd_after_vote'] = list(synd.shape)
 
@@ -430,7 +428,7 @@ class TestTwoChannelDimensions:
             for decoder_idx in range(len(decoders)):
                 io_dict = decoders[decoder_idx](io_dict)
                 decoder_stage = f'decoder_{decoder_idx}'
-                vote_kwargs = dict(d_rounds=d_rounds, vote_stage=vote_stage, current_stage=decoder_stage)
+                vote_kwargs = dict(rounds=rounds, vote_stage=vote_stage, current_stage=decoder_stage)
                 io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel=1, **vote_kwargs)
                 io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, **vote_kwargs)
                 for key in ('llr', 'converge', 'iter'):
@@ -445,7 +443,7 @@ class TestTwoChannelDimensions:
         return shapes, N, M
 
     def test_2ch_d1(self):
-        s, N, M = self._run_2ch_pipeline(d_rounds=1)
+        s, N, M = self._run_2ch_pipeline(rounds=1)
         assert s['err'] == [BATCH_SIZE, 2, N]
         assert s['synd_raw'] == [BATCH_SIZE, 2, M]
         assert s['synd_after_vote'] == [BATCH_SIZE, 2, M]
@@ -453,14 +451,14 @@ class TestTwoChannelDimensions:
         assert s['check'] == [BATCH_SIZE, 2]
 
     def test_2ch_d3_vote_syndrome(self):
-        s, N, M = self._run_2ch_pipeline(d_rounds=3, vote_stage='syndrome')
+        s, N, M = self._run_2ch_pipeline(rounds=3, vote_stage='syndrome')
         assert s['synd_with_rounds'] == [BATCH_SIZE, 3, 2, M]
         assert s['synd_after_vote'] == [BATCH_SIZE, 2, M]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, 2, N]
         assert s['check'] == [BATCH_SIZE, 2]
 
     def test_2ch_d3_vote_decoder_0(self):
-        s, N, M = self._run_2ch_pipeline(d_rounds=3, vote_stage='decoder_0')
+        s, N, M = self._run_2ch_pipeline(rounds=3, vote_stage='decoder_0')
         assert s['synd_with_rounds'] == [BATCH_SIZE, 3, 2, M]
         assert s['synd_after_vote'] == [BATCH_SIZE, 3, 2, M]
         assert s['e_v_after_decoder_0'] == [BATCH_SIZE, 2, N]

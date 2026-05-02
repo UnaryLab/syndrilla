@@ -87,14 +87,6 @@ class create(torch.nn.Module):
         self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
-        # trainable per-iteration weights
-        self.trainable = decoder_cfg.get('trainable', False)
-        if self.trainable:
-            # per-iteration CN scaling (replaces hardcoded beta = 1 - 2^(-i))
-            self.weights_cn = torch.nn.Parameter(torch.ones(self.max_iter, dtype=self.dtype, device=self.device))
-            # per-iteration LLR combination weight
-            self.weights_llr = torch.nn.Parameter(torch.ones(self.max_iter, dtype=self.dtype, device=self.device))
-
         self.algo = 'bp_norm_min_sum'
         self.num_max_iter = self.max_iter
         
@@ -175,10 +167,6 @@ class create(torch.nn.Module):
 
             s_est = self.syndrome_estimation(e_v)
 
-            if self.training:
-                # during training, run all iterations to preserve gradient flow
-                continue
-
             # different samples from the same batch may terminated at different iteration (pick the smallest one)
             indices = torch.all(s_est == syndrome, 1).nonzero()
             checker = torch.where(num_iters == -1.0)[0]
@@ -203,18 +191,12 @@ class create(torch.nn.Module):
                 })
                 return io_dict
 
-        if self.training:
-            # return soft LLR from final iteration for differentiable loss computation
-            e_out = e_v[:, :-1]
-            l_out = l_v[:, :-1]
-            num_iters[:] = self.max_iter
-        else:
-            checker = torch.where(num_iters == -1)[0]
-            e_out[checker] = e_v[checker]
-            l_out[checker] = l_v[checker]
-            num_iters[checker] = self.max_iter
-            e_out = e_out[:, :-1]
-            l_out = l_out[:, :-1]
+        checker = torch.where(num_iters == -1)[0]
+        e_out[checker] = e_v[checker]
+        l_out[checker] = l_v[checker]
+        num_iters[checker] = self.max_iter
+        e_out = e_out[:, :-1]
+        l_out = l_out[:, :-1]
 
         logger.info(f'Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
@@ -236,12 +218,9 @@ class create(torch.nn.Module):
         
 
     def cn_update(self, a_v2c):
-        if self.trainable:
-            beta = self.weights_cn[self.i - 1]
-        else:
-            base = torch.tensor(2.0, dtype=self.dtype)
-            exponent = torch.tensor(-(self.i), dtype=self.dtype)
-            beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
+        base = torch.tensor(2.0, dtype=self.dtype)
+        exponent = torch.tensor(-(self.i), dtype=self.dtype)
+        beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
 
         # compute sgn
         sign = torch.sgn(a_v2c)
@@ -265,13 +244,8 @@ class create(torch.nn.Module):
         partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
         sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
 
-        if self.trainable:
-            w = self.weights_llr[self.i - 1]
-            sum_b_c2v = u_init + sum_b_c2v
-            sum_b_c2v.scatter_add_(1, partitions_flat, data_flat * w)
-        else:
-            sum_b_c2v = u_init + sum_b_c2v
-            sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+        sum_b_c2v = u_init + sum_b_c2v
+        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
 
         return sum_b_c2v
 
