@@ -27,6 +27,7 @@ jobs:
           pip install -e . --no-deps
           pip install pytest pyyaml yamlordereddictloader loguru numpy scipy pyfiglet
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install stim ldpc
 
       - name: Run tests
         run: pytest -v
