@@ -1,4 +1,4 @@
 syndrome:
   measure: phenomenological
-  d_rounds: 3
-  measurement_error_rate: 0.01
+  rounds: 10
+  measurement_error_rate: 0.05
