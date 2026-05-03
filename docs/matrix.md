@@ -90,6 +90,8 @@ The `target` field selects which matrix to expose:
 - `check`: the detector parity-check matrix H (detectors x error mechanisms).
 - `observable`: the logical observable matrix L (observables x error mechanisms).
 
+In the resulting matrix, **the stabilizer (detector) axis is treated as the variable-node axis of the Tanner graph, and the error-mechanism axis as the check-node axis** — i.e. the loader hands the decoder the matrix in the orientation it expects, so no transpose is needed downstream. This is opposite to the conventional `H[checks, variables]` layout used in classical LDPC literature; keep it in mind when porting matrices in/out of stim.
+
 An example inline matrix configuration using the stim format is:
 
 ```

@@ -121,17 +121,6 @@ The following table details the configuration parameters used in the syndrome mo
 | `syndrome.measure`  | Model for syndrome measurement                                                                      | `stim`   |
 | `syndrome.rounds` | Number of QEC rounds in the generated stim circuit and syndrome samples taken per error instance   | `1`      |
 
-### 3. Vote stage
-When `rounds > 1`, each round is an independent sample from the stim circuit.
-The `-vs` flag controls where majority voting is applied across the rounds.
-
-The following table details the options accepted by the `-vs` flag.
-| `-vs` value  | Description                                                                 |
-|--------------|-----------------------------------------------------------------------------|
-| `syndrome`   | Vote on syndromes before decoding                                           |
-| `decoder_0`  | Vote after the first decoder                                                |
-| `decoder_1`  | Vote after the second decoder (e.g., after OSD)                             |
-| `decoder`    | Vote after the last decoder                                                 |
 
 
 ## Pipeline flow
@@ -153,3 +142,5 @@ syndrome.yaml      →  rounds, measurement_error_rate
                                            ↓
                                     decode → logical check → metrics
 ```
+
+ **Tanner-graph node convention:** In the H/L matrices the loader hands the decoder, **the stabilizer (detector) axis is treated as the variable-node axis of the Tanner graph, and the error-mechanism axis as the check-node axis**. The matrix already arrives in the orientation the decoder expects, so no transpose is needed downstream. This is opposite to the conventional `H[checks, variables]` layout used in classical LDPC literature.

@@ -32,9 +32,6 @@ class BatchTracker:
         self.shape = shape
         self.dtype = dtype
         self.device = device
-        # `rounds` is a hint only; each buffer is allocated lazily to match the
-        # actual tensor shape of the first record, so decoders that have voting
-        # before them and decoders that don't can coexist with different shapes.
         self.rounds = int(rounds)
         self.reset()
 
@@ -54,9 +51,24 @@ class BatchTracker:
         empty_shape = (0,) + tuple(sample.shape[1:])
         return torch.empty(empty_shape, dtype=dtype or sample.dtype, device=self.device)
 
+    def _flatten_rounds(self, t, base_ndim):
+        """If `t` carries a rounds axis at dim=1 (i.e., t.ndim > base_ndim),
+        flatten it into the batch axis: [B, R, ...] → [B*R, ...]. Otherwise
+        return as-is."""
+        if t.ndim > base_ndim:
+            R = t.shape[1]
+            return t.reshape(t.shape[0] * R, *t.shape[2:])
+        return t
+
     def record_error(self, err):
-        """Append the ground-truth error batch. Buffer is sized on first call."""
+        """Append the ground-truth error batch. If self.rounds > 1, replicate
+        the error vector across rounds (errors live on data qubits and don't
+        depend on measurement round)."""
         err = err.to(self.device)
+        if self.rounds > 1:
+            R = self.rounds
+            err = err.unsqueeze(1).expand(err.shape[0], R, *err.shape[1:]) \
+                       .reshape(err.shape[0] * R, *err.shape[1:])
         if self.e_all is None:
             self.e_all = self.ensure_buffer(err, dtype=err.dtype)
         self.e_all = torch.cat((self.e_all, err))
@@ -73,6 +85,13 @@ class BatchTracker:
         e_v = io_dict['e_v'].to(device=self.device, dtype=self.dtype)
         converge = io_dict['converge'].to(device=self.device, dtype=self.dtype)
         iter_val = io_dict['iter'].to(device=self.device, dtype=self.dtype)
+
+        # Flatten rounds-into-batch: e_v base ndim is 2 (1ch) or 3 (2ch), if no voting.
+        # iter/converge base ndim is 1 (one scalar per sample).
+        e_v_base = 3 if self.number_channel > 1 else 2
+        e_v = self._flatten_rounds(e_v, e_v_base)
+        iter_val = self._flatten_rounds(iter_val, 1)
+        converge = self._flatten_rounds(converge, 1)
 
         if self.e_v_all[i] is None:
             self.e_v_all[i] = self.ensure_buffer(e_v, dtype=self.dtype)
@@ -280,7 +299,8 @@ class MetricState:
             else:
                 ch_map = []
 
-            state.total_time[idx] = float(entry['total time (s)']) * bc
+            # total_time is saved raw by save_metric (NOT divided by num_batches)。
+            state.total_time[idx] = float(entry['total time (s)'])
             state.average_time_sample[idx] = float(entry['average time per sample (s)']) * bc
             state.average_iter[idx] = float(entry['average iteration']) * bc
             state.distribution[idx] = torch.tensor(entry['iteration distribution'])
@@ -363,7 +383,7 @@ def report_metric(num_max_iter, e_estimated, e_actual, iteration, time_iteration
         average_iter = 0.0
         distribution = torch.zeros(num_max_iter+1).to(e_estimated.device)
     else:
-        distribution = torch.bincount((iteration - 1).int(), minlength=num_max_iter+1).int().to(e_estimated.device)
+        distribution = torch.bincount((iteration - 1).int().flatten(), minlength=num_max_iter+1).int().to(e_estimated.device)
         average_iter = torch.mean(iteration).item()
 
     logger.info(f'Average iterations per sample: {average_iter}')
