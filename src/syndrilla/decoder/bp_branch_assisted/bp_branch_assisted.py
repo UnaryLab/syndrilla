@@ -5,8 +5,6 @@ from loguru import logger
 
 import numpy as np
 
-from syndrilla.matrix import create_parity_matrix
-from syndrilla.utils import compute_lz
 
 
 class create(torch.nn.Module):
@@ -84,28 +82,14 @@ class create(torch.nn.Module):
             logger.warning(f'Invalid input machine type <{self.random_machine}>, default to <sobol>.')
             self.random_machine = 'sobol'
 
-        # get the column and row index for all 1s in parity check matrix
-        logger.info(f'Creating hx parity check matrix.')
-        self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device)
-
-        logger.info(f'Creating hz parity check matrix.')
-        self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device)
-
-        if self.check_type.lower() == 'hx':
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hx_matrix.get_index()
-        else: 
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hz_matrix.get_index()
-            
-        # compute lx, switch hx and hz position can compute lz
-        # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
-        logger.info(f'Creating lx and lz parity check matrix.')
-        logical_check_matrix =  decoder_cfg.get('logical_check_matrix', False)
-        if logical_check_matrix:
-            self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device).get_dense()
-            self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device).get_dense()
-        else:
-            self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
-            self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
+        bundle = kwargs.get('bundle')
+        if bundle is None:
+            raise ValueError('bp_branch_assisted requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+        self.Hx_matrix = bundle.Hx_matrix
+        self.Hz_matrix = bundle.Hz_matrix
+        self.lx_matrix = bundle.lx_matrix
+        self.lz_matrix = bundle.lz_matrix
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
 
@@ -117,6 +101,7 @@ class create(torch.nn.Module):
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
         self.algo = 'bp_branch_assisted'
+        self.num_max_iter = self.max_iter * self.max_b_iter
         
         logger.info(f'Complete.')
 

@@ -1,10 +1,5 @@
 decoder:
   algorithm: bp_norm_min_sum
   check_type: hx
-  parity_matrix_hx: examples/txt/hx.matrix.yaml
-  parity_matrix_hz: examples/txt/hz.matrix.yaml
   max_iter: 50
   dtype: float64
-  logical_check_matrix: True
-  logical_check_lx: examples/txt/lx.matrix.yaml
-  logical_check_lz: examples/txt/lz.matrix.yaml

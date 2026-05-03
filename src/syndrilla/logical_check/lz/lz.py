@@ -33,8 +33,8 @@ class create():
             logger.info(f'Logical check rate measurement complete.')
         else:
             e_v_total = e_v_total.to(error_vector.device)
-            lz_matrix = lz_matrix.to(error_vector.device).to(error_vector.dtype).unsqueeze(0)
-            
+            lz_matrix = torch.as_tensor(lz_matrix, device = error_vector.device, dtype = error_vector.dtype).unsqueeze(0)
+
             logical_check = ((e_v_total + error_vector)%2).to(e_v_total.dtype).unsqueeze(3)
 
             # lx logical check is obtained by matrix multiplication between lx matrix with ((e + e_hat) % 2) (need to use matmul)

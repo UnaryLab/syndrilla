@@ -1,4 +1,4 @@
-import os, sys, yaml, json, torch, random
+import os, sys, yaml, json, csv, torch, random
 import numpy as np
 import importlib.util
 
@@ -6,6 +6,18 @@ from collections import OrderedDict
 from yamlordereddictloader import SafeDumper
 from yamlordereddictloader import SafeLoader
 from loguru import logger
+
+
+def parse_device_dtype(cfg):
+    """Resolve (device, dtype) from a decoder/interface cfg dict."""
+    device_cfg = cfg.get('device', {})
+    device_type = device_cfg.get('device_type', 'cuda' if torch.cuda.is_available() else 'cpu')
+    if device_type == 'cuda' and torch.cuda.is_available():
+        device = torch.device(f"cuda:{device_cfg.get('device_idx', 0)}")
+    else:
+        device = torch.device('cpu')
+    dtype = torch.__dict__[cfg.get('dtype', 'float64')]
+    return device, dtype
 
 
 class bcolors:
@@ -231,6 +243,34 @@ def get_path(path):
     path = os.path.realpath(path)
     assert os.path.exists(path), logger.error('Invalid path: ' + path)
     return path
+
+
+def majority_vote(tensor, dim=1):
+    """
+    Majority vote along the given dimension (typically the rounds dimension).
+
+    Args:
+        tensor: [..., d, ...] binary tensor with d rounds along `dim`
+        dim:    dimension to vote over (default 1 for [B, d, M])
+
+    Returns:
+        voted tensor with `dim` collapsed: [..., ...]
+        Each element is 1 if more than half the rounds had 1, else 0.
+    """
+    return (tensor.sum(dim=dim) > tensor.size(dim) / 2).to(tensor.dtype)
+
+
+def save_metrics_to_csv(csv_path, row_dict, fieldnames):
+    """
+    Save one row of metrics to a CSV file. Creates a new file with a header
+    if one doesn't already exist, otherwise appends to the existing file.
+    """
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_dict)
 
 
 def uniquify_list(sequence):

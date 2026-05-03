@@ -1,0 +1,14 @@
+matrix:
+  parity_matrix_hx:
+    file_type: txt
+    path: examples/txt/h_matrix/hgp_(4,7)-[[400,16,6]]_hx.txt
+  parity_matrix_hz:
+    file_type: txt
+    path: examples/txt/h_matrix/hgp_(4,7)-[[400,16,6]]_hz.txt
+  logical_check_matrix: True
+  logical_check_lx:
+    file_type: txt
+    path: examples/txt/h_matrix/hgp_(4,7)-[[400,16,6]]_lx.txt
+  logical_check_lz:
+    file_type: txt
+    path: examples/txt/h_matrix/hgp_(4,7)-[[400,16,6]]_lz.txt

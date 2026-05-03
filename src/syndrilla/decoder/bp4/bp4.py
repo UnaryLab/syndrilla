@@ -4,8 +4,6 @@ from loguru import logger
 
 import numpy as np
 
-from syndrilla.matrix import create_parity_matrix
-from syndrilla.utils import compute_lz
 
 
 class create(torch.nn.Module):
@@ -71,27 +69,17 @@ class create(torch.nn.Module):
             logger.warning(f'Invalid input damping factor <{self.d}>, default to <0.1>.')
             self.max_iter = 50
 
-        # get the column and row index for all 1s in parity check matrix
-        logger.info(f'Creating hx parity check matrix.')
-        self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device, dtype=self.dtype)
+        bundle = kwargs.get('bundle')
+        if bundle is None:
+            raise ValueError('bp4 requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+        self.Hx_matrix = bundle.Hx_matrix
+        self.Hz_matrix = bundle.Hz_matrix
+        self.lx_matrix = bundle.lx_matrix
+        self.lz_matrix = bundle.lz_matrix
 
-        logger.info(f'Creating hz parity check matrix.')
-        self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device, dtype=self.dtype)
-
-       
+        # bp4 needs indices from both Hx and Hz (no check_type selection)
         self.H_shape, self.Hx_V_c_row, self.Hx_V_c_col, _ = self.Hx_matrix.get_index()
         _, self.Hz_V_c_row, self.Hz_V_c_col, _ = self.Hz_matrix.get_index()
-        
-        # compute lx, switch hx and hz position can compute lz
-        # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
-        logger.info(f'Creating lx and lz parity check matrix.')
-        logical_check_matrix =  decoder_cfg.get('logical_check_matrix', False)
-        if logical_check_matrix:
-            self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device, dtype=self.dtype).get_dense()
-            self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device, dtype=self.dtype).get_dense()
-        else:
-            self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
-            self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
 
         self.mask_dummy = (self.Hx_V_c_col == self.H_shape[1])
 
@@ -105,12 +93,13 @@ class create(torch.nn.Module):
         self.V_c_col = torch.nn.Parameter(torch.stack((self.Hx_V_c_col, self.Hz_V_c_col)), requires_grad=False)
 
         self.algo = 'bp4'
+        self.num_max_iter = self.max_iter
         
         logger.info(f'Complete.')
 
 
     def forward(self, io_dict):
-        """Iterative bp4 (normalized min sum) decoding algorithm
+        """Iterative bp4 (Quaternary BP) decoding algorithm
         Input:
             syndrome: estimated syndrome for c-th code node
 
@@ -128,7 +117,7 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f'Initializing bp (normailized min sum) decoding.')
+        logger.info(f'Initializing bp4 (Quaternary BP) decoding.')
 
 
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)

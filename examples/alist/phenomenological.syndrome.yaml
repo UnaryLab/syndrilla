@@ -1,0 +1,4 @@
+syndrome:
+  measure: phenomenological
+  rounds: 10
+  measurement_error_rate: 0.05

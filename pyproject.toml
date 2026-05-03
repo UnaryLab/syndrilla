@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-version = "2026.01.21"
+version = "v1.0.0"
 name = "syndrilla"
 authors = [
   { name="Yanzhang Zhu", email="yanzhang.zhu@ucf.edu" },
@@ -41,3 +41,7 @@ sources = ["src"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["syndrilla", "syndrilla/*"]

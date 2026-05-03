@@ -1,0 +1,14 @@
+matrix:
+  parity_matrix_hx:
+    file_type: npz
+    path: examples/npz/h_matrix/pk_x_p3_delta8.npz
+  parity_matrix_hz:
+    file_type: npz
+    path: examples/npz/h_matrix/pk_z_p3_delta8.npz
+  logical_check_matrix: True
+  logical_check_lx:
+    file_type: txt
+    path: examples/npz/h_matrix/pk_x_p3_delta8_lx.txt
+  logical_check_lz:
+    file_type: txt
+    path: examples/npz/h_matrix/pk_x_p3_delta8_lz.txt
