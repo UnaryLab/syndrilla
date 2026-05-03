@@ -64,7 +64,6 @@ error:
   model: stim_circuit
   after_clifford_depolarization: 0.01
   after_reset_flip_probability: 0.01
-  before_measure_flip_probability: 0.01
   before_round_data_depolarization: 0.01
 ```
 
@@ -74,7 +73,6 @@ The following table details the configuration parameters used in the stim error 
 | `error.model`                            | Type of error model applied to the stim circuit                             | `stim_circuit`   |
 | `error.after_clifford_depolarization`    | Depolarizing noise applied after each Clifford gate                         | `0.01`           |
 | `error.after_reset_flip_probability`     | Bit-flip noise applied after each reset operation                           | `0.01`           |
-| `error.before_measure_flip_probability`  | Bit-flip noise applied before each measurement                              | `0.01`           |
 | `error.before_round_data_depolarization` | Depolarizing noise applied to data qubits before each syndrome round        | `0.01`           |
 
 For each error mechanism `i` in the DEM with probability `p_i`, the LLR prior passed to the decoder is `log((1 - p_i) / p_i)`. The actual sample errors are produced by the stim syndrome measurer, so `inject_error` returns dummy zero errors paired with the DEM-derived LLRs.

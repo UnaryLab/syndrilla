@@ -93,7 +93,6 @@ error:
   model: stim_circuit
   after_clifford_depolarization: 0.01
   after_reset_flip_probability: 0.01
-  before_measure_flip_probability: 0.01
   before_round_data_depolarization: 0.01
 ```
 
@@ -103,7 +102,6 @@ The following table details the configuration parameters used in the error modul
 | `error.model`                            | Type of error model applied to the stim circuit                             | `stim_circuit`   |
 | `error.after_clifford_depolarization`    | Depolarizing noise applied after each Clifford gate                         | `0.01`           |
 | `error.after_reset_flip_probability`     | Bit-flip noise applied after each reset operation                           | `0.01`           |
-| `error.before_measure_flip_probability`  | Bit-flip noise applied before each measurement                              | `0.01`           |
 | `error.before_round_data_depolarization` | Depolarizing noise applied to data qubits before each syndrome round        | `0.01`           |
 
 #### 2.4. Syndrome module
@@ -138,18 +136,20 @@ The following table details the options accepted by the `-vs` flag.
 
 ## Pipeline flow
 
+The stim circuit is generated jointly from all three YAMLs — `interface.yaml` supplies `code`/`distance`, `error.yaml` supplies the per-gate noise rates, and `syndrome.yaml` supplies `rounds` and (optionally) `measurement_error_rate`, which is forwarded to stim as `before_measure_flip_probability`.
+
 ```
-interface.yaml     →  backend (stim), code, distance → stim.Circuit.generated()
-error.yaml         →  noise rates                    → circuit noise parameters
+interface.yaml     →  backend (stim), code, distance
+error.yaml         →  noise rates (after_clifford_depolarization, ...)
+syndrome.yaml      →  rounds, measurement_error_rate
+                                           ↓
+                                  stim.Circuit.generated()
                                            ↓
                                     stim circuit
                                     ├── H matrix (detectors × errors)
                                     ├── L matrix (observables × errors)
                                     ├── LLR priors (per-error probabilities)
-                                    └── syndrome sampler
-                                           ↓
-syndrome.yaml      →  rounds             → [B, d, M] syndromes
-                   →  vote_stage           → majority vote placement
+                                    └── syndrome sampler → [B, d, M] syndromes
                                            ↓
                                     decode → logical check → metrics
 ```
