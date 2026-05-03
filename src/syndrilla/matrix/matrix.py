@@ -106,8 +106,8 @@ class MatrixBundle:
 
     def get_l_matrix(self, check_type, number_channel):
         if number_channel > 1:
-            lx = torch.tensor(self.lx_matrix)
-            lz = torch.tensor(self.lz_matrix)
+            lx = torch.as_tensor(self.lx_matrix)
+            lz = torch.as_tensor(self.lz_matrix)
             return torch.stack((lx, lz), dim=1)
         if check_type.lower() == 'hx':
             return self.lx_matrix

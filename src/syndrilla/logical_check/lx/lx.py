@@ -32,7 +32,7 @@ class create():
             logger.info(f'Logical check rate measurement complete.')
         else:
             e_v_total = e_v_total.to(error_vector.device)
-            lx_matrix = torch.tensor(lx_matrix, device = error_vector.device, dtype = error_vector.dtype).unsqueeze(0)
+            lx_matrix = torch.as_tensor(lx_matrix, device = error_vector.device, dtype = error_vector.dtype).unsqueeze(0)
 
             logical_check = ((e_v_total + error_vector)%2).to(e_v_total.dtype).unsqueeze(3)
 
