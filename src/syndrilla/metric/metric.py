@@ -26,50 +26,62 @@ class BatchTracker:
     were previously initialised and managed inline in main.py.
     """
 
-    def __init__(self, num_decoders, number_channel, shape, dtype, device):
+    def __init__(self, num_decoders, number_channel, shape, dtype, device, rounds=1):
         self.num_decoders = num_decoders
         self.number_channel = number_channel
         self.shape = shape
         self.dtype = dtype
-        device = torch.device(device) if not isinstance(device, torch.device) else device
-        if device.type == 'cuda' and not torch.cuda.is_available():
-            logger.warning('BatchTracker: CUDA device requested but unavailable; using CPU.')
-            device = torch.device('cpu')
         self.device = device
+        # `rounds` is a hint only; each buffer is allocated lazily to match the
+        # actual tensor shape of the first record, so decoders that have voting
+        # before them and decoders that don't can coexist with different shapes.
+        self.rounds = int(rounds)
         self.reset()
 
     def reset(self):
-        """Clear all buffers for a new batch."""
-        nc, s, dt, dev = self.number_channel, self.shape, self.dtype, self.device
+        """Clear all buffers for a new batch. Buffers are allocated lazily on
+        first record (per-decoder), so each can have its own shape — handy when
+        voting collapses rounds for some decoders but not others."""
         nd = self.num_decoders
-        empty_shape = (0, nc, s[1]) if nc > 1 else (0, s[1])
-        self.e_v_all = [torch.empty(empty_shape, dtype=dt, device=dev) for _ in range(nd)]
-        self.e_all = torch.empty(empty_shape, dtype=dt, device=dev)
-        self.converge_all = [torch.empty((0), dtype=dt, device=dev) for _ in range(nd + 1)]
-        self.iter_all = [torch.empty((0), dtype=dt, device=dev) for _ in range(nd)]
+        self.e_v_all = [None] * nd
+        self.e_all = None
+        self.converge_all = [None] * (nd + 1)
+        self.iter_all = [None] * nd
         self.time_iter_all = [[] for _ in range(nd)]
 
+    def ensure_buffer(self, sample, dtype=None):
+        """Allocate an empty buffer matching `sample`'s shape (with batch dim 0)."""
+        empty_shape = (0,) + tuple(sample.shape[1:])
+        return torch.empty(empty_shape, dtype=dtype or sample.dtype, device=self.device)
+
     def record_error(self, err):
-        """Append the ground-truth error batch."""
-        err = err.to(self.e_all.device)
+        """Append the ground-truth error batch. Buffer is sized on first call."""
+        err = err.to(self.device)
+        if self.e_all is None:
+            self.e_all = self.ensure_buffer(err, dtype=err.dtype)
         self.e_all = torch.cat((self.e_all, err))
 
     def record_decoder(self, decoder_idx, io_dict, elapsed):
-        """Record one decoder's output for the current batch."""
+        """Record one decoder's output for the current batch.
+
+        Each per-decoder decoder N's e_v may have a rounds axis while
+        decoder N+1's doesn't (or vice versa) depending on `vote_stage`.
+        """
         i = decoder_idx
         self.time_iter_all[i].append(elapsed)
 
-        e_v = io_dict['e_v'].to(device=self.device, dtype=self.e_v_all[i].dtype)
-        converge = io_dict['converge'].to(device=self.device, dtype=self.converge_all[i + 1].dtype)
-        iter_val = io_dict['iter'].to(device=self.device, dtype=self.iter_all[i].dtype)
+        e_v = io_dict['e_v'].to(device=self.device, dtype=self.dtype)
+        converge = io_dict['converge'].to(device=self.device, dtype=self.dtype)
+        iter_val = io_dict['iter'].to(device=self.device, dtype=self.dtype)
 
-        expected_ndim = 3 if self.number_channel > 1 else 2
-        if e_v.ndim > expected_ndim:
-            e_v = e_v[:, 0]
-        if converge.ndim > 1:
-            converge = converge[:, 0]
-        if iter_val.ndim > 1:
-            iter_val = iter_val[:, 0]
+        if self.e_v_all[i] is None:
+            self.e_v_all[i] = self.ensure_buffer(e_v, dtype=self.dtype)
+        if self.iter_all[i] is None:
+            self.iter_all[i] = self.ensure_buffer(iter_val, dtype=self.dtype)
+        if self.converge_all[i + 1] is None:
+            self.converge_all[i + 1] = self.ensure_buffer(converge, dtype=self.dtype)
+        if i == 0 and self.converge_all[0] is None:
+            self.converge_all[0] = self.ensure_buffer(converge, dtype=self.dtype)
 
         self.e_v_all[i] = torch.cat((self.e_v_all[i], e_v), dim=0)
         self.iter_all[i] = torch.cat((self.iter_all[i], iter_val))
@@ -97,11 +109,6 @@ class MetricState:
     def __init__(self, num_decoders, number_channel, device):
         self.num_decoders = num_decoders
         self.number_channel = number_channel
-        # Same CUDA-unavailable fallback as BatchTracker.
-        device = torch.device(device) if not isinstance(device, torch.device) else device
-        if device.type == 'cuda' and not torch.cuda.is_available():
-            logger.warning('MetricState: CUDA device requested but unavailable; using CPU.')
-            device = torch.device('cpu')
         self.device = device
 
         # scalar accumulators: list[float] indexed by decoder
