@@ -1,46 +1,22 @@
-name: Publish to PyPI
+publish-pypi:
+  name: Publish to Pypi
+  needs: build
+  runs-on: ubuntu-latest
+  if: |
+    (github.event_name == 'push' && !contains(github.ref_name, '-')) ||
+    (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+  environment: 
+    name: pypi
+    url: https://pypi.org/project/syndrilla
+  permissions:
+    id-token: write
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist
+        path: dist/
 
-on:
-  release:
-    types: [published]
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    environment: pypi 
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build tools
-        run: pip install build
-
-      - name: Build sdist and wheel
-        run: python -m build
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with: 
+        skip-exiting: false
