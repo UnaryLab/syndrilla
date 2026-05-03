@@ -1,22 +1,173 @@
-publish-pypi:
-  name: Publish to Pypi
-  needs: build
-  runs-on: ubuntu-latest
-  if: |
-    (github.event_name == 'push' && !contains(github.ref_name, '-')) ||
-    (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
-  environment: 
-    name: pypi
-    url: https://pypi.org/project/syndrilla
-  permissions:
-    id-token: write
-  steps:
-    - uses: actions/download-artifact@v4
-      with:
-        name: dist
-        path: dist/
+name: Publish to PyPI
 
-    - name: Publish to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with: 
-        skip-exiting: false
+on:
+  push:
+    tags:
+      # Publish on any semver-ish tag: v1.2.3, v1.2.3-rc1, v0.1.0, etc.
+      - "v*"
+  workflow_dispatch:
+    # Manual trigger for emergency republishes from the Actions UI.
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: "testpypi"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+# Only one publish run at a time to avoid racing uploads.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Build wheel + sdist. Runs first so that if the build fails, we
+  #    don't even try to publish. Artifacts are shared with the publish
+  #    jobs below via actions/upload-artifact.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so hatchling's version-from-git machinery (if
+          # ever enabled) sees the tag. Harmless for a static version.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          # Build with the minimum supported Python so the resulting
+          # sdist/wheel can't accidentally use a newer-only syntax
+          # feature. Per `requires-python = ">=3.9"` in pyproject.toml.
+          python-version: "3.9"
+          cache: pip
+
+      - name: Install build backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build
+
+      - name: Verify version tag matches pyproject.toml
+        # When a tag like v1.0.0 triggers the workflow, sanity-check that
+        # pyproject.toml declares the same version. Prevents the "tag
+        # says v1.0.1, wheel says 1.0.0" mismatch that wrecks releases.
+        # Skipped on manual (workflow_dispatch) runs since those don't
+        # come from a tag.
+        if: github.event_name == 'push'
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION=$(python -c "
+          import sys
+          try:
+              import tomllib  # py3.11+
+          except ModuleNotFoundError:
+              import tomli as tomllib
+          print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])
+          ")
+          # Strip a leading 'v' from pyproject.toml for projects that
+          # use 'v1.0.0' as the static version string (syndrilla does).
+          PYPROJECT_VERSION="${PYPROJECT_VERSION#v}"
+          echo "Tag version:        $TAG_VERSION"
+          echo "pyproject version:  $PYPROJECT_VERSION"
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml version $PYPROJECT_VERSION. Bump pyproject.toml before tagging, or retag."
+            exit 1
+          fi
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: List built artifacts
+        run: ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # 2. Publish to TestPyPI.
+  #
+  #    Runs when:
+  #      - Tag push AND tag name contains rc/alpha/beta/dev
+  #        (e.g. v1.0.0-rc1, v1.0.0a2) — lets us do release dry-runs
+  #      - Manual run with target=testpypi
+  #
+  #    Uses trusted publishing (OIDC). Configure at:
+  #      https://test.pypi.org/manage/account/publishing/
+  #      Project:     syndrilla
+  #      Owner:       UnaryLab
+  #      Repo:        syndrilla
+  #      Workflow:    publish.yml
+  #      Environment: testpypi
+  # ---------------------------------------------------------------------
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && contains(github.ref_name, '-')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi')
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/syndrilla
+    # Required for PyPI trusted publishing via OIDC. No API token needed.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  # ---------------------------------------------------------------------
+  # 3. Publish to production PyPI.
+  #
+  #    Runs when:
+  #      - Tag push AND tag name is a final release (no rc/alpha/beta)
+  #      - Manual run with target=pypi (use sparingly — tags are the
+  #        documented release path)
+  #
+  #    Configure trusted publishing at:
+  #      https://pypi.org/manage/account/publishing/
+  #      Project:     syndrilla
+  #      Owner:       UnaryLab
+  #      Repo:        syndrilla
+  #      Workflow:    publish.yml
+  #      Environment: pypi
+  # ---------------------------------------------------------------------
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && !contains(github.ref_name, '-')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    environment:
+      name: pypi
+      url: https://pypi.org/project/syndrilla
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Defaults to https://upload.pypi.org/legacy/ — production PyPI.
+          skip-existing: false
