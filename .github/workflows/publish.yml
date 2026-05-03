@@ -4,7 +4,7 @@ on:
   push:
     tags:
       # Publish on any semver-ish tag: v1.2.3, v1.2.3-rc1, v0.1.0, etc.
-      - "v1.0.0"
+      - "v*"
   workflow_dispatch:
     # Manual trigger for emergency republishes from the Actions UI.
     inputs:
