@@ -505,15 +505,25 @@ CPU: Intel i9-13900K
 
 
 ## Citation
-If you use Syndrilla in your research, please cite the following paper:
+If you use Syndrilla in your research, please cite the following papers:
 
 ```bibtex
-@inproceedings{2025_qce_syndrilla,
+@article{2026_arxiv_lottery_bp,
+	title={{Lottery BP: Unlocking Quantum Error Decoding at Scale}},
+	author={Yanzhang Zhu and Chen-Yu Peng and Yun Hao Chen and Yeong-Luh Ueng and Di Wu},
+	year={2026},
+	eprint={2605.00038},
+	archivePrefix={arXiv},
+	url={https://arxiv.org/abs/2605.00038}
+}
+```
+```bibtex
+@article{2025_qce_syndrilla,
 	title={{Syndrilla: Simulating Decoders for Quantum Error Correction using PyTorch}},
 	author={Yanzhang Zhu and Chen-Yu Peng and Yun Hao Chen and Siyuan Niu and Yeong-Luh Ueng and Di Wu},
 	booktitle={International Conference on Quantum Computing and Engineering},
 	year={2025}
-} 
+}
 ```
 
 ## Contribution

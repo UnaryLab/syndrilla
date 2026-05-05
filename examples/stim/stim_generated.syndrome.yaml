@@ -1,4 +1,4 @@
 syndrome:
   measure: stim
-  d_rounds: 3
-  measurement_error_rate: 0.01
+  rounds: 3
+  measurement_error_rate: 0.1
