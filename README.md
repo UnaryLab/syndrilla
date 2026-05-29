@@ -83,7 +83,7 @@ syndrilla -r=tests/test_outputs
           -e=examples/alist/bsc.error.yaml 
           -c=examples/alist/lx.check.yaml 
           -s=examples/alist/perfect.syndrome.yaml 
-          -m=examples/alist/lx.check.yaml 
+          -m=examples/alist/surface_10.matrix.yaml 
           -bs=10000 
           -te=1000
 ```
@@ -176,18 +176,33 @@ Syndrilla accepts matrix from:
 2. [.npz](https://numpy.org/doc/2.1/reference/generated/numpy.savez.html) format from NumPy, which contains a sparse matrix.
 3. .txt format containing a dense 2D matrix. Each row represents a check node of the H matrix, in which each 1 entry denotes a connecting variable node to that check node.
 
-An example matrix configuration file that loads a matrix from a alist file is provided in ```hx.matrix.yaml```:
+A decoder consumes a bundle of matrices (Hx, Hz, and optionally Lx and Lz). These are combined into a single matrix YAML file, where each entry can be referenced as a file path or inlined as a config dict. An example combined matrix configuration is provided in ```surface_10.matrix.yaml```, which is the file passed via `-m` in the command above:
 
 ```
 matrix:
-  file_type: alist
-  path: examples/alist/surface/surface_10_hx.alist
+  parity_matrix_hx:
+    file_type: alist
+    path: examples/alist/surface/surface_10_hx.alist
+  parity_matrix_hz:
+    file_type: alist
+    path: examples/alist/surface/surface_10_hz.alist
+  logical_check_matrix: True
+  logical_check_lx:
+    file_type: alist
+    path: examples/alist/surface/surface_10_lx.alist
+  logical_check_lz:
+    file_type: alist
+    path: examples/alist/surface/surface_10_lz.alist
 ```
-The following table details the configuration parameters used in the matrix module YAML file.
-| Key              | Description                                                   | Example                   |
-|------------------|---------------------------------------------------------------|---------------------------|
-|`matrix.file_type`| Format of the parity-check matrix file                        | `alist`, `npz`, `txt`, or `stim` |
-|`matrix.path`     | Path to the parity-check matrix file (file-based formats)     | `examples/alist/surface/surface_10_hx.alist`                     |
+
+The following table details the configuration parameters used in the combined matrix YAML file.
+| Key                           | Description                                                                                            | Example                                      |
+|-------------------------------|--------------------------------------------------------------------------------------------------------|----------------------------------------------|
+| `matrix.parity_matrix_hx`     | Matrix entry (path or inline dict) for the X-type parity-check matrix                                  | `examples/alist/surface/surface_10_hx.alist` |
+| `matrix.parity_matrix_hz`     | Matrix entry (path or inline dict) for the Z-type parity-check matrix                                  | `examples/alist/surface/surface_10_hz.alist` |
+| `matrix.logical_check_matrix` | Flag for whether logical-check matrices are provided; if `False`, they are computed from Hx/Hz via `compute_lz` | `True` or `False`                            |
+| `matrix.logical_check_lx`     | Matrix entry for the X-type logical-check matrix (used when `logical_check_matrix = True`)             | `examples/alist/surface/surface_10_lx.alist` |
+| `matrix.logical_check_lz`     | Matrix entry for the Z-type logical-check matrix (used when `logical_check_matrix = True`)             | `examples/alist/surface/surface_10_lz.alist` |
 
 The following table details all matrix formats Syndrilla supports. (Using different matrix formats may need different configuration format, which will be shown on [Matrix module](docs/matrix.md).)
 
@@ -208,15 +223,10 @@ decoder:
   algorithm: [bp_norm_min_sum, osd_0]
   check_type: hx
   max_iter: 131
-  parity_matrix_hx: examples/alist/hx.matrix.yaml
-  parity_matrix_hz: examples/alist/hz.matrix.yaml
   dtype: float64
   device: 
     device_type: cuda
     device_idx: 0
-  logical_check_matrix: True
-  logical_check_lx: examples/alist/lx.matrix.yaml
-  logical_check_lz: examples/alist/lz.matrix.yaml
 ``` 
 
 The following table details the configuration parameters used in the decoder module YAML file.
@@ -227,12 +237,7 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.device.device_type`       | Type of the device where the decoding will happen                                       | `cpu` or `cuda`                                       |
 | `decoder.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
 | `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `131`                                              |
-| `decoder.parity_matrix_hx` | Path to the X-type parity-check matrix in YAML format                   | `examples/alist/hx.matrix.yaml`                   |
-| `decoder.parity_matrix_hz` | Path to the Z-type parity-check matrix in YAML format                   | `examples/alist/hz.matrix.yaml`                   |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
-| `decoder.logical_check_matrix` |  Whether logical check matrices are provided. If not provided, the decoder is supposed to compute these logical check matrices based from parity-check matrices.           | `True` or `False`                                 |
-| `decoder.logical_check_lx` | Path to the X-type logical check matrix in YAML format               | `examples/alist/lx.matrix.yaml`                   |
-| `decoder.logical_check_lz` | Path to the Z-type logical check matrix in YAML format               | `examples/alist/lz.matrix.yaml`                   |
 
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 

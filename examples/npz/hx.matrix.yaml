@@ -1,3 +1,0 @@
-matrix:
-  file_type: npz
-  path: examples/npz/h_matrix/pk_x_p3_delta8.npz
