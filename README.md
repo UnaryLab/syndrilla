@@ -97,6 +97,7 @@ Following is a table for detailed explaination on each command line arguments:
 | `-e`     | Path to error model YAML file                | `-e=examples/alist/bsc.error.yaml`                |
 | `-c`     | Path to check matrix YAML file               | `-c=examples/alist/lx.check.yaml`                 |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/alist/perfect.syndrome.yaml`         |
+| `-m`     | Path to matrix YAML file                     | `-m=examples/alist/surface_10.matrix.yaml`        |
 | `-ckpt`  | Path to checkpoint YAML file to resume | `-ch=result_phy_err.yaml`                         |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
 | `-te`    | Total number of errors to stop decoding      | `-te=1000`                                         |
