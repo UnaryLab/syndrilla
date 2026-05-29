@@ -104,11 +104,11 @@ def make_2ch_components():
         'device': {'device_type': 'cpu', 'device_idx': 0},
     }
     matrix_cfg = {
-        'parity_matrix_hx': 'examples/alist/hx.matrix.yaml',
-        'parity_matrix_hz': 'examples/alist/hz.matrix.yaml',
+        'parity_matrix_hx': {'file_type': 'alist', 'path': 'examples/alist/surface/surface_10_hx.alist'},
+        'parity_matrix_hz': {'file_type': 'alist', 'path': 'examples/alist/surface/surface_10_hz.alist'},
         'logical_check_matrix': True,
-        'logical_check_lx': 'examples/alist/lx.matrix.yaml',
-        'logical_check_lz': 'examples/alist/lz.matrix.yaml',
+        'logical_check_lx': {'file_type': 'alist', 'path': 'examples/alist/surface/surface_10_lx.alist'},
+        'logical_check_lz': {'file_type': 'alist', 'path': 'examples/alist/surface/surface_10_lz.alist'},
     }
     bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
     decoders = create_decoder(cfg=decoder_cfg, bundle=bundle)

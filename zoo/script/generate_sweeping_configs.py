@@ -31,45 +31,49 @@ def generate_decoder(base_path: str, code, check_type, distance, dtype, decoder)
             config['decoder']['max_iter'] = distance*2*(distance-1)+1
         else:
             config['decoder']['max_iter'] = distance*2*(distance)
-        config['decoder']['parity_matrix_hx'] = base_path + 'hx.matrix.yaml'
-        config['decoder']['parity_matrix_hz'] = base_path + 'hz.matrix.yaml'
-        config['decoder']['logical_check_matrix'] = True
-        config['decoder']['logical_check_lx'] = base_path + 'lx.matrix.yaml'
-        config['decoder']['logical_check_lz'] = base_path + 'lz.matrix.yaml'
 
     write_yaml(target_file, config)
 
 
 def generate_matrix(base_path: str, code, distance):
     """
-        Generate matrix yaml files from examples
+        Generate comprehensive matrix yaml file with all parity and logical check matrices
     """
     base_path = base_path if base_path.endswith('/') else base_path + '/'
-    template_path = 'examples/alist/'
-    generated_path = base_path
+    target_file = os.path.join(base_path, 'matrix.yaml')
 
-    check_type_list = ['hx', 'hz', 'lx', 'lz']
+    config = {
+        'matrix': {
+            'parity_matrix_hx': {
+                'file_type': 'alist',
+                'path': f'examples/alist/{code}/{code}_{distance}_hx.alist'
+            },
+            'parity_matrix_hz': {
+                'file_type': 'alist',
+                'path': f'examples/alist/{code}/{code}_{distance}_hz.alist'
+            },
+            'logical_check_matrix': True,
+            'logical_check_lx': {
+                'file_type': 'alist',
+                'path': f'examples/alist/{code}/{code}_{distance}_lx.alist'
+            },
+            'logical_check_lz': {
+                'file_type': 'alist',
+                'path': f'examples/alist/{code}/{code}_{distance}_lz.alist'
+            }
+        }
+    }
+    write_yaml(target_file, config)
 
-    # create all hx, hz, lx, lz matrix yaml files 
-    for check_type in check_type_list:
-        configuration_dict = template_path + f'{check_type}.matrix.yaml'
-        target_file = os.path.join(generated_path, f'{check_type}.matrix.yaml')
 
-        # Read, modify, and write
-        config = read_yaml(configuration_dict)
-        if 'matrix' in config:
-            config['matrix']['path'] = f'examples/alist/{code}/{code}_{distance}_{check_type}.alist'
-        write_yaml(target_file, config)
-
-
-def generate_error(base_path: str, probability):
+def generate_error(base_path: str, probability, rounds=1):
     """
         Generate error yaml file from examples
     """
     base_path = base_path if base_path.endswith('/') else base_path + '/'
     template_path = 'examples/alist/'
     generated_path = base_path
-    
+
     configuration_dict = template_path + 'bsc.error.yaml'
     target_file = os.path.join(generated_path, 'bsc.error.yaml')
 
@@ -77,42 +81,26 @@ def generate_error(base_path: str, probability):
     config = read_yaml(configuration_dict)
     if 'error' in config:
         config['error']['rate'] = probability
+        if rounds > 1:
+            config['error']['rounds'] = rounds
     write_yaml(target_file, config)
 
 
-def generate_syndrome(base_path: str):
+def generate_syndrome(base_path: str, syndrome_type='perfect', measurement_error_rate=0.0):
     """
         Generate syndrome yaml file from examples
     """
     base_path = base_path if base_path.endswith('/') else base_path + '/'
     template_path = 'examples/alist/'
     generated_path = base_path
-    
-    configuration_dict = template_path + 'perfect.syndrome.yaml'
-    target_file = os.path.join(generated_path, 'perfect.syndrome.yaml')
 
-    # Read, and write
+    configuration_dict = template_path + f'{syndrome_type}.syndrome.yaml'
+    target_file = os.path.join(generated_path, f'{syndrome_type}.syndrome.yaml')
+
+    # Read, modify, and write
     config = read_yaml(configuration_dict)
-    write_yaml(target_file, config)
-
-
-def generate_checker(base_path: str, check_type):
-    """
-        Generate logical check yaml file from examples
-    """
-    base_path = base_path if base_path.endswith('/') else base_path + '/'
-    template_path = 'examples/alist/'
-    generated_path = base_path
-
-    if check_type == 'hx':
-        configuration_dict = template_path + 'lx.check.yaml'
-        target_file = os.path.join(generated_path, 'lx.check.yaml')
-    else:
-        configuration_dict = template_path + 'lz.check.yaml'
-        target_file = os.path.join(generated_path, 'lz.check.yaml')
-
-    # Read, write
-    config = read_yaml(configuration_dict)
+    if syndrome_type == 'phenomenological' and 'syndrome' in config:
+        config['syndrome']['measurement_error_rate'] = measurement_error_rate
     write_yaml(target_file, config)
 
 
