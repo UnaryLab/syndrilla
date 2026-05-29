@@ -83,6 +83,7 @@ syndrilla -r=tests/test_outputs
           -e=examples/alist/bsc.error.yaml 
           -c=examples/alist/lx.check.yaml 
           -s=examples/alist/perfect.syndrome.yaml 
+          -m=examples/alist/lx.check.yaml 
           -bs=10000 
           -te=1000
 ```

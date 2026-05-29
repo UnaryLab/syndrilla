@@ -14,6 +14,8 @@ class create():
                  **kwargs) -> None:
         assert 'rate' in error_model_cfg.keys(), logger.error(f'Missing key <rate> in the configuration.')
         self.rate = error_model_cfg['rate']
+        # default to 1, and it will be set in main.py
+        self.rounds = 1
 
         device_cfg = error_model_cfg.get('device', {})
         self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
@@ -37,12 +39,19 @@ class create():
             codeword = codeword.to(self.device)
             if batch_size == 0:
                 batch_size = codeword.size(0)
-            # random values in [0,1)
-            random_values = torch.rand_like(codeword)
             self.dtype = codeword.dtype
-            self.len = codeword.shape
-            
-            error = torch.where(random_values < self.rate, 1 - codeword, codeword)
+
+            if self.rounds > 1:
+                # [B, N] -> [B, rounds, N] with independent errors per round
+                random_values = torch.rand(codeword.size(0), self.rounds, codeword.size(1),
+                                           device=codeword.device, dtype=codeword.dtype)
+                expanded = codeword.unsqueeze(1).expand(-1, self.rounds, -1)
+                error = torch.where(random_values < self.rate, 1 - expanded, expanded)
+            else:
+                random_values = torch.rand_like(codeword)
+                error = torch.where(random_values < self.rate, 1 - codeword, codeword)
+
+            self.len = error.shape
             dataloader = torch.utils.data.DataLoader(dataset(error, self.get_llr(error), torch.arange(0, codeword.size(0))), batch_size=batch_size, shuffle=False)
             logger.info(f'Injection complete.')
         else:

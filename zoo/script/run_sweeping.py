@@ -25,6 +25,8 @@ def parse_commandline_args():
                         help = 'The decoder.')
     parser.add_argument('-bs', '--batch_size', type=int, default=10000,
                         help = 'The number of samples run each batch.')
+    parser.add_argument('-st', '--syndrome_type', type=str, default='perfect',
+                        help = 'The syndrome type (perfect or phenomenological).')
     parser.add_argument('-l', '--log_level', type=str, default='SUCCESS',
                         help = 'The log level to record runtime statistics.')
 
@@ -39,6 +41,7 @@ def main(target_error):
     assert args.decoder in decoder_list, logger.error(f'Illegal input decoder: {args.decoder}; legal values: {decoder_list}.')
     decoder = args.decoder
     batch_size = args.batch_size
+    syndrome_type = args.syndrome_type
     log_level = args.log_level
 
     subdirs = sorted([d for d in os.listdir(run_dir) if os.path.isdir(os.path.join(run_dir, d))], reverse=True)
@@ -57,8 +60,10 @@ def main(target_error):
             check_yaml = os.path.join(folder_path, 'lz.check.yaml')
 
         error_yaml = os.path.join(folder_path, 'bsc.error.yaml')
-        syndrome_yaml = os.path.join(folder_path, 'perfect.syndrome.yaml')
 
+        syndrome_yaml = os.path.join(folder_path, f'{syndrome_type}.syndrome.yaml')
+        matrix_yaml = os.path.join(folder_path, 'matrix.yaml')
+        
         # set command line arguement to load all yaml file from the folder
         cmd = [
             'syndrilla',
@@ -67,6 +72,7 @@ def main(target_error):
             f'-e={error_yaml}',
             f'-c={check_yaml}',
             f'-s={syndrome_yaml}',
+            f'-m={matrix_yaml}',
             f'-bs={batch_size}',
             f'-te={target_error}',
             f'-l={log_level}'
@@ -78,20 +84,13 @@ def main(target_error):
         if results_files:
             print('Results exist: ', results_files[0])
             cmd.append(f'-ckpt={results_files[0]}')
-            print('Run command: ', ' '.join(cmd))
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            # Print stdout/stderr for debugging
-            print('  --> STDOUT:\n', result.stdout)
-            print('  --> STDERR:\n', result.stderr)
         else:
             print('Results do not exist.')
-            print('Run command: ', ' '.join(cmd))
-            result = subprocess.run(cmd, capture_output=True, text=True)
 
-            # Print stdout/stderr for debugging
-            print('  --> STDOUT:\n', result.stdout)
-            print('  --> STDERR:\n', result.stderr)
+        print('Run command: ', ' '.join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        print('  --> STDOUT:\n', result.stdout)
+        print('  --> STDERR:\n', result.stderr)
 
 
 if __name__ == '__main__':

@@ -106,6 +106,8 @@ def main():
         logger.success(f'\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------')
         logical_check = create_check(args.logical_yaml)
 
+    error_model.rounds = getattr(syndrome_generator, 'rounds', 1)
+
     num_decoders = len(decoders)
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
@@ -158,18 +160,17 @@ def main():
         error_vector, error_dataloader = error_model.inject_error(zero_qubits, args.batch_size)
         num_batches += 1
 
-        avg_error_rate = torch.mean(torch.sum(error_vector, 1) / shape[1])
+        avg_error_rate = torch.mean(torch.sum(error_vector, -1) / shape[1])
         logger.info(f'Specified error rate <{error_model.rate}>.')
         logger.info(f'Generated error rate <{avg_error_rate}>.')
 
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
-
-            rounds = getattr(syndrome_generator, 'rounds', 1)
             vote_recorded = False
 
             logger.success(f'\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------')
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
+            rounds = getattr(syndrome_generator, 'rounds', 1)
             synd = voter.apply(synd, number_channel, rounds=rounds, vote_stage=args.vote_stage, current_stage='syndrome')
             if not vote_recorded and voter.last_sample_count > 0:
                 metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_rounds)
