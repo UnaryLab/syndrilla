@@ -222,7 +222,7 @@ An example decoder configuration file is provided in ```bposd_hx.decoder.yaml```
 decoder:
   algorithm: [bp_norm_min_sum, osd_0]
   check_type: hx
-  max_iter: 131
+  max_iter: 181
   dtype: float64
   device: 
     device_type: cuda
@@ -236,7 +236,7 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.check_type`   | Type of parity-check matrix used                                            | `hx` or `hz`                                       |
 | `decoder.device.device_type`       | Type of the device where the decoding will happen                                       | `cpu` or `cuda`                                       |
 | `decoder.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
-| `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `131`                                              |
+| `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `181`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
@@ -300,59 +300,59 @@ Example output of running above code:
 decoder_0:
   algorithm: bp_norm_min_sum
   decoder invoke rate: 1.00000000000000000e+00
-  average iteration: 1.79144704761904791e+02
-  distribution: [1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4,
-    4, 5, 6, 7, 14, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242,
-    242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242,
-    242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242,
-    242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242,
-    242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242, 242]
-  total time (s): '1.53461852073669434e+01'
-  average time per batch (s): '7.30770724160330620e-01'
-  average time per sample (s): '7.30770724160330684e-05'
-  average time per iteration (s): '4.07948710925328149e-07'
+  average iteration: 7.69916235294117968e+01
+  iteration distribution: [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 5, 5, 6, 6, 8, 14, 131,
+    131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131,
+    131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131,
+    131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131, 131,
+    131, 131, 131, 131, 131, 131, 131, 131, 131]
+  total time (s): '1.10485250949859619e+01'
+  average time per batch (s): '6.49913240881527104e-02'
+  average time per sample (s): '6.49913240881526920e-05'
+  average time per iteration (s): '8.44576808757733200e-07'
   hx:
-    data qubit accuracy: 9.81257221566312232e-01
-    data qubit correction accuracy: 6.69583968602863844e-01
-    data frame error rate: 7.78004761904761977e-01
-    syndrome frame error rate: 7.36490476190476140e-01
-    logical error rate: 7.36661904761904740e-01
-    converge failure rate: 1.71428571428571425e-04
-    converge success rate: 2.63338095238095149e-01
+    data qubit accuracy: 9.75190120246994030e-01
+    data qubit correction accuracy: 6.41507008117403132e-01
+    data frame error rate: 6.73282352941176554e-01
+    syndrome frame error rate: 5.77482352941176336e-01
+    logical error rate: 5.78029411764705681e-01
+    converge failure rate: 5.47058823529412205e-04
+    converge success rate: 4.21970588235294097e-01
 decoder_1:
   algorithm: osd_0
-  decoder invoke rate: 7.36490476190476140e-01
-  average iteration: 2.36568818167190017e+02
-  distribution: [1, 227, 229, 230, 230, 231, 231, 232, 232, 233, 233, 233, 233, 234,
-    234, 234, 234, 234, 234, 235, 235, 235, 235, 235, 235, 235, 236, 236, 236, 236,
-    236, 236, 236, 236, 236, 236, 236, 236, 236, 237, 237, 237, 237, 237, 237, 237,
-    237, 237, 237, 237, 237, 237, 237, 238, 238, 238, 238, 238, 238, 238, 238, 238,
-    238, 238, 238, 238, 238, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239,
-    239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239, 239,
-    239, 239, 239, 239, 239, 239, 239]
-  total time (s): '1.02458470344543457e+02'
-  average time per batch (s): '4.87897477831159332e+00'
-  average time per sample (s): '4.87897477831159237e-04'
-  average time per iteration (s): '2.06239091821614230e-06'
+  decoder invoke rate: 5.77482352941176336e-01
+  average iteration: 1.77477071406242374e+02
+  iteration distribution: [1, 170, 172, 172, 173, 173, 174, 174, 174, 175, 175, 175,
+    175, 175, 175, 176, 176, 176, 176, 176, 176, 176, 176, 176, 177, 177, 177, 177,
+    177, 177, 177, 177, 177, 177, 177, 178, 178, 178, 178, 178, 178, 178, 178, 178,
+    178, 178, 178, 178, 178, 178, 178, 178, 178, 178, 178, 178, 178, 178, 179, 179,
+    179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179,
+    179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179, 179,
+    179, 179, 179, 179, 179, 179, 179, 179, 179]
+  total time (s): '6.03572950363159180e+01'
+  average time per batch (s): '3.55042911978328934e-01'
+  average time per sample (s): '3.55042911978328650e-04'
+  average time per iteration (s): '2.00049854387823897e-06'
   hx:
-    data qubit accuracy: 9.83180617866981299e-01
-    data qubit correction accuracy: 7.11704897881009879e-01
-    data frame error rate: 5.94433333333333369e-01
+    data qubit accuracy: 9.81503314917126946e-01
+    data qubit correction accuracy: 6.86872349409486938e-01
+    data frame error rate: 5.27194117647059146e-01
     syndrome frame error rate: 0.00000000000000000e+00
-    logical error rate: 4.87619047619047580e-03
-    converge failure rate: 4.87619047619047580e-03
-    converge success rate: 9.95123809523809744e-01
+    logical error rate: 5.92352941176471030e-03
+    converge failure rate: 5.92352941176471030e-03
+    converge success rate: 9.94076470588235228e-01
 decoder_full:
-  batch size: 10000
-  batch count: 21
+  batch size: 1000
+  batch count: 170
   target error: 1000
-  target error reached: 1024
+  target error reached: 1007
   data type: torch.float64
   physical error rate: 5.00000000000000028e-02
-  total time (s): '1.17804655551910400e+02'
-  H matrix: /home/ya212494/code/syndrilla/examples/alist/toric/toric_11_hx.alist
+  total time (s): '7.14058201313018799e+01'
+  H matrix: /home/ya212494/code/syndrilla/examples/alist/surface/surface_10_hx.alist
   hx:
-    logical error rate: 7.36661904761904740e-01
+    logical error rate: 5.78029411764705681e-01
 ```
 
 #### 3.1. Per-decoder metrics
