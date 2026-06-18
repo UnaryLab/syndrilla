@@ -649,3 +649,56 @@ def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_d
         trigger = n_extra >= min(remaining / extra_density, batch_size)
     return (trigger or flushing), flushing
 
+
+class ExtraQueue:
+    """Deferred-sample queue for the iter_speedup adaptive cap.
+
+    The cap leaves hard (unconverged) samples behind; they are parked here on CPU
+    and re-decoded later in full, uncapped batches. This class owns the offload
+    scheduling (WHEN to flush, via should_flush_extra_queue) and the one-time
+    hard-queue density measurement; the cap itself decides WHICH samples get
+    deferred. A no-op until samples are actually deferred into it.
+    """
+
+    def __init__(self, batch_size, target_error, device='cpu'):
+        self.batch_size = batch_size
+        self.target_error = target_error
+        self.device = device   # decoder's device: deferred samples live where they're re-decoded
+        self.err = None        # [n, N] deferred errors (on self.device)
+        self.llr = None        # [n, ...] deferred priors (on self.device)
+        self.density = None    # errors-per-drained-sample, frozen after the FIRST flush
+
+    def __len__(self):
+        return 0 if self.err is None else self.err.shape[0]
+
+    @property
+    def nonempty(self):
+        return len(self) > 0
+
+    def defer(self, err, llr, defer_mask):
+        """Park the rows selected by defer_mask (a full-batch bool tensor) onto the queue."""
+        if not bool(defer_mask.any()):
+            return
+        d = defer_mask.to(err.device)                  # index on err's device
+        e_def, l_def = err[d].detach().to(self.device), llr[d].detach().to(self.device)
+        self.err = e_def if self.err is None else torch.cat((self.err, e_def))
+        self.llr = l_def if self.llr is None else torch.cat((self.llr, l_def))
+
+    def should_flush(self, num_err):
+        """(do_flush, flushing): wrap should_flush_extra_queue with the queue's own state."""
+        return should_flush_extra_queue(len(self), num_err, self.target_error,
+                                        self.batch_size, self.density)
+
+    def take_batch(self):
+        """Pop up to batch_size of the hardest deferred samples as a one-item dataloader.
+        Returns (error_dataloader, n_taken)."""
+        n = min(self.batch_size, len(self))
+        batch = [(self.err[:n], self.llr[:n], None)]
+        self.err, self.llr = self.err[n:], self.llr[n:]
+        return batch, n
+
+    def freeze_density(self, errors_found, n_drained):
+        """Set the hard-queue error density once, from the first flushed batch, then hold it."""
+        if self.density is None and n_drained:
+            self.density = int(errors_found) / n_drained
+

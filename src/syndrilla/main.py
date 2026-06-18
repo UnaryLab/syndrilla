@@ -1,12 +1,8 @@
 import torch
-import re
-import sys, os, time
-import pyfiglet, argparse, time
-import numpy as np
-import yaml
-import subprocess
+import os, time
+import pyfiglet, argparse
 from loguru import logger
-from syndrilla.utils import bcolors, read_yaml, get_path, parse_device_dtype, should_flush_extra_queue
+from syndrilla.utils import bcolors, read_yaml, get_path, parse_device_dtype, ExtraQueue
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
 from syndrilla.syndrome import create_syndrome
@@ -156,25 +152,20 @@ def main():
     if cap_on and getattr(syndrome_generator, 'rounds', 1) != 1:
         logger.warning('iter_speedup supports rounds==1 only; disabling the cap.')
         cap_on = False
-    extra_err = None       # deferred (hard) samples, kept on CPU until re-decoded
-    extra_llr = None
-    extra_density = None   # hard-queue error density g, set from the FIRST extra batch (None = not yet)
+    queue = ExtraQueue(args.batch_size, args.target_error, decoder_device)   # deferred (hard) samples
 
-    while num_err <= args.target_error or (cap_on and extra_err is not None and extra_err.shape[0] > 0):
+    while num_err <= args.target_error or (cap_on and queue.nonempty):
         logger.success(f'\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------')
         bt = BatchTracker(num_decoders, number_channel, shape, dtype, decoder_device)
-        
+
         # predict_pct offload scheduler: decide WHEN to re-decode the deferred queue
-        n_extra = 0 if extra_err is None else extra_err.shape[0]
-        do_flush, flushing = should_flush_extra_queue(n_extra, num_err, args.target_error, args.batch_size, extra_density)
+        do_flush, flushing = queue.should_flush(num_err)
         use_extra = cap_on and do_flush
         if cap_on:
             inner0.cap_bypass = use_extra
         if use_extra:
             # re-decode a batch of the hardest deferred samples together (one batch at a time)
-            n = min(args.batch_size, n_extra)
-            error_dataloader = [(extra_err[:n], extra_llr[:n], None)]
-            extra_err, extra_llr = extra_err[n:], extra_llr[n:]
+            error_dataloader, n = queue.take_batch()
             logger.info(f'Decoding <{n}> deferred samples from the extra queue '
                         f'({"flush" if flushing else "predict_pct"}).')
         else:
@@ -229,12 +220,7 @@ def main():
             cap_keep = None
             if cap_on and getattr(inner0, 'cap_active_last', False):
                 keep = (bt.converge_all[1].flatten() > 0)
-                defer = ~keep
-                if bool(defer.any()):
-                    dcpu = defer.cpu()
-                    e_def, l_def = err[dcpu].detach().cpu(), llr[dcpu].detach().cpu()
-                    extra_err = e_def if extra_err is None else torch.cat((extra_err, e_def))
-                    extra_llr = l_def if extra_llr is None else torch.cat((extra_llr, l_def))
+                queue.defer(err, llr, ~keep)
                 cap_keep = keep.to(bt.e_all.device)
                 bt.keep_samples(cap_keep)
 
@@ -267,8 +253,8 @@ def main():
                 logger.success(f'Saved log to <{output_log}>.')
                 logger.success(f'Saved metric results to <{args.run_dir}>.')
 
-        if use_extra and extra_density is None:   # measure density from the FIRST extra batch, then freeze
-            extra_density = int(num_err - num_err_before_batch) / n
+        if use_extra:   # measure density from the FIRST extra batch, then freeze
+            queue.freeze_density(num_err - num_err_before_batch, n)
 
     logger.success(f'\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------')
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)
