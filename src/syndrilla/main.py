@@ -6,7 +6,7 @@ import numpy as np
 import yaml
 import subprocess
 from loguru import logger
-from syndrilla.utils import bcolors, read_yaml, get_path, parse_device_dtype
+from syndrilla.utils import bcolors, read_yaml, get_path, parse_device_dtype, should_flush_extra_queue
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
 from syndrilla.syndrome import create_syndrome
@@ -151,19 +151,42 @@ def main():
     else:
         logger.info(f'No input Checkpoint file.')
 
-    while num_err <= args.target_error:
+    inner0 = getattr(decoders[0], 'decoder', decoders[0])
+    cap_on = getattr(inner0, 'cap', None) is not None
+    if cap_on and getattr(syndrome_generator, 'rounds', 1) != 1:
+        logger.warning('iter_speedup supports rounds==1 only; disabling the cap.')
+        cap_on = False
+    extra_err = None       # deferred (hard) samples, kept on CPU until re-decoded
+    extra_llr = None
+    extra_density = None   # hard-queue error density g, set from the FIRST extra batch (None = not yet)
+
+    while num_err <= args.target_error or (cap_on and extra_err is not None and extra_err.shape[0] > 0):
         logger.success(f'\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------')
         bt = BatchTracker(num_decoders, number_channel, shape, dtype, decoder_device)
-
-        # create error
-        zero_qubits = torch.zeros([args.batch_size, shape[1]], dtype=dtype)
-        error_vector, error_dataloader = error_model.inject_error(zero_qubits, args.batch_size)
+        
+        # predict_pct offload scheduler: decide WHEN to re-decode the deferred queue
+        n_extra = 0 if extra_err is None else extra_err.shape[0]
+        do_flush, flushing = should_flush_extra_queue(n_extra, num_err, args.target_error, args.batch_size, extra_density)
+        use_extra = cap_on and do_flush
+        if cap_on:
+            inner0.cap_bypass = use_extra
+        if use_extra:
+            # re-decode a batch of the hardest deferred samples together (one batch at a time)
+            n = min(args.batch_size, n_extra)
+            error_dataloader = [(extra_err[:n], extra_llr[:n], None)]
+            extra_err, extra_llr = extra_err[n:], extra_llr[n:]
+            logger.info(f'Decoding <{n}> deferred samples from the extra queue '
+                        f'({"flush" if flushing else "predict_pct"}).')
+        else:
+            # create error
+            zero_qubits = torch.zeros([args.batch_size, shape[1]], dtype=dtype)
+            error_vector, error_dataloader = error_model.inject_error(zero_qubits, args.batch_size)
+            avg_error_rate = torch.mean(torch.sum(error_vector, -1) / shape[1])
+            logger.info(f'Specified error rate <{error_model.rate}>.')
+            logger.info(f'Generated error rate <{avg_error_rate}>.')
         num_batches += 1
 
-        avg_error_rate = torch.mean(torch.sum(error_vector, -1) / shape[1])
-        logger.info(f'Specified error rate <{error_model.rate}>.')
-        logger.info(f'Generated error rate <{avg_error_rate}>.')
-
+        num_err_before_batch = num_err  
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
             vote_recorded = False
@@ -172,13 +195,17 @@ def main():
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
             rounds = getattr(syndrome_generator, 'rounds', 1)
             synd = voter.apply(synd, number_channel, rounds=rounds, vote_stage=args.vote_stage, current_stage='syndrome')
+
+            llr0 = llr
+            if hasattr(syndrome_generator, 'adjust_llr0'):
+                llr0 = syndrome_generator.adjust_llr0(llr0)
             if not vote_recorded and voter.last_sample_count > 0:
                 metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count, voter.last_voted_stage, voter.last_rounds)
                 vote_recorded = True
 
             io_dict = {
                 'synd': synd,
-                'llr0': llr,
+                'llr0': llr0,
                 'H_matrix': H_matrix
             }
 
@@ -198,11 +225,25 @@ def main():
                     if key in io_dict and io_dict[key].ndim > 1:
                         io_dict[key] = voter.select_round(io_dict[key], rounds=rounds, vote_stage=args.vote_stage, current_stage=decoder_stage)
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
-                
+
+            cap_keep = None
+            if cap_on and getattr(inner0, 'cap_active_last', False):
+                keep = (bt.converge_all[1].flatten() > 0)
+                defer = ~keep
+                if bool(defer.any()):
+                    dcpu = defer.cpu()
+                    e_def, l_def = err[dcpu].detach().cpu(), llr[dcpu].detach().cpu()
+                    extra_err = e_def if extra_err is None else torch.cat((extra_err, e_def))
+                    extra_llr = l_def if extra_llr is None else torch.cat((extra_llr, l_def))
+                cap_keep = keep.to(bt.e_all.device)
+                bt.keep_samples(cap_keep)
+
             logger.success(f'\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------')
 
             has_obs_flips = hasattr(syndrome_generator, 'observable_flips') and syndrome_generator.observable_flips is not None
             check_error = syndrome_generator.observable_flips.to(dtype) if has_obs_flips else bt.e_all
+            if cap_keep is not None and has_obs_flips:
+                check_error = check_error[cap_keep]
 
             check = [[] for _ in range(num_decoders)]
             for i in range(num_decoders):
@@ -225,6 +266,9 @@ def main():
                 save_metric(all_metrics, args.run_dir + '/', args.batch_size, args.target_error, str(dtype), error_model.rate, num_batches, num_err, H_file_name, check_num, vote_info=metrics.get_vote_info())
                 logger.success(f'Saved log to <{output_log}>.')
                 logger.success(f'Saved metric results to <{args.run_dir}>.')
+
+        if use_extra and extra_density is None:   # measure density from the FIRST extra batch, then freeze
+            extra_density = int(num_err - num_err_before_batch) / n
 
     logger.success(f'\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------')
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)

@@ -372,7 +372,9 @@ The following table provides a detailed explanation of the metrics in the output
 | `converge success rate`          | Ratio of samples that successfully converge without a logical error |
 | `decoder invoke rate`            | Ratio of samples for which the decoder is invoked                           |
 | `average iteration`              | Average number of iterations per sample                                    |
-| `distribution`                   | Distribution of iterations at 1% interval |
+| `sample count`                   | Total number of samples this decoder metered. Per-sample rates are accumulated weighted by this count (not by batch count), so they stay correct when batches differ in size — e.g. under the adaptive iteration speedup (`iter_speedup`), where a batch may meter only its converged samples. For equal-size batches it equals `batch count` × `batch size`. |
+| `iteration distribution`         | Once the error budget is reached, the per-percentile iteration counts (101 values, 0–100% at 1% intervals); before then, the raw per-iteration histogram |
+| `iteration count`                | Raw per-iteration histogram (samples stopping at each iteration index), always saved un-percentiled regardless of completion |
 | `total time (s)`                 | Total time taken by the decoder in seconds                                  |
 | `average time per batch (s)`     | Average time taken per batch in seconds                                     |
 | `average time per sample (s)`    | Average time taken per sample in seconds                                    |

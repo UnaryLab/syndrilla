@@ -619,3 +619,33 @@ def fp2fxp(input, intwidth=7, fracwidth=8, rounding='floor'):
     min_val = 0 - (2**(intwidth + fracwidth))
     return RoundingNoGrad.apply(input.mul(scale), rounding).clamp(min_val, max_val).div(scale)
 
+
+def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_density):
+    """predict_pct schedule for the iter_speedup deferred ('extra') queue.
+
+    The cap defers hard (slow-to-converge) samples into an extra queue; this decides
+    WHEN to re-decode them (NOT the cap percentile, which decides WHICH samples get
+    deferred). Flush once the queue is predicted to hold the remaining errors still
+    needed, using g = `extra_density`, the hard-queue error density (errors per drained
+    sample) measured once from the FIRST extra batch and then held fixed:
+      - extra_density is None (no first extra yet):    queue >= remaining
+      - extra_density == 0   (first batch found none): queue >= batch_size
+      - else:                                          queue >= min(remaining / g, batch_size)
+    The phase-2 threshold is capped at batch_size (never wait for more than one batch).
+    Plus an endgame flush once the error budget is passed.
+
+    Returns (flush, flushing): whether to run an extra batch now, and whether this is the
+    endgame drain (used only for logging).
+    """
+    flushing = num_err >= batch_size                      # endgame: error budget passed
+    if n_extra <= 0:
+        return False, flushing
+    remaining = max(1, target_error - num_err)
+    if extra_density is None:                             # no first extra batch yet
+        trigger = n_extra >= remaining
+    elif extra_density <= 0:                              # first batch found no errors -> fill a batch
+        trigger = n_extra >= batch_size
+    else:                                                 # queue >= remaining / density (<= one batch)
+        trigger = n_extra >= min(remaining / extra_density, batch_size)
+    return (trigger or flushing), flushing
+

@@ -207,7 +207,35 @@ decoder:
 
 `bp4` consumes both Hx and Hz from the matrix bundle directly; `check_type` is not used.
 
-## 4. Decoder I/O contract
+## 4. Adaptive iteration speedup (`iter_speedup`)
+An opt-in, per-decoder block currently consumed by `bp_norm_min_sum` (other algorithms ignore it). It reduces decoding **time** without changing results — every sample is still fully decoded, so the logical error rate is identical to a no-cap run. 
+
+**Setup.** Add an `iter_speedup` block to the decoder YAML; omit it to disable the feature.
+
+```
+decoder:
+  algorithm: bp_norm_min_sum
+  check_type: hx
+  max_iter: 181
+  dtype: float64
+  iter_speedup:
+    kl_eps: 1.0
+    kl_window: 1
+    kl_min: 2
+  device:
+    device_type: cuda
+    device_idx: 0
+```
+
+| Key                               | Description                                              | Example |
+|-----------------------------------|----------------------------------------------------------|---------|
+| `decoder.iter_speedup.kl_eps`     | Warm-up KL threshold (larger ⇒ shorter warm-up)          | `1.0`   |
+| `decoder.iter_speedup.kl_window`  | Consecutive settled batches that end warm-up             | `1`     |
+| `decoder.iter_speedup.kl_min`     | Minimum warm-up batches                                  | `2`     |
+| `decoder.iter_speedup.candidates` | (optional) cap percentiles to consider; default `0..99`  | -       |
+
+
+## 5. Decoder I/O contract
 Every decoder consumes and returns an `io_dict` with the following entries.
 | Key                | Direction | Description                                                                                              |
 |--------------------|-----------|----------------------------------------------------------------------------------------------------------|

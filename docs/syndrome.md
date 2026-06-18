@@ -35,10 +35,18 @@ The following table details the configuration parameters used in the phenomenolo
 |----------------------------------|-----------------------------------------------------------------------------------------------------|--------------------|
 | `syndrome.measure`               | Model for syndrome measurement                                                                      | `phenomenological` |
 | `syndrome.rounds`              | Number of syndrome rounds replicated from the true syndrome                                         | `3`                |
-| `syndrome.measurement_error_rate`| Per-bit bit-flip probability applied independently to each replicated round                         | `0.01`             |
+| `syndrome.measurement_error_rate`| Per-bit bit-flip probability applied independently to each round                                    | `0.01`             |
 
-This computes the true syndrome (H*e), replicates it `rounds` times, and independently flips each bit with probability `measurement_error_rate`.
-The true syndrome is stored in `syndrome_actual` for analysis.
+When `rounds > 1`, the BSC error model emits a per-round error tensor `[B, rounds, N]` whose data flips are **cumulative** across rounds (a flipped qubit stays flipped — see [error.md](error.md) §1). `rounds` is read from this syndrome config and propagated to the error model (`error_model.rounds`), so it sets the round count for the whole pipeline.
+
+The measurer then:
+- For a per-round `[B, rounds, N]` error: computes the noiseless per-round syndrome `H · e_t (mod 2)` for each round directly (no replication — every round already carries its own accumulated data error), then independently flips each measured bit with probability `measurement_error_rate`, producing `[B, rounds, M]`.
+- For a 2-D `[B, N]` error (`rounds == 1`): computes one syndrome `H · e (mod 2)` and applies the same measurement noise, producing `[B, M]`.
+
+The noiseless per-round syndrome is stored in `syndrome_actual` for analysis (unaffected by `measurement_error_rate`).
+
+### 2.1. Prior adjustment (`adjust_llr0`)
+Because a flipped syndrome bit is statistically indistinguishable from an extra data flip, the measurer also exposes `adjust_llr0(llr0)`, which the pipeline calls to fold the measurement-error rate `q` into the per-data-qubit channel prior before decoding. It inflates the data-error probability `p` (recovered from `llr0 = log((1 - p)/p)`) to the effective `p_eff = p + q − 2·p·q` and rebuilds the prior. This keeps the decoder's prior physically consistent with the noisy syndromes; a zero rate leaves `llr0` untouched.
 
 ## 3. Stim model
 The stim syndrome measurer samples syndromes (and observable flips) directly from a stim circuit's detector error model. Used together with the stim interface, error model, and matrix loader (see [interface.md](interface.md)).

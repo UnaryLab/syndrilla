@@ -31,6 +31,8 @@ The following table details the configuration parameters used in the BSC error Y
 In 1-channel mode, each qubit is flipped independently with probability `rate`, and the LLR prior is `log((1 - rate) / rate)`.
 In 2-channel mode, X and Z streams are sampled independently with the same `rate`, and the Pauli priors passed to the decoder are `(p_I, p_X, p_Y, p_Z) = (1 - rate^2 - 2*rate, rate*(1-rate), rate*rate, rate*(1-rate))`.
 
+The BSC model has no `rounds` field of its own — `error_model.rounds` is set from the syndrome config's `rounds` (see [syndrome.md](syndrome.md) §2). When `rounds > 1`, errors become **cumulative** across rounds rather than i.i.d. per round: each round independently flips qubits at `rate`, but a flip persists once it occurs (round `t`'s error is the parity-sum of all flips up to `t`). The model then emits a per-round tensor `[B, rounds, N]` consumed directly by the phenomenological syndrome measurer. With `rounds == 1` it emits the usual `[B, N]`.
+
 ## 2. Deplorization error model
 The depolarizing model assigns each Pauli error type (X, Y, Z) an equal probability of `rate/3`, so the total single-qubit error probability is `rate`.
 This model is always 2-channel.
