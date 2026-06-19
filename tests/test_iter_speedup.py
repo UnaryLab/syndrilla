@@ -50,9 +50,15 @@ UNIT_FRAC = 0.9      # cap: stop each batch once 90% of samples have converged
 UNIT_SEED = 0
 
 
-def _unit_cfg(iter_speedup=None):
+# the iterative BP decoders that support the opt-in iter_speedup cap. The lottery
+# family reuses the exact same IterSpeedup machinery as bp_norm_min_sum, so the
+# correctness guarantees below are checked against every one of them.
+CAP_DECODERS = ['bp_norm_min_sum', 'bp_lottery', 'bp_lottery_quant', 'bp_lottery_policy']
+
+
+def _unit_cfg(iter_speedup=None, algorithm='bp_norm_min_sum'):
     cfg = {
-        'algorithm': 'bp_norm_min_sum', 'check_type': 'hx',
+        'algorithm': algorithm, 'check_type': 'hx',
         'max_iter': UNIT_MAX_ITER, 'dtype': 'float64',
         'device': {'device_type': 'cpu', 'device_idx': 0},
     }
@@ -61,8 +67,8 @@ def _unit_cfg(iter_speedup=None):
     return cfg
 
 
-def _build(bundle, iter_speedup=None):
-    return create_decoder(cfg=_unit_cfg(iter_speedup), bundle=bundle)[0]
+def _build(bundle, iter_speedup=None, algorithm='bp_norm_min_sum'):
+    return create_decoder(cfg=_unit_cfg(iter_speedup, algorithm), bundle=bundle)[0]
 
 
 def _decode(dec, synd, llr, H, bypass=False):
@@ -79,9 +85,9 @@ def _decode(dec, synd, llr, H, bypass=False):
     }
 
 
-def _ready_cap_decoder(bundle, frac=UNIT_FRAC):
+def _ready_cap_decoder(bundle, frac=UNIT_FRAC, algorithm='bp_norm_min_sum'):
     """A capped decoder with warm-up forced complete at a known stop fraction."""
-    dec = _build(bundle, iter_speedup={'kl_eps': 1e-2})
+    dec = _build(bundle, iter_speedup={'kl_eps': 1e-2}, algorithm=algorithm)
     dec.decoder.cap.frac = frac              # `done` is true once frac is set
     dec.decoder.cap.pct = int(frac * 100)
     return dec
@@ -187,6 +193,55 @@ def test_bypass_is_identical_to_baseline(bundle, fixed_batch):
     assert torch.equal(byp['iter'], base['iter'])
 
 
+# ---- the same two guarantees, checked across every cap-capable decoder --------
+# bp_lottery / bp_lottery_quant / bp_lottery_policy reuse the IterSpeedup cap
+# verbatim, so they must satisfy exactly the guarantees proven above for
+# bp_norm_min_sum: capping is strictly faster and never changes a result.
+# (sobol randomness is per-iteration only, so a deferred sample re-decoded alone
+# reconstructs its baseline trajectory bit-for-bit.)
+
+@pytest.mark.parametrize('algorithm', CAP_DECODERS)
+def test_cap_speeds_up_without_changing_results_all(bundle, fixed_batch, algorithm):
+    synd, llr, H = fixed_batch['synd'], fixed_batch['llr'], fixed_batch['H']
+
+    base = _decode(_build(bundle, algorithm=algorithm), synd, llr, H)
+    capped = _decode(_ready_cap_decoder(bundle, algorithm=algorithm), synd, llr, H)
+
+    # the cap engaged and left a hard tail for re-decoding
+    assert capped['active'] is True
+    deferred = capped['converge'] == 0
+    assert int(deferred.sum()) > 0
+
+    # SPEEDUP: strictly fewer BP iterations than the uncapped baseline
+    assert capped['niter'] < base['niter']
+
+    # NO DIFFERENCE (kept part): samples the cap kept match the baseline exactly
+    kept = capped['converge'] > 0
+    assert torch.equal(capped['e_v'][kept], base['e_v'][kept])
+
+    # NO DIFFERENCE (final): re-decode the deferred tail uncapped, reassemble,
+    # and the full output is identical to the baseline bit-for-bit
+    tail = _decode(_build(bundle, algorithm=algorithm), synd[deferred], llr[deferred], H)
+    final = capped['e_v'].clone()
+    final[deferred] = tail['e_v']
+    assert torch.equal(final, base['e_v'])
+
+
+@pytest.mark.parametrize('algorithm', CAP_DECODERS)
+def test_bypass_is_identical_to_baseline_all(bundle, fixed_batch, algorithm):
+    """A ready cap that main asks to bypass behaves exactly like no cap at all."""
+    synd, llr, H = fixed_batch['synd'], fixed_batch['llr'], fixed_batch['H']
+
+    base = _decode(_build(bundle, algorithm=algorithm), synd, llr, H)
+    byp = _decode(_ready_cap_decoder(bundle, algorithm=algorithm), synd, llr, H, bypass=True)
+
+    assert byp['active'] is False
+    assert byp['niter'] == base['niter']
+    assert torch.equal(byp['e_v'], base['e_v'])
+    assert torch.equal(byp['converge'], base['converge'])
+    assert torch.equal(byp['iter'], base['iter'])
+
+
 # ================================================================ timing test
 # End-to-end wall-clock via main(), cap ON vs OFF. Edit the SETUP CONSTANTS, or
 # override on the command line, e.g.:
@@ -201,7 +256,7 @@ DISTANCE = int(os.environ.get('SYND_DISTANCE', 10))            # needs surface_{
 ERROR_RATE = float(os.environ.get('SYND_ERROR_RATE', 0.005))  # BSC physical error rate
 DECODER_ALGORITHM = os.environ.get('SYND_DECODER', 'bp_norm_min_sum')
 DTYPE_STR = 'float32'
-DEVICE_TYPE = 'cpu'
+DEVICE_TYPE = os.environ.get('SYND_DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
 DEVICE_IDX = 0
 BATCH_SIZE = 10000
 TARGET_ERRORS = 1000
@@ -244,6 +299,9 @@ def _run(run_dir, decoder_yaml, error_yaml):
     return decode_s, ler, n_batches
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason='wall-clock timing benchmark (slow + timing-sensitive); '
+                           'run on a GPU box or directly via `python tests/test_iter_speedup.py`')
 def test_cap_vs_nocap_timing():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 

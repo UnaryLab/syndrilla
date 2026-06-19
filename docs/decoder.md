@@ -208,7 +208,7 @@ decoder:
 `bp4` consumes both Hx and Hz from the matrix bundle directly; `check_type` is not used.
 
 ## 4. Adaptive iteration speedup (`iter_speedup`)
-An opt-in, per-decoder block currently consumed by `bp_norm_min_sum` (other algorithms ignore it). It reduces decoding **time** without changing results — every sample is still fully decoded, so the logical error rate is identical to a no-cap run. 
+An opt-in, per-decoder block consumed by the iterative BP decoders — `bp_norm_min_sum`, `bp_lottery`, `bp_lottery_quant`, and `bp_lottery_policy` (other algorithms, e.g. `osd_0`, ignore it). It reduces decoding **time** without changing results — every sample is still fully decoded (the unconverged tail is deferred and re-decoded uncapped), so the logical error rate is identical to a no-cap run. 
 
 **Setup.** Add an `iter_speedup` block to the decoder YAML; omit it to disable the feature.
 

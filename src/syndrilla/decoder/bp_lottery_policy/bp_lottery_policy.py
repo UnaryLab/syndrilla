@@ -4,6 +4,8 @@ from loguru import logger
 
 import numpy as np
 
+from syndrilla.decoder.decoder import IterSpeedup
+
 
 class create(torch.nn.Module):
     """
@@ -109,6 +111,13 @@ class create(torch.nn.Module):
         self.algo = 'bp_lottery_policy'
         self.num_max_iter = self.max_iter
 
+        # opt-in adaptive iteration speedup (no-op unless an `iter_speedup` block is
+        # in the config). When active it stops a batch once a learned % has converged
+        # and leaves the rest unconverged for main's extra queue. See decoder.py.
+        self.cap = IterSpeedup.from_cfg(decoder_cfg.get('iter_speedup'))
+        self.cap_bypass = False       # set by main: True -> decode this batch uncapped
+        self.cap_active_last = False  # set per forward: True if the cap was applied
+
         logger.info(f'Complete.')
 
 
@@ -175,6 +184,11 @@ class create(torch.nn.Module):
 
         logger.info(f'Starting decoding iterations.')
 
+        # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
+        # soon as that fraction has converged (unless main asked for an uncapped pass).
+        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
+        cap_frac = self.cap.frac if self.cap_active_last else None
+
         self.i = 0
         while self.i < self.max_iter:
             self.i += 1
@@ -193,7 +207,7 @@ class create(torch.nn.Module):
             e_v = torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
             s_est = self.syndrome_estimation(e_v)
 
-            # different samples from the same batch may terminated at different iteration (pick the smallest one) 
+            # different samples from the same batch may terminated at different iteration (pick the smallest one)
             indices = torch.all(s_est == syndrome, 1).nonzero()
             checker = torch.where(num_iters == -1.0)[0]
             indices = indices[torch.isin(indices, checker)]
@@ -205,18 +219,13 @@ class create(torch.nn.Module):
 
             # do the early termination if all batch satisfy the condition
             if checker.size()[0] == 0:
-                e_out = e_out[:, :-1]
-                l_out = l_out[:, :-1]
-                logger.info(f'Complete.')
-                logger.info(f'Decoding iterations: <{(self.i)}>.')
-                io_dict.update({
-                    'e_v': e_out,
-                    'iter': num_iters,
-                    'llr': l_out,
-                    'converge': converges
-                })
-                return io_dict
-            
+                break
+
+            # adaptive cap: stop once >= cap_frac of the batch has converged; the
+            # unconverged remainder (converge == 0) becomes main's deferred tail.
+            if cap_frac is not None and int((num_iters != -1).sum()) >= cap_frac * self.batch_size:
+                break
+
             if self.sign_flip_policy == 'Proposed':
                 l_v = self.sign_flip_lottery(syndrome, s_est, l_v)
             elif self.sign_flip_policy == 'global_optimal':
@@ -231,13 +240,18 @@ class create(torch.nn.Module):
                 l_v = self.sign_flip_local_reliable(syndrome, s_est, l_v)
             elif self.sign_flip_policy == 'local_connectivity':
                 l_v = self.sign_flip_local_connectivity(syndrome, s_est, l_v)
-           
+
         checker = torch.where(num_iters == -1)[0]
         e_out[checker] = e_v[checker]
         l_out[checker] = l_v[checker]
         num_iters[checker] = self.i
         e_out = e_out[:, :-1]
         l_out = l_out[:, :-1]
+
+        # warm-up: observe this batch's iteration distribution (decides k + the cap).
+        if self.cap is not None and not self.cap.done and not self.cap_bypass:
+            self.cap.observe(num_iters, self.max_iter, self.batch_size)
+
         logger.info(f'Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
