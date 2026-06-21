@@ -259,19 +259,27 @@ class create(torch.nn.Module):
                 # next iteration (extrinsic: bias + sum of OTHER incoming c2v messages)
                 message = self.vn_update(c2v, bias)
             
-            #relay code to get best weight solution 
-            valid_mask = (converges == 1) & (solutions != self.solution)
-            new_e_weight_all = (e_out[:, :-1] * u_init[:, :-1].abs()).sum(dim=1)
+            
+            converged_this_leg = (converges == 1)
+            valid_mask = converged_this_leg & (solutions < self.solution)
+
+            # decoding quality = sum of the prior LLRs over the decoded support
+            # (crate get_decoding_quality): signed, skipping non-finite priors.
+            prior_llr = u_init[:, :-1]
+            prior_llr = torch.where(torch.isfinite(prior_llr), prior_llr, torch.zeros_like(prior_llr))
+            new_e_weight_all = (e_out[:, :-1] * prior_llr).sum(dim=1)
             solutions = solutions + valid_mask.to(solutions.dtype)
 
-            #find better solution and update
+            # keep the lowest-quality (best) converged solution seen so far
             improve_mask = valid_mask & (new_e_weight_all < e_solutions)
             e_solutions = torch.where(improve_mask, new_e_weight_all, e_solutions)
             e_best[improve_mask, :] = e_out[improve_mask, :-1]
 
-            #check if we have enough solutions
+            # stop once every sample has found `solution` converged solutions (the
+            # crate's stop_after / stop_nconv). If a sample never reaches it, the loop
+            # runs all `legs`, matching the crate exhausting num_sets.
             solution_sum = solutions.sum()
-            if solution_sum == self.batch_size * self.solution:
+            if solution_sum >= self.batch_size * self.solution:
                 break
           
         logger.info(f'Complete.')
@@ -349,7 +357,13 @@ class create(torch.nn.Module):
     def bias_update(self, memory_strengths, marginals, u_init):
         marginal_strength = memory_strengths * marginals
         sub = 1 - memory_strengths
-        return (sub * u_init) + marginal_strength
+        bias = (sub * u_init) + marginal_strength
+        # The padding column carries +inf (the min-sum identity for non-existent
+        # edges). Memory must not touch it: with u_init[-1] = +inf, a strength <= 0
+        # makes (1-m)*inf + m*inf evaluate to inf - inf or inf + (0*inf) = NaN, which
+        # then leaks into the v2c messages of padded checks. Restore it to +inf.
+        bias[:, -1] = u_init[:, -1]
+        return bias
     
 
     def create_memory_strengths(self, rows, cols, center, width):
