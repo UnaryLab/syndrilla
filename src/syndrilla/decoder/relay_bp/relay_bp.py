@@ -135,39 +135,14 @@ class create(torch.nn.Module):
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
-        # Matrices: use a pre-loaded bundle when one is provided (this is how main builds every
-        # decoder -- create_decoder(cfg=..., bundle=bundle)), like the bp_norm_min_sum family.
-        # Otherwise load them from the yaml paths in the config (direct instantiation in tests).
         bundle = kwargs.get('bundle')
-        if bundle is not None:
-            self.Hx_matrix = bundle.Hx_matrix
-            self.Hz_matrix = bundle.Hz_matrix
-            self.lx_matrix = bundle.lx_matrix
-            self.lz_matrix = bundle.lz_matrix
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
-        else:
-            # get the column and row index for all 1s in parity check matrix
-            logger.info(f'Creating hx parity check matrix.')
-            self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device, dtype=self.dtype)
-
-            logger.info(f'Creating hz parity check matrix.')
-            self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device, dtype=self.dtype)
-
-            if self.check_type.lower() == 'hx':
-                self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hx_matrix.get_index()
-            else:
-                self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hz_matrix.get_index()
-
-            # compute lx, switch hx and hz position can compute lz
-            # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
-            logger.info(f'Creating lx and lz parity check matrix.')
-            logical_check_matrix = decoder_cfg.get('logical_check_matrix', False)
-            if logical_check_matrix:
-                self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device, dtype=self.dtype).get_dense()
-                self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device, dtype=self.dtype).get_dense()
-            else:
-                self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
-                self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
+        if bundle is None:
+            raise ValueError('bp_norm_min_sum requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+        self.Hx_matrix = bundle.Hx_matrix
+        self.Hz_matrix = bundle.Hz_matrix
+        self.lx_matrix = bundle.lx_matrix
+        self.lz_matrix = bundle.lz_matrix
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
 
@@ -253,7 +228,6 @@ class create(torch.nn.Module):
                 self.max_iter = self.iteration_count
                 memory_strengths = self.create_memory_strengths(self.batch_size, N_extended, self.center, self.width)
                 message = u_init[:, self.V_c_col]
-            
             
             while self.i < self.max_iter:
                 # variable node update update v2c
