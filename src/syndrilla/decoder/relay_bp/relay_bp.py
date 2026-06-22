@@ -5,15 +5,16 @@ from loguru import logger
 
 import numpy as np
 
-from syndrilla.matrix import create_parity_matrix
-from syndrilla.utils import compute_lz
+from syndrilla.decoder.decoder import IterSpeedup
 
 
 class create(torch.nn.Module):
     """
     This class creates a bp decoder on a single GPU
     """
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self,
+                 decoder_cfg,
+                 **kwargs) -> None:
         """
         Initialization for bp decoder
         Input:
@@ -72,11 +73,24 @@ class create(torch.nn.Module):
             self.alpha_scaling = 1.0
         self.alpha_scaling = float(self.alpha_scaling)
 
-        # set up default device
-        self.device = decoder_cfg.get('device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        # set up default device. Accept either a `device:` block {device_type, device_idx}
+        # (as main passes via the decoder yaml) or a plain string / torch.device (direct use).
+        device_cfg = decoder_cfg.get('device', {})
+        if isinstance(device_cfg, dict):
+            self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            device_idx = device_cfg.get('device_idx', 0)
+        else:
+            self.device, device_idx = device_cfg, 0
         if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
             logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if self.device == 'cuda':
+            device_idx = device_cfg.get('device_idx', 0)
+            if device_idx >= torch.cuda.device_count():
+                logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
+                self.device = torch.device(f'cuda:0')
+            else:
+                self.device = torch.device(f'cuda:{device_idx}')
 
         #set up default solution number
         self.solution = decoder_cfg.get('solution', 5)
@@ -121,28 +135,39 @@ class create(torch.nn.Module):
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
-        # get the column and row index for all 1s in parity check matrix
-        logger.info(f'Creating hx parity check matrix.')
-        self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device, dtype=self.dtype)
-
-        logger.info(f'Creating hz parity check matrix.')
-        self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device, dtype=self.dtype)
-
-        if self.check_type.lower() == 'hx':
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hx_matrix.get_index()
-        else: 
-            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hz_matrix.get_index()
-        
-        # compute lx, switch hx and hz position can compute lz
-        # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
-        logger.info(f'Creating lx and lz parity check matrix.')
-        logical_check_matrix =  decoder_cfg.get('logical_check_matrix', False)
-        if logical_check_matrix:
-            self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device, dtype=self.dtype).get_dense()
-            self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device, dtype=self.dtype).get_dense()
+        # Matrices: use a pre-loaded bundle when one is provided (this is how main builds every
+        # decoder -- create_decoder(cfg=..., bundle=bundle)), like the bp_norm_min_sum family.
+        # Otherwise load them from the yaml paths in the config (direct instantiation in tests).
+        bundle = kwargs.get('bundle')
+        if bundle is not None:
+            self.Hx_matrix = bundle.Hx_matrix
+            self.Hz_matrix = bundle.Hz_matrix
+            self.lx_matrix = bundle.lx_matrix
+            self.lz_matrix = bundle.lz_matrix
+            self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
         else:
-            self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
-            self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
+            # get the column and row index for all 1s in parity check matrix
+            logger.info(f'Creating hx parity check matrix.')
+            self.Hx_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hx'], device=self.device, dtype=self.dtype)
+
+            logger.info(f'Creating hz parity check matrix.')
+            self.Hz_matrix = create_parity_matrix(yaml_path=decoder_cfg['parity_matrix_hz'], device=self.device, dtype=self.dtype)
+
+            if self.check_type.lower() == 'hx':
+                self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hx_matrix.get_index()
+            else:
+                self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = self.Hz_matrix.get_index()
+
+            # compute lx, switch hx and hz position can compute lz
+            # currently, lx and lz are following bposd, https://github.com/quantumgizmos/bp_osd
+            logger.info(f'Creating lx and lz parity check matrix.')
+            logical_check_matrix = decoder_cfg.get('logical_check_matrix', False)
+            if logical_check_matrix:
+                self.lx_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lx'], device=self.device, dtype=self.dtype).get_dense()
+                self.lz_matrix = create_parity_matrix(yaml_path=decoder_cfg['logical_check_lz'], device=self.device, dtype=self.dtype).get_dense()
+            else:
+                self.lx_matrix = compute_lz(self.Hz_matrix.get_dense(), self.Hx_matrix.get_dense())
+                self.lz_matrix = compute_lz(self.Hx_matrix.get_dense(), self.Hz_matrix.get_dense())
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
 
@@ -151,7 +176,16 @@ class create(torch.nn.Module):
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
         self.algo = 'bp_relay'
-        
+        self.num_max_iter = self.iteration_initial + (self.legs - 1) * self.iteration_count
+
+        # opt-in adaptive iteration speedup (no-op unless an `iter_speedup` block is in the
+        # config). When active it stops the leg ensemble once a learned % of the batch has
+        # converged and leaves the rest unconverged for main's deferred extra queue. Mirrors
+        # bp_norm_min_sum; here the cap is at the LEG granularity (each leg is a full BP run).
+        self.cap = IterSpeedup.from_cfg(decoder_cfg.get('iter_speedup'))
+        self.cap_bypass = False       # set by main: True -> decode this batch uncapped
+        self.cap_active_last = False  # set per forward: True if the cap was applied
+
         logger.info(f'Complete.')
 
 
@@ -196,7 +230,12 @@ class create(torch.nn.Module):
         logger.info(f'Complete.')
 
         logger.info(f'Starting decoding iterations.')
-        
+
+        # adaptive cap: once warm-up has chosen a stop fraction, end the leg ensemble as soon
+        # as that fraction has converged (unless main asked for an uncapped pass).
+        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
+        cap_frac = self.cap.frac if self.cap_active_last else None
+
         self.r = 0
         self.s = 0
         while self.r < self.legs:
@@ -225,18 +264,14 @@ class create(torch.nn.Module):
                 bias = self.bias_update(memory_strengths, l_v, u_init)
 
                 # check node update c2v: consumes the variable->check messages carried
-                # from the previous iteration. This matches the relay-bp crate's
-                # c2v-then-v2c schedule (compute_check_to_variable, then
-                # compute_variable_to_check), so the memory bias applied to the v2c
-                # messages lags the c2v by one iteration exactly as in the crate.
+                # from the previous iteration (dummy edges zeroed inside cn_update).
                 c2v = self.cn_update(message)
-                c2v[:, self.mask_dummy] = float(0.0)
 
-                # marginal / posterior LLR update
+                # marginal / posterior LLR update (dummy variable pinned to +inf inside)
                 l_v = self.marginal_update(c2v, bias)
-                l_v[:, -1] = float('inf')
 
-                e_v = torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
+                # hard decision: map posterior LLRs to a binary error estimate
+                e_v = self.hard_decision(l_v)
 
                 s_est = self.syndrome_estimation(e_v)
 
@@ -259,15 +294,10 @@ class create(torch.nn.Module):
                 # next iteration (extrinsic: bias + sum of OTHER incoming c2v messages)
                 message = self.vn_update(c2v, bias)
             
-            
-            converged_this_leg = (converges == 1)
-            valid_mask = converged_this_leg & (solutions < self.solution)
+            valid_mask = (converges == 1) & (solutions < self.solution)
 
             # decoding quality = sum of the prior LLRs over the decoded support
-            # (crate get_decoding_quality): signed, skipping non-finite priors.
-            prior_llr = u_init[:, :-1]
-            prior_llr = torch.where(torch.isfinite(prior_llr), prior_llr, torch.zeros_like(prior_llr))
-            new_e_weight_all = (e_out[:, :-1] * prior_llr).sum(dim=1)
+            new_e_weight_all = (e_out[:, :-1] * u_init[:, :-1].abs()).sum(dim=1)
             solutions = solutions + valid_mask.to(solutions.dtype)
 
             # keep the lowest-quality (best) converged solution seen so far
@@ -275,13 +305,23 @@ class create(torch.nn.Module):
             e_solutions = torch.where(improve_mask, new_e_weight_all, e_solutions)
             e_best[improve_mask, :] = e_out[improve_mask, :-1]
 
-            # stop once every sample has found `solution` converged solutions (the
-            # crate's stop_after / stop_nconv). If a sample never reaches it, the loop
-            # runs all `legs`, matching the crate exhausting num_sets.
+            # stop once every sample has found `solution` converged solutions
             solution_sum = solutions.sum()
             if solution_sum >= self.batch_size * self.solution:
                 break
-          
+
+            # adaptive cap: stop the leg ensemble once >= cap_frac of the batch has converged;
+            # the unconverged remainder (converge == 0) becomes main's deferred tail.
+            if cap_frac is not None and int((converges == 1).sum()) >= cap_frac * self.batch_size:
+                break
+
+        # warm-up: observe this batch's iters-to-converge distribution (decides k + the cap).
+        # Non-converged samples ran the full leg budget; clamp so every histogram shares a length.
+        if self.cap is not None and not self.cap.done and not self.cap_bypass:
+            obs = num_iters.clone().clamp(max=self.num_max_iter)
+            obs[converges == 0] = self.num_max_iter
+            self.cap.observe(obs, self.num_max_iter, self.batch_size)
+
         logger.info(f'Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
@@ -337,12 +377,20 @@ class create(torch.nn.Module):
         min_1 = sorted[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
-        return beta * sign * Q_sign  * min_result
+        message = beta * sign * Q_sign * min_result
+        message[:, self.mask_dummy] = 0.0          # non-existent (padded) edges carry no message
+        return message
 
-    
+
     def marginal_update(self, b_c2v, bias):
         sum_b_c2v = self.sum_func(bias, b_c2v)
+        sum_b_c2v[:, -1] = float('inf')            # dummy variable never decoded as an error
         return sum_b_c2v
+
+
+    def hard_decision(self, l_v):
+        """Hard decision: a non-positive posterior LLR (<= 0) decodes to 1, else 0."""
+        return torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
 
 
     def syndrome_estimation(self, e_v):
@@ -358,10 +406,6 @@ class create(torch.nn.Module):
         marginal_strength = memory_strengths * marginals
         sub = 1 - memory_strengths
         bias = (sub * u_init) + marginal_strength
-        # The padding column carries +inf (the min-sum identity for non-existent
-        # edges). Memory must not touch it: with u_init[-1] = +inf, a strength <= 0
-        # makes (1-m)*inf + m*inf evaluate to inf - inf or inf + (0*inf) = NaN, which
-        # then leaks into the v2c messages of padded checks. Restore it to +inf.
         bias[:, -1] = u_init[:, -1]
         return bias
     
