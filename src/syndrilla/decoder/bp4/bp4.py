@@ -4,6 +4,7 @@ from loguru import logger
 
 import numpy as np
 
+from syndrilla.decoder.decoder import IterSpeedup
 
 
 class create(torch.nn.Module):
@@ -94,7 +95,14 @@ class create(torch.nn.Module):
 
         self.algo = 'bp4'
         self.num_max_iter = self.max_iter
-        
+
+        # opt-in adaptive iteration speedup (no-op unless an `iter_speedup` block is
+        # in the config). When active it stops a batch once a learned % has converged
+        # and leaves the rest unconverged for main's extra queue. See decoder.py.
+        self.cap = IterSpeedup.from_cfg(decoder_cfg.get('iter_speedup'))
+        self.cap_bypass = False       # set by main: True -> decode this batch uncapped
+        self.cap_active_last = False  # set per forward: True if the cap was applied
+
         logger.info(f'Complete.')
 
 
@@ -160,27 +168,37 @@ class create(torch.nn.Module):
         logger.info(f'Complete.')
 
         logger.info(f'Starting decoding iterations.')
-        
+
+        # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
+        # soon as that fraction has converged (unless main asked for an uncapped pass).
+        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
+        cap_frac = self.cap.frac if self.cap_active_last else None
+
+        # per-edge extrinsic factors produced by c2v; consumed by the next vn_update
+        new_err = None
         self.i = 0
         while self.i < self.max_iter:
-            # variable node update update v2c
             self.i += 1
 
-            # check node update c2v
-            message = self.check2bit_ms(message, syndrome)
-            message[:, :, self.mask_dummy] = float(0.0)
+            # v2c + variable-node update: recover the v->c messages from the previous
+            # posterior (pass-through on the first iteration, before any posterior exists)
+            message = self.vn_update(message, bitnode, new_err)
 
-            bitnode, new_err = self.convert_prob(message, bitnode, oldbitnode, chan, self.d)
- 
-            oldbitnode = bitnode / bitnode.sum(dim=1, keepdim=True).clamp_min(self.eps)
+            # check node update (min-sum), still in the [batch, 2, n_checks, degree] layout
+            message = self.cn_update(message, syndrome)
 
-            # elementwise LLR update
-            message = self.convert_llr(bitnode, new_err)
+            # c2v: scatter the check messages into the per-variable posterior (prob domain)
+            bitnode, new_err = self.c2v(message, oldbitnode, chan)
+
+            # damped posterior memory carried into the next iteration
+            oldbitnode = self.normalize_posterior(bitnode)
+
+            # hard decision: map the posterior probabilities to a binary error estimate
             x_bits, z_bits = self.hard_decision(bitnode)
 
             convergent_mask = self.syndrome_estimation(x_bits, z_bits, syndrome)
 
-            # different samples from the same batch may terminated at different iteration (pick the smallest one) 
+            # different samples from the same batch may terminated at different iteration (pick the smallest one)
             indices = torch.nonzero(convergent_mask == 1)
             checker = torch.where(num_iters == -1.0)[0]
 
@@ -192,24 +210,24 @@ class create(torch.nn.Module):
                 converges[indices] = 1
             # do the early termination if all batch satisfy the condition
             if checker.size()[0] == 0:
-                e_out = e_out[:, :, :-1]
-                l_out = l_out[:, :, :-1]
-                logger.info(f'Complete.')
-                logger.info(f'Decoding iterations: <{(self.i)}>.')
-                io_dict.update({
-                    'e_v': e_out,
-                    'iter': num_iters,
-                    'llr': l_out,
-                    'converge': converges
-                })
-                return io_dict
-           
+                break
+
+            # adaptive cap: stop once >= cap_frac of the batch has converged; the
+            # unconverged remainder (converge == 0) becomes main's deferred tail.
+            if cap_frac is not None and int((num_iters != -1).sum()) >= cap_frac * self.batch_size:
+                break
+
         checker = torch.where(num_iters == -1)[0]
         e_out[checker] = e_v[checker]
         l_out[checker] = l_v[checker]
         num_iters[checker] = self.max_iter
         e_out = e_out[:, :, :-1]
         l_out = l_out[:, :, :-1]
+
+        # warm-up: observe this batch's iteration distribution (decides k + the cap).
+        if self.cap is not None and not self.cap.done and not self.cap_bypass:
+            self.cap.observe(num_iters, self.max_iter, self.batch_size)
+
         logger.info(f'Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
@@ -221,7 +239,9 @@ class create(torch.nn.Module):
         return io_dict
         
 
-    def check2bit_ms(self, a_v2c, syndrome):
+    def cn_update(self, a_v2c, syndrome):
+        """Check-node update (quaternary min-sum) in the [batch, 2, n_checks, degree]
+        layout, then zero the dummy edges padded onto irregular checks."""
         # checks
         check_node = 1.0 - 2.0 * syndrome.to(self.dtype)
         channel_idx = torch.arange(self.number_channel, device=check_node.device)
@@ -229,20 +249,26 @@ class create(torch.nn.Module):
         sign = torch.sgn(a_v2c)
 
         check_node = check_node[:, channel_idx[:, None, None], self.V_c_row]
-        
+
         # sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=3, keepdim=True)
-        
+
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
         sorted, _ = torch.sort(abs_a_v2c, dim=3)  # Changed from dim=2 to dim=3
         min_0 = sorted[:, :, :, 0].unsqueeze(3)  # Added extra : for channel dimension
         min_1 = sorted[:, :, :, 1].unsqueeze(3)  # Added extra : for channel dimension
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
-        return check_node * sign_prod * sign  * min_result
-    
-    def convert_prob(self, a_v2c, bitnode, oldbitnode, chan, d):
-        bitnode[:, :] = torch.pow(chan, 1.0 - d) * torch.pow(oldbitnode, d)
+        message = check_node * sign_prod * sign  * min_result
+        message[:, :, self.mask_dummy] = float(0.0)
+        return message
+
+    def c2v(self, a_v2c, oldbitnode, chan):
+        """Check-to-variable update: turn the check messages into per-edge quaternary
+        error probabilities and scatter-multiply them into the per-variable posterior
+        (probability domain), seeded by the damped channel/memory prior. Returns the
+        posterior `bitnode` and the per-edge factors `new_err` (consumed by vn_update)."""
+        bitnode = torch.pow(chan, 1.0 - self.d) * torch.pow(oldbitnode, self.d)
         err_neg = 0.5 / (1.0 + torch.exp(-a_v2c))
         err_pos = 0.5 / (1.0 + torch.exp(a_v2c))
         new_err = torch.zeros((self.batch_size, 2, 4, self.H_shape[0], 4), dtype=a_v2c.dtype, device=a_v2c.device)
@@ -268,10 +294,25 @@ class create(torch.nn.Module):
         sum_b_c2v = bitnode + sum_b_c2v
         sum_b_c2v.scatter_reduce_(2, partitions_flat_expanded, data_flat, reduce='prod')
         return sum_b_c2v, new_err
-    
 
-    def convert_llr(self, bitnode, new_err):
-        idx = self.V_c_col.unsqueeze(0).unsqueeze(2) 
+
+    def normalize_posterior(self, bitnode):
+        """Normalize the quaternary posterior into the damped memory carried to the next
+        iteration: divide each variable's [I, X, Z, Y] probabilities by their sum (clamped
+        to `eps` to avoid divide-by-zero) so they form a per-variable distribution."""
+        return bitnode / bitnode.sum(dim=1, keepdim=True).clamp_min(self.eps)
+
+
+    def vn_update(self, message, bitnode, new_err):
+        """Variable-node update: produce the v->c messages from the current posterior.
+
+        On the first iteration there is no posterior yet, so the initialized message is
+        passed through. Afterwards each per-edge v->c LLR is recovered from the posterior
+        `bitnode` by dividing out that edge's own contribution (`new_err`, the quaternary
+        extrinsic information) and mapping back to X/Z log-likelihood ratios."""
+        if self.i == 1:
+            return message
+        idx = self.V_c_col.unsqueeze(0).unsqueeze(2)
         idx = idx.expand(self.batch_size, 2, 4, self.H_shape[0], 4)      
 
         bitnode_expanded = bitnode.unsqueeze(1).unsqueeze(3).expand(-1, 2, -1, self.H_shape[0], -1)
