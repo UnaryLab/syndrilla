@@ -17,6 +17,11 @@ The following table details the configuration parameters shared by every decoder
 | `decoder.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
 | `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `131`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
+| `decoder.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device, skipping the fused-CUDA-kernel port | `false`                  |
+
+**CUDA acceleration.** Every belief-propagation decoder ships a fused-CUDA-kernel implementation alongside its PyTorch module: `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp4`, `bp_sf`, and `relay_bp` (all algorithms except `osd_0`). There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically when a CUDA-capable GPU is present and the kernel builds.
+
+The selection **falls back to PyTorch automatically**. If no CUDA GPU is available, or the `.cu` kernel fails to build or instantiate (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM, where the CUDA kernels do not compile), the plain `<algo>/<algo>.py` PyTorch module runs instead, on whatever device the config resolves to (the CUDA device under ROCm, otherwise CPU). The same fallback applies when an algorithm has no CUDA port. Set `force_pytorch: true` to force the PyTorch module even on an NVIDIA CUDA device.
 
 ## 2. Chained decoders
 A list of algorithms runs each decoder in order; later decoders are only invoked on samples that the earlier ones did not converge on.
@@ -273,6 +278,8 @@ decoder:
 | `decoder.rebatch_speedup.kl_window`  | Consecutive settled batches that end warm-up             | `1`     |
 | `decoder.rebatch_speedup.kl_min`     | Minimum warm-up batches                                  | `2`     |
 | `decoder.rebatch_speedup.candidates` | (optional) cap percentiles to consider; default `0..99`  | -       |
+
+**Output.** When a decoder uses `rebatch_speedup`, its per-decoder block in the result YAML gains a `rebatch_speedup` entry reporting `warmup batches` (the number of warm-up batches the KL test consumed) and, once the cap is chosen, `chosen pct`. This entry is emitted **before** the `total time (s)` timing fields.
 
 
 ## 5. Decoder I/O contract

@@ -46,7 +46,7 @@ class create(_QuantCuda, _LotteryQuantPy):
         _, _, _, H_matrix = bundle.select(self.check_type)
         self.H_matrix = H_matrix.to(self.device, self.dtype)
 
-        self.algo = "bp_lottery_quant_cuda"
+        self.algo = "bp_lottery_quant"
         logger.info(
             f"bp_lottery_quant_cuda ready (per-step, Q{self.intwidth}.{self.fracwidth} + sign-flip)."
         )

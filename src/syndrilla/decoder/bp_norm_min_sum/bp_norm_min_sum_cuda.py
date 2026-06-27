@@ -289,7 +289,7 @@ class create(nn.Module):
         self._block_size = min(max(32 * math.ceil(min_threads / 32), 64), 512)
 
         # ── metadata expected by the syndrilla framework ───────────────────────
-        self.algo = "bp_norm_min_sum_cuda"
+        self.algo = "bp_norm_min_sum"
         self.batch_size = 1  # updated in forward()
 
         # rebatch_speedup (adaptive cap): honored on-device by the fused kernel via a

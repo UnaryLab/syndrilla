@@ -290,8 +290,13 @@ class MetricState:
         logger.info(f'Complete.')
         return result
 
-    def get_all_metrics(self, num_batches, algo_names):
-        """Compute averaged metrics for all decoders. Returns list of dicts for save_metric."""
+    def get_all_metrics(self, num_batches, algo_names, decoders=None):
+        """Compute averaged metrics for all decoders. Returns list of dicts for save_metric.
+
+        When a decoder uses rebatch_speedup, its warm-up batch count (and the chosen cap
+        percentile once warm-up has finished) is attached to that decoder's metrics from
+        its RebatchSpeedup ``cap``.
+        """
         all_metrics = []
         for i in range(self.num_decoders):
             avg = self.compute_avg(i, num_batches)
@@ -299,6 +304,14 @@ class MetricState:
             # remap keys to match save_metric expectations
             avg['converge_fail_rate'] = avg.pop('converge_fail')
             avg['converge_succ_rate'] = avg.pop('converge_succ')
+            cap = None
+            if decoders is not None:
+                inner = getattr(decoders[i], 'decoder', decoders[i])
+                cap = getattr(inner, 'cap', None)
+            if cap is not None and cap.hists:
+                avg['rebatch_speedup'] = {'warmup batches': len(cap.hists)}
+                if cap.pct is not None:
+                    avg['rebatch_speedup']['chosen pct'] = cap.pct
             all_metrics.append(avg)
         return all_metrics
 
@@ -622,11 +635,16 @@ def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_er
             'sample count': int(round(float(decoder_metrics.get('sample_count', 0)))),
             'iteration distribution': distribution,
             'iteration count': iteration_count,
+        }
+        # rebatch_speedup (e.g. warmup batches) is reported before the timing fields.
+        if decoder_metrics.get('rebatch_speedup'):
+            all_metrics_results[decoder_key]['rebatch_speedup'] = decoder_metrics['rebatch_speedup']
+        all_metrics_results[decoder_key].update({
             'total time (s)': format_time(decoder_metrics['total_time']),
             'average time per batch (s)': format_time(decoder_metrics['total_time']/num_batches),
             'average time per sample (s)': format_time(decoder_metrics['average_time_sample']),
             'average time per iteration (s)': format_time(decoder_metrics['average_time_sample_iter']),
-        }
+        })
         for idx, check_name in enumerate(check_types[:len(check_list)]):
             all_metrics_results[decoder_key][f'{check_name}'] = check_list[idx]
 

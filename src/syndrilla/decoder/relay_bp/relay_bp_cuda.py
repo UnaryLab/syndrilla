@@ -58,7 +58,7 @@ class create(_RelayPy):
             torch.from_numpy(adj_k).to(self.device), requires_grad=False
         )
 
-        self.algo = "relay_bp_cuda"
+        self.algo = "relay_bp"
         logger.info("relay_bp_cuda decoder ready (per-step kernels + relay legs).")
 
     def forward(self, io_dict: dict) -> dict:

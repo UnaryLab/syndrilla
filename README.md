@@ -240,6 +240,8 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `181`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 
+When `decoder.device.device_type` is set to `cuda`, every BP-based decoder automatically uses its fused CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
+
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 
 | Error Model                       | #Channel                                          | Example                                            | Reference         |
@@ -249,6 +251,7 @@ The following table details the different types of decoding algorithms Syndrilla
 |Ordered Statistics Decoding (OSD)  | 1                                                           | osd_0                                              | Soft-Decision Decoding of Linear Block Codes Based on Ordered Statistics |    
 |Quaternary Belief Propagation (BP4)| 2                                                           | bp4                                                | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices|
 |Relay Belief Propagation (Relay BP)| 1                                                           | relay_bp                                           | Relay BP: normalized min-sum over multiple legs with disordered per-variable memory (relay-bp crate, `trmue/relay`)|
+|Belief Propagation with Syndrome Flipping (BP-SF)| 1                                               | bp_sf                                              | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)|
 
 #### 2.5. Logical check module
 The check YAML file defines all configuration parameters associated with the computation of logical check error rates.

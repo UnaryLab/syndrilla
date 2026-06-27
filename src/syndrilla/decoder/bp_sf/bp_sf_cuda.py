@@ -97,7 +97,7 @@ class create(_BpSfPy):
                 f"(fused needs {smem_needed} B shared memory, limit {smem_limit} B)."
             )
 
-        self.algo = "bp_sf_cuda"
+        self.algo = "bp_sf"
         logger.info(
             "bp_sf_cuda decoder ready (per-step BP + oscillation tracking; "
             f"fused SF retries={'on' if self._use_fused else 'off'})."

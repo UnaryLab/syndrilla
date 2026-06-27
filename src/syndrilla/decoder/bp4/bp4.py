@@ -77,7 +77,7 @@ class create(torch.nn.Module):
 
         self.batch_size = 1
 
-        self.d = decoder_cfg.get("damping_factor", "0.1")
+        self.d = decoder_cfg.get("damping_factor", 0.1)
         if self.d <= 0 or self.d > 1:
             logger.warning(
                 f"Invalid input damping factor <{self.d}>, default to <0.1>."

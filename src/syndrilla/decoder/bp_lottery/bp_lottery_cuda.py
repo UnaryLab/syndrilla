@@ -55,7 +55,7 @@ class create(_BaseCuda):
         _, _, _, H_matrix = bundle.select(self.check_type)
         self.H_dense = H_matrix.to(self.device, self.dtype)
 
-        self.algo = "bp_lottery_cuda"
+        self.algo = "bp_lottery"
         logger.info("bp_lottery_cuda decoder ready (per-step path + sign-flip).")
 
     # ── Forward pass ──────────────────────────────────────────────────────────

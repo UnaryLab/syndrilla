@@ -75,7 +75,7 @@ class create(_BranchPy):
                 "bp_branch_assisted_cuda: no rebatch_speedup block — running uncapped."
             )
 
-        self.algo = "bp_branch_assisted_cuda"
+        self.algo = "bp_branch_assisted"
         logger.info(
             "bp_branch_assisted_cuda decoder ready (per-step kernels + branching)."
         )
