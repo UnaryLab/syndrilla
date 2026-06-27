@@ -2,9 +2,7 @@ import torch
 
 from loguru import logger
 
-import numpy as np
-
-from syndrilla.decoder.decoder import IterSpeedup
+from syndrilla.decoder.decoder import RebatchSpeedup
 
 
 
@@ -96,10 +94,10 @@ class create(torch.nn.Module):
         self.algo = 'bp_lottery'
         self.num_max_iter = self.max_iter
 
-        # opt-in adaptive iteration speedup (no-op unless an `iter_speedup` block is
+        # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is
         # in the config). When active it stops a batch once a learned % has converged
         # and leaves the rest unconverged for main's extra queue. See decoder.py.
-        self.cap = IterSpeedup.from_cfg(decoder_cfg.get('iter_speedup'))
+        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 

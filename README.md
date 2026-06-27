@@ -98,7 +98,7 @@ Following is a table for detailed explaination on each command line arguments:
 | `-c`     | Path to check matrix YAML file               | `-c=examples/alist/lx.check.yaml`                 |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/alist/perfect.syndrome.yaml`         |
 | `-m`     | Path to matrix YAML file                     | `-m=examples/alist/surface_10.matrix.yaml`        |
-| `-ckpt`  | Path to checkpoint YAML file to resume | `-ch=result_phy_err.yaml`                         |
+| `-ckpt`  | Path to checkpoint YAML file to resume | `-ckpt=result_phy_err_0.01.yaml`                  |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
 | `-te`    | Total number of errors to stop decoding      | `-te=1000`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
@@ -280,7 +280,7 @@ The following table provides a detailed explanation of the configuration paramet
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
 | `interface.backend`| The quantum circuit simulator is used            | `stim`                     |
-| `interface.device.device_type`| Type of the device where the output result will be processed           | `cpu` or `cude`                  |
+| `interface.device.device_type`| Type of the device where the output result will be processed           | `cpu` or `cuda`                  |
 | `interface.device.device_idx`| The indice of the device where the output result will be processed           | `0`                     |
 | `interface.dtype`| The data type which the output result will be set as           | `0`                     |
 #### 2.7. Vote module
@@ -373,7 +373,7 @@ The following table provides a detailed explanation of the metrics in the output
 | `converge success rate`          | Ratio of samples that successfully converge without a logical error |
 | `decoder invoke rate`            | Ratio of samples for which the decoder is invoked                           |
 | `average iteration`              | Average number of iterations per sample                                    |
-| `sample count`                   | Total number of samples this decoder metered. Per-sample rates are accumulated weighted by this count (not by batch count), so they stay correct when batches differ in size — e.g. under the adaptive iteration speedup (`iter_speedup`), where a batch may meter only its converged samples. For equal-size batches it equals `batch count` × `batch size`. |
+| `sample count`                   | Total number of samples this decoder metered. Per-sample rates are accumulated weighted by this count (not by batch count), so they stay correct when batches differ in size — e.g. under the adaptive iteration speedup (`rebatch_speedup`), where a batch may meter only its converged samples. For equal-size batches it equals `batch count` × `batch size`. |
 | `iteration distribution`         | Once the error budget is reached, the per-percentile iteration counts (101 values, 0–100% at 1% intervals); before then, the raw per-iteration histogram |
 | `iteration count`                | Raw per-iteration histogram (samples stopping at each iteration index), always saved un-percentiled regardless of completion |
 | `total time (s)`                 | Total time taken by the decoder in seconds                                  |
@@ -402,7 +402,7 @@ To change the configuration of the simulator, user need to update the YAML files
 For example, if you want to use a different physical error rate, you need to find the input error YAML (e.g., ```examples/alist/bsc.error.yaml```) and update the ```rate``` field.
 
 ### 4. Resume from checkpoint
-If previous run is terminated by accident, the simulation can resume by setting ```-ckpt``` to the checkpoint YAML file, the results of a previous run (e.g., ```tests/test_outputs=result_phy_err_0.01.yaml```).
+If previous run is terminated by accident, the simulation can resume by setting ```-ckpt``` to the checkpoint YAML file, the results of a previous run (e.g., ```tests/test_outputs/result_phy_err_0.01.yaml```).
 
 ```command
 syndrilla -r=tests/test_outputs 
@@ -412,7 +412,7 @@ syndrilla -r=tests/test_outputs
           -s=examples/alist/perfect.syndrome.yaml 
           -bs=10000 
           -te=1000
-          -ckpt=tests/test_outputs=result_phy_err_0.01.yaml
+          -ckpt=tests/test_outputs/result_phy_err_0.01.yaml
 ```
 
 ### 5. Sweep configurations

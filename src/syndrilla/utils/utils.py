@@ -1,4 +1,4 @@
-import os, sys, yaml, json, csv, torch, random
+import os, sys, yaml, json, csv, torch
 import numpy as np
 import importlib.util
 
@@ -621,7 +621,7 @@ def fp2fxp(input, intwidth=7, fracwidth=8, rounding='floor'):
 
 
 def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_density):
-    """predict_pct schedule for the iter_speedup deferred ('extra') queue.
+    """predict_pct schedule for the rebatch_speedup deferred ('extra') queue.
 
     The cap defers hard (slow-to-converge) samples into an extra queue; this decides
     WHEN to re-decode them (NOT the cap percentile, which decides WHICH samples get
@@ -651,7 +651,7 @@ def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_d
 
 
 class ExtraQueue:
-    """Deferred-sample queue for the iter_speedup adaptive cap.
+    """Deferred-sample queue for the rebatch_speedup adaptive cap.
 
     The cap leaves hard (unconverged) samples behind; they are parked here on CPU
     and re-decoded later in full, uncapped batches. This class owns the offload

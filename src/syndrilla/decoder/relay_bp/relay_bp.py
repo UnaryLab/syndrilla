@@ -1,11 +1,8 @@
 import torch
-import random
 
 from loguru import logger
 
-import numpy as np
-
-from syndrilla.decoder.decoder import IterSpeedup
+from syndrilla.decoder.decoder import RebatchSpeedup
 
 
 class create(torch.nn.Module):
@@ -153,11 +150,11 @@ class create(torch.nn.Module):
         self.algo = 'bp_relay'
         self.num_max_iter = self.iteration_initial + (self.legs - 1) * self.iteration_count
 
-        # opt-in adaptive iteration speedup (no-op unless an `iter_speedup` block is in the
+        # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is in the
         # config). When active it stops the leg ensemble once a learned % of the batch has
         # converged and leaves the rest unconverged for main's deferred extra queue. Mirrors
         # bp_norm_min_sum; here the cap is at the LEG granularity (each leg is a full BP run).
-        self.cap = IterSpeedup.from_cfg(decoder_cfg.get('iter_speedup'))
+        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 

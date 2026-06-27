@@ -43,6 +43,7 @@ The following table lists every algorithm registered under `src/syndrilla/decode
 | `bp_norm_min_sum`           | 1        | Normalized min-sum belief propagation                                                   | Factor Graphs and the Sum-Product Algorithm                                                                                        |
 | `bp_norm_min_sum_quant`     | 1        | Normalized min-sum BP with fixed-point quantization                                | -                                                                                                                                  |
 | `bp_branch_assisted`        | 1        | Branch-assisted sign-flipping BP (BSFBP)                                                 | Branch-Assisted Sign-Flipping Belief Propagation Decoding for Topological Quantum Codes Based on Hypergraph Product Structure      |
+| `bp_sf`                     | 1        | Normalized min-sum BP with syndrome-flipping (SF) post-processing on the most-oscillating bits | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)                                |
 | `bp_lottery`                | 1        | Lottery BP                      | -                                                                                                                                  |
 | `bp_lottery_quant`          | 1        | Lottery BP with fixed-point quantization                                         | -                                                                                                                                  |
 | `bp_lottery_policy`         | 1        | Lottery BP with selectable sign-flip policy (paper's five-policy)               | -                                                                                                                                  |
@@ -244,12 +245,12 @@ decoder:
 
 `relay_bp` uses `iteration_initial`/`iteration_count`/`legs` to bound its work, so it **ignores** the common `max_iter` field. The `center`/`width` defaults match the crate's `gamma_dist_interval = (−0.24, 0.66)`.
 
-## 4. Adaptive iteration speedup (`iter_speedup`)
-An opt-in, per-decoder block consumed by the iterative BP decoders — `bp_norm_min_sum`, `bp_lottery`, `bp_lottery_quant`, and `bp_lottery_policy` (other algorithms, e.g. `relay_bp` and `osd_0`, ignore it). It reduces decoding **time** by stopping a batch once a warm-up–learned fraction of samples has converged and deferring the unconverged tail to be re-decoded uncapped.
+## 4. Adaptive iteration speedup (`rebatch_speedup`)
+An opt-in, per-decoder block consumed by the iterative BP decoders `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp4`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, and `relay_bp` (other algorithms, e.g. `bp_branch_assisted`, `bp_sf`, and `osd_0`, ignore it). It reduces decoding **time** by stopping a batch once a warm-up-learned fraction of samples has converged and deferring the unconverged tail to be re-decoded uncapped.
 
-For these single-pass BP decoders the cap is **lossless**: every sample is still fully decoded, so the logical error rate is identical to a no-cap run. The deferred tail (`converge == 0`) is still re-decoded uncapped.
+For these BP decoders the cap is **lossless**: every sample is still fully decoded, so the logical error rate is identical to a no-cap run. The deferred tail (`converge == 0`) is still re-decoded uncapped.
 
-**Setup.** Add an `iter_speedup` block to the decoder YAML; omit it to disable the feature.
+**Setup.** Add an `rebatch_speedup` block to the decoder YAML; omit it to disable the feature.
 
 ```
 decoder:
@@ -257,7 +258,7 @@ decoder:
   check_type: hx
   max_iter: 181
   dtype: float64
-  iter_speedup:
+  rebatch_speedup:
     kl_eps: 0.001
     kl_window: 2
     kl_min: 3
@@ -268,10 +269,10 @@ decoder:
 
 | Key                               | Description                                              | Example |
 |-----------------------------------|----------------------------------------------------------|---------|
-| `decoder.iter_speedup.kl_eps`     | Warm-up KL threshold (larger ⇒ shorter warm-up)          | `1.0`   |
-| `decoder.iter_speedup.kl_window`  | Consecutive settled batches that end warm-up             | `1`     |
-| `decoder.iter_speedup.kl_min`     | Minimum warm-up batches                                  | `2`     |
-| `decoder.iter_speedup.candidates` | (optional) cap percentiles to consider; default `0..99`  | -       |
+| `decoder.rebatch_speedup.kl_eps`     | Warm-up KL threshold (larger ⇒ shorter warm-up)          | `1.0`   |
+| `decoder.rebatch_speedup.kl_window`  | Consecutive settled batches that end warm-up             | `1`     |
+| `decoder.rebatch_speedup.kl_min`     | Minimum warm-up batches                                  | `2`     |
+| `decoder.rebatch_speedup.candidates` | (optional) cap percentiles to consider; default `0..99`  | -       |
 
 
 ## 5. Decoder I/O contract
