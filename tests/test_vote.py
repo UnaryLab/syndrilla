@@ -46,6 +46,12 @@ def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
     l_matrix = bundle.get_l_matrix(check_type, number_channel)
     dtype = decoders[0].dtype
 
+    # BSC now generates the rounds dimension itself: rounds>1 yields a 3-D
+    # [B, rounds, N] (cumulative) error and a matching 3-D llr, which the
+    # phenomenological measurer turns into a per-round [B, rounds, M] syndrome
+    # for the voter to collapse.
+    error_model.rounds = rounds
+
     total_logical_errors = 0
     total_shots = 0
 
@@ -59,7 +65,10 @@ def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
             synd = voter.apply(synd, number_channel, rounds=rounds,
                                vote_stage=vote_stage, current_stage='syndrome')
 
-            io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
+            # The per-round data prior is identical every round (constant
+            # log((1-p)/p)), so collapse the 3-D llr to a single 2-D prior.
+            llr0 = llr if llr.ndim == 2 else llr[:, 0]
+            io_dict = {'synd': synd, 'llr0': llr0, 'H_matrix': H_matrix}
 
             for decoder_idx, decoder in enumerate(decoders):
                 io_dict = decoder(io_dict)
@@ -70,7 +79,10 @@ def run_decode(decoders, error_model, syndrome_gen, logical_chk, bundle,
                     if key in io_dict and io_dict[key].ndim > 1:
                         io_dict[key] = voter.select_round(io_dict[key], rounds=rounds, vote_stage=vote_stage, current_stage=decoder_stage)
 
-            check = logical_chk.check(io_dict['e_v'].to(dtype), err, l_matrix)
+            # voting collapses the rounds dimension to one estimate, so compare
+            # against a single 2-D ground truth: the final accumulated error.
+            err_check = err if err.ndim == 2 else err[:, -1]
+            check = logical_chk.check(io_dict['e_v'].to(dtype), err_check, l_matrix)
             total_logical_errors += int(check.sum())
             total_shots += batch_size
 

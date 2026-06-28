@@ -42,11 +42,12 @@ class create():
             self.dtype = codeword.dtype
 
             if self.rounds > 1:
-                # [B, N] -> [B, rounds, N] with independent errors per round
                 random_values = torch.rand(codeword.size(0), self.rounds, codeword.size(1),
                                            device=codeword.device, dtype=codeword.dtype)
+                flip = (random_values < self.rate).to(codeword.dtype)
+                cumulative_flip = flip.cumsum(dim=1) % 2                
                 expanded = codeword.unsqueeze(1).expand(-1, self.rounds, -1)
-                error = torch.where(random_values < self.rate, 1 - expanded, expanded)
+                error = (expanded + cumulative_flip) % 2
             else:
                 random_values = torch.rand_like(codeword)
                 error = torch.where(random_values < self.rate, 1 - codeword, codeword)

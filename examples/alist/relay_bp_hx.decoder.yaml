@@ -1,0 +1,16 @@
+decoder:
+  algorithm: relay_bp
+  check_type: hx
+  legs: 20
+  iteration_initial: 80
+  iteration_count: 60
+  solution: 5
+  init_mem_strength: 0.35
+  center: 0.21
+  width: 0.9
+  alpha: 0.0
+  alpha_scaling: 1.0
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0

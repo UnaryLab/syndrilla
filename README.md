@@ -97,7 +97,8 @@ Following is a table for detailed explaination on each command line arguments:
 | `-e`     | Path to error model YAML file                | `-e=examples/alist/bsc.error.yaml`                |
 | `-c`     | Path to check matrix YAML file               | `-c=examples/alist/lx.check.yaml`                 |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/alist/perfect.syndrome.yaml`         |
-| `-ckpt`  | Path to checkpoint YAML file to resume | `-ch=result_phy_err.yaml`                         |
+| `-m`     | Path to matrix YAML file                     | `-m=examples/alist/surface_10.matrix.yaml`        |
+| `-ckpt`  | Path to checkpoint YAML file to resume | `-ckpt=result_phy_err_0.01.yaml`                  |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
 | `-te`    | Total number of errors to stop decoding      | `-te=1000`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
@@ -239,6 +240,8 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `181`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 
+When `decoder.device.device_type` is set to `cuda`, every BP-based decoder automatically uses its fused CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
+
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 
 | Error Model                       | #Channel                                          | Example                                            | Reference         |
@@ -247,6 +250,8 @@ The following table details the different types of decoding algorithms Syndrilla
 |Branch-Assisted Sign-Flipping Belief Propagation (BSFBP) | 1                                     | bp_branch_assisted                                 | Branch-Assisted Sign-Flipping Belief Propagation Decoding for Topological Quantum Codes Based on Hypergraph Product Structure |
 |Ordered Statistics Decoding (OSD)  | 1                                                           | osd_0                                              | Soft-Decision Decoding of Linear Block Codes Based on Ordered Statistics |    
 |Quaternary Belief Propagation (BP4)| 2                                                           | bp4                                                | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices|
+|Relay Belief Propagation (Relay BP)| 1                                                           | relay_bp                                           | Relay BP: normalized min-sum over multiple legs with disordered per-variable memory (relay-bp crate, `trmue/relay`)|
+|Belief Propagation with Syndrome Flipping (BP-SF)| 1                                               | bp_sf                                              | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)|
 
 #### 2.5. Logical check module
 The check YAML file defines all configuration parameters associated with the computation of logical check error rates.
@@ -278,7 +283,7 @@ The following table provides a detailed explanation of the configuration paramet
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
 | `interface.backend`| The quantum circuit simulator is used            | `stim`                     |
-| `interface.device.device_type`| Type of the device where the output result will be processed           | `cpu` or `cude`                  |
+| `interface.device.device_type`| Type of the device where the output result will be processed           | `cpu` or `cuda`                  |
 | `interface.device.device_idx`| The indice of the device where the output result will be processed           | `0`                     |
 | `interface.dtype`| The data type which the output result will be set as           | `0`                     |
 #### 2.7. Vote module
@@ -371,7 +376,9 @@ The following table provides a detailed explanation of the metrics in the output
 | `converge success rate`          | Ratio of samples that successfully converge without a logical error |
 | `decoder invoke rate`            | Ratio of samples for which the decoder is invoked                           |
 | `average iteration`              | Average number of iterations per sample                                    |
-| `distribution`                   | Distribution of iterations at 1% interval |
+| `sample count`                   | Total number of samples this decoder metered. Per-sample rates are accumulated weighted by this count (not by batch count), so they stay correct when batches differ in size — e.g. under the adaptive iteration speedup (`rebatch_speedup`), where a batch may meter only its converged samples. For equal-size batches it equals `batch count` × `batch size`. |
+| `iteration distribution`         | Once the error budget is reached, the per-percentile iteration counts (101 values, 0–100% at 1% intervals); before then, the raw per-iteration histogram |
+| `iteration count`                | Raw per-iteration histogram (samples stopping at each iteration index), always saved un-percentiled regardless of completion |
 | `total time (s)`                 | Total time taken by the decoder in seconds                                  |
 | `average time per batch (s)`     | Average time taken per batch in seconds                                     |
 | `average time per sample (s)`    | Average time taken per sample in seconds                                    |
@@ -398,7 +405,7 @@ To change the configuration of the simulator, user need to update the YAML files
 For example, if you want to use a different physical error rate, you need to find the input error YAML (e.g., ```examples/alist/bsc.error.yaml```) and update the ```rate``` field.
 
 ### 4. Resume from checkpoint
-If previous run is terminated by accident, the simulation can resume by setting ```-ckpt``` to the checkpoint YAML file, the results of a previous run (e.g., ```tests/test_outputs=result_phy_err_0.01.yaml```).
+If previous run is terminated by accident, the simulation can resume by setting ```-ckpt``` to the checkpoint YAML file, the results of a previous run (e.g., ```tests/test_outputs/result_phy_err_0.01.yaml```).
 
 ```command
 syndrilla -r=tests/test_outputs 
@@ -408,7 +415,7 @@ syndrilla -r=tests/test_outputs
           -s=examples/alist/perfect.syndrome.yaml 
           -bs=10000 
           -te=1000
-          -ckpt=tests/test_outputs=result_phy_err_0.01.yaml
+          -ckpt=tests/test_outputs/result_phy_err_0.01.yaml
 ```
 
 ### 5. Sweep configurations

@@ -2,8 +2,6 @@ import torch
 
 from loguru import logger
 
-from syndrilla.matrix import create_parity_matrix
-
 
 class create():
     """

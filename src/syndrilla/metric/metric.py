@@ -110,6 +110,29 @@ class BatchTracker:
         self.converge_all[i + 1] = torch.cat(
             (self.converge_all[i + 1], converge), dim=0)
 
+    def keep_samples(self, mask):
+        """Restrict every per-sample buffer (ground truth + all decoders) to the
+        rows selected by `mask`. Used by the adaptive cap to drop the deferred
+        (unconverged) tail so this batch only meters its kept, converged samples.
+
+        Only buffers that are full-batch-aligned with `mask` are sliced. A chained
+        decoder may keep buffers sized to a subset of the batch — e.g. osd_0 only
+        decodes the unconverged samples, so its `iter` buffer is shorter than the
+        batch — and the full-batch cap mask doesn't apply to those; leave them
+        as-is rather than mis-indexing."""
+        mask = mask.to(self.device)
+        n = mask.shape[0]
+
+        def _maybe_slice(t):
+            return t[mask] if (t is not None and t.shape[0] == n) else t
+
+        self.e_all = _maybe_slice(self.e_all)
+        for di in range(self.num_decoders):
+            self.e_v_all[di] = _maybe_slice(self.e_v_all[di])
+            self.iter_all[di] = _maybe_slice(self.iter_all[di])
+        for di in range(self.num_decoders + 1):
+            self.converge_all[di] = _maybe_slice(self.converge_all[di])
+
 
 class MetricState:
     """Holds all per-decoder metric accumulators."""
@@ -133,6 +156,13 @@ class MetricState:
         # scalar accumulators: list[float] indexed by decoder
         for field in self._scalar_fields:
             setattr(self, field, [0.0] * num_decoders)
+
+        # per-decoder total sample count: per-sample rate fields are accumulated
+        # weighted by each batch's sample count and divided by this (not by the
+        # batch count), so reported rates stay correct when batches differ in size
+        # (e.g. the adaptive cap meters only a batch's converged samples). For
+        # equal-size batches this is identical to averaging over batches.
+        self.total_samples = [0.0] * num_decoders
 
         # distribution is special (tensor per decoder)
         self.distribution = [0.0] * num_decoders
@@ -182,10 +212,19 @@ class MetricState:
         }
 
     def accumulate(self, decoder_idx, batch_metrics):
-        """Add one batch's report_metric result for a decoder."""
+        """Add one batch's report_metric result for a decoder.
+
+        Per-sample rates are weighted by the batch's sample count so that batches of
+        different sizes are combined correctly (see total_samples). total_time is a
+        raw sum and distribution is a raw histogram, so both are added unweighted."""
         i = decoder_idx
-        for field in self._scalar_fields:
-            getattr(self, field)[i] += batch_metrics[field]
+        ss = float(batch_metrics.get('sample_size', 1) or 1)
+        self.total_samples[i] += ss
+
+        self.total_time[i] += batch_metrics['total_time']
+        for field in ('average_time_sample', 'average_iter',
+                      'average_time_sample_iter', 'invoke_rate'):
+            getattr(self, field)[i] += batch_metrics[field] * ss
 
         self.distribution[i] += batch_metrics['distribution']
 
@@ -193,7 +232,7 @@ class MetricState:
             acc = getattr(self, field)[i]
             batch_val = batch_metrics[field]
             for ch in range(self.number_channel):
-                acc[ch] += batch_val[ch]
+                acc[ch] += batch_val[ch] * ss
 
     def compute_avg(self, decoder_idx, num_batches):
         """Compute averaged metrics for one decoder. Returns a dict."""
@@ -201,13 +240,19 @@ class MetricState:
 
         logger.info(f'Reporting decoding metric for decoder {i}.')
 
+        # per-sample rates were accumulated weighted by sample count -> divide by the
+        # total sample count. Fall back to num_batches for the legacy
+        # compute_avg_metrics() wrapper, which accumulates unweighted.
+        ts = getattr(self, 'total_samples', None)
+        denom = ts[i] if (ts is not None and ts[i]) else num_batches
+
         total_time = self.total_time[i]
         average_time_batch = total_time / num_batches
-        average_time_sample = self.average_time_sample[i] / num_batches
-        average_iter = self.average_iter[i] / num_batches
+        average_time_sample = self.average_time_sample[i] / denom
+        average_iter = self.average_iter[i] / denom
         distribution = self.distribution[i]
-        average_time_sample_iter = self.average_time_sample_iter[i] / num_batches
-        invoke_rate = self.invoke_rate[i] / num_batches
+        average_time_sample_iter = self.average_time_sample_iter[i] / denom
+        invoke_rate = self.invoke_rate[i] / denom
 
         logger.info(f'Decoder invoke rate: {invoke_rate}')
         logger.info(f'Total time: {total_time} seconds.')
@@ -225,10 +270,11 @@ class MetricState:
             'distribution': distribution,
             'average_time_sample_iter': average_time_sample_iter,
             'invoke_rate': invoke_rate,
+            'sample_count': float(denom),
         }
 
         for field in self._channel_fields:
-            avg = [x / num_batches for x in getattr(self, field)[i]]
+            avg = [x / denom for x in getattr(self, field)[i]]
             result[field] = avg
 
         for ch in range(self.number_channel):
@@ -244,8 +290,13 @@ class MetricState:
         logger.info(f'Complete.')
         return result
 
-    def get_all_metrics(self, num_batches, algo_names):
-        """Compute averaged metrics for all decoders. Returns list of dicts for save_metric."""
+    def get_all_metrics(self, num_batches, algo_names, decoders=None):
+        """Compute averaged metrics for all decoders. Returns list of dicts for save_metric.
+
+        When a decoder uses rebatch_speedup, its warm-up batch count (and the chosen cap
+        percentile once warm-up has finished) is attached to that decoder's metrics from
+        its RebatchSpeedup ``cap``.
+        """
         all_metrics = []
         for i in range(self.num_decoders):
             avg = self.compute_avg(i, num_batches)
@@ -253,6 +304,14 @@ class MetricState:
             # remap keys to match save_metric expectations
             avg['converge_fail_rate'] = avg.pop('converge_fail')
             avg['converge_succ_rate'] = avg.pop('converge_succ')
+            cap = None
+            if decoders is not None:
+                inner = getattr(decoders[i], 'decoder', decoders[i])
+                cap = getattr(inner, 'cap', None)
+            if cap is not None and cap.hists:
+                avg['rebatch_speedup'] = {'warmup batches': len(cap.hists)}
+                if cap.pct is not None:
+                    avg['rebatch_speedup']['chosen pct'] = cap.pct
             all_metrics.append(avg)
         return all_metrics
 
@@ -299,23 +358,29 @@ class MetricState:
             else:
                 ch_map = []
 
+            # per-sample rates were saved divided by the sample count, so rebuild the
+            # accumulators by multiplying back by it. Old checkpoints have no 'sample
+            # count'; for those (equal-size batches) it is exactly batch_count*batch_size.
+            sc = float(entry.get('sample count', bc * ckpt_meta['batch_size']))
+            state.total_samples[idx] = sc
+
             # total_time is saved raw by save_metric (NOT divided by num_batches)。
             state.total_time[idx] = float(entry['total time (s)'])
-            state.average_time_sample[idx] = float(entry['average time per sample (s)']) * bc
-            state.average_iter[idx] = float(entry['average iteration']) * bc
+            state.average_time_sample[idx] = float(entry['average time per sample (s)']) * sc
+            state.average_iter[idx] = float(entry['average iteration']) * sc
             state.distribution[idx] = torch.tensor(entry['iteration distribution'])
-            state.average_time_sample_iter[idx] = float(entry['average time per iteration (s)']) * bc
-            state.invoke_rate[idx] = float(entry['decoder invoke rate']) * bc
+            state.average_time_sample_iter[idx] = float(entry['average time per iteration (s)']) * sc
+            state.invoke_rate[idx] = float(entry['decoder invoke rate']) * sc
 
             for ch, ch_idx in ch_map:
                 ch_entry = entry[ch]
-                state.data_qubit_acc[idx][ch_idx] = float(ch_entry.get('data qubit accuracy', 0.0)) * bc
-                state.data_frame_error_rate[idx][ch_idx] = float(ch_entry.get('data frame error rate', 0.0)) * bc
-                state.synd_frame_error_rate[idx][ch_idx] = float(ch_entry.get('syndrome frame error rate', 0.0)) * bc
-                state.correction_acc[idx][ch_idx] = float(ch_entry.get('data qubit correction accuracy', 0.0)) * bc
-                state.logical_error_rate[idx][ch_idx] = float(ch_entry.get('logical error rate', 0.0)) * bc
-                state.converge_fail[idx][ch_idx] = float(ch_entry.get('converge failure rate', 0.0)) * bc
-                state.converge_succ[idx][ch_idx] = float(ch_entry.get('converge success rate', 0.0)) * bc
+                state.data_qubit_acc[idx][ch_idx] = float(ch_entry.get('data qubit accuracy', 0.0)) * sc
+                state.data_frame_error_rate[idx][ch_idx] = float(ch_entry.get('data frame error rate', 0.0)) * sc
+                state.synd_frame_error_rate[idx][ch_idx] = float(ch_entry.get('syndrome frame error rate', 0.0)) * sc
+                state.correction_acc[idx][ch_idx] = float(ch_entry.get('data qubit correction accuracy', 0.0)) * sc
+                state.logical_error_rate[idx][ch_idx] = float(ch_entry.get('logical error rate', 0.0)) * sc
+                state.converge_fail[idx][ch_idx] = float(ch_entry.get('converge failure rate', 0.0)) * sc
+                state.converge_succ[idx][ch_idx] = float(ch_entry.get('converge success rate', 0.0)) * sc
 
         if 'vote' in data:
             v = data['vote']
@@ -486,6 +551,7 @@ def report_metric(num_max_iter, e_estimated, e_actual, iteration, time_iteration
 
     return MetricResult({
         'total_time': total_time,
+        'sample_size': sample_size,
         'average_time_sample': average_time_sample,
         'average_iter': average_iter,
         'distribution': distribution,
@@ -529,6 +595,9 @@ def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_er
 
     for i, decoder_metrics in enumerate(out_dict):
         decoder_key = f'decoder_{i}'
+        raw_dist = decoder_metrics['distribution'].int().cpu()
+        iteration_count = raw_dist.numpy().tolist()
+
         if done:
             total = decoder_metrics['distribution'].sum()
             cdf = torch.cumsum(decoder_metrics['distribution'], dim=0) / total
@@ -536,7 +605,7 @@ def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_er
             indices = torch.searchsorted(cdf, qs, right=False)
             distribution = (indices + 1).int().tolist()
         else:
-            distribution = decoder_metrics['distribution'].int().cpu().numpy().tolist()
+            distribution = raw_dist.numpy().tolist()
 
         total_time_sum += float(decoder_metrics['total_time'])
         data_acc = decoder_metrics['data_qubit_acc']
@@ -563,12 +632,19 @@ def save_metric(out_dict, curr_dir, batch_size, target_error, dtype, physical_er
             'algorithm': decoder_metrics['algorithm'],
             'decoder invoke rate': float(decoder_metrics['invoke_rate']),
             'average iteration': float(decoder_metrics['average_iter']),
+            'sample count': int(round(float(decoder_metrics.get('sample_count', 0)))),
             'iteration distribution': distribution,
+            'iteration count': iteration_count,
+        }
+        # rebatch_speedup (e.g. warmup batches) is reported before the timing fields.
+        if decoder_metrics.get('rebatch_speedup'):
+            all_metrics_results[decoder_key]['rebatch_speedup'] = decoder_metrics['rebatch_speedup']
+        all_metrics_results[decoder_key].update({
             'total time (s)': format_time(decoder_metrics['total_time']),
             'average time per batch (s)': format_time(decoder_metrics['total_time']/num_batches),
             'average time per sample (s)': format_time(decoder_metrics['average_time_sample']),
             'average time per iteration (s)': format_time(decoder_metrics['average_time_sample_iter']),
-        }
+        })
         for idx, check_name in enumerate(check_types[:len(check_list)]):
             all_metrics_results[decoder_key][f'{check_name}'] = check_list[idx]
 

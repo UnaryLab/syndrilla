@@ -19,7 +19,6 @@ YAML config::
 import math
 
 import torch
-from loguru import logger
 
 from syndrilla.utils import dataset
 from syndrilla.interface.stim.stim import get_stim_circuit

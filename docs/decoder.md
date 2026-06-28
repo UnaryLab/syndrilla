@@ -17,6 +17,11 @@ The following table details the configuration parameters shared by every decoder
 | `decoder.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
 | `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `131`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
+| `decoder.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device, skipping the fused-CUDA-kernel port | `false`                  |
+
+**CUDA acceleration.** Every belief-propagation decoder ships a fused-CUDA-kernel implementation alongside its PyTorch module: `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp4`, `bp_sf`, and `relay_bp` (all algorithms except `osd_0`). There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically when a CUDA-capable GPU is present and the kernel builds.
+
+The selection **falls back to PyTorch automatically**. If no CUDA GPU is available, or the `.cu` kernel fails to build or instantiate (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM, where the CUDA kernels do not compile), the plain `<algo>/<algo>.py` PyTorch module runs instead, on whatever device the config resolves to (the CUDA device under ROCm, otherwise CPU). The same fallback applies when an algorithm has no CUDA port. Set `force_pytorch: true` to force the PyTorch module even on an NVIDIA CUDA device.
 
 ## 2. Chained decoders
 A list of algorithms runs each decoder in order; later decoders are only invoked on samples that the earlier ones did not converge on.
@@ -43,10 +48,12 @@ The following table lists every algorithm registered under `src/syndrilla/decode
 | `bp_norm_min_sum`           | 1        | Normalized min-sum belief propagation                                                   | Factor Graphs and the Sum-Product Algorithm                                                                                        |
 | `bp_norm_min_sum_quant`     | 1        | Normalized min-sum BP with fixed-point quantization                                | -                                                                                                                                  |
 | `bp_branch_assisted`        | 1        | Branch-assisted sign-flipping BP (BSFBP)                                                 | Branch-Assisted Sign-Flipping Belief Propagation Decoding for Topological Quantum Codes Based on Hypergraph Product Structure      |
+| `bp_sf`                     | 1        | Normalized min-sum BP with syndrome-flipping (SF) post-processing on the most-oscillating bits | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)                                |
 | `bp_lottery`                | 1        | Lottery BP                      | -                                                                                                                                  |
 | `bp_lottery_quant`          | 1        | Lottery BP with fixed-point quantization                                         | -                                                                                                                                  |
 | `bp_lottery_policy`         | 1        | Lottery BP with selectable sign-flip policy (paper's five-policy)               | -                                                                                                                                  |
 | `bp4`                       | 2        | Quaternary BP (BP4) operating on the 2-channel Pauli prior                               | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices                               |
+| `relay_bp`                  | 1        | Relay BP — normalized min-sum run over multiple "legs" with disordered per-variable memory, keeping the best converged solution | relay-bp crate (crates.io, `trmue/relay`)                                                  |
 | `osd_0`                     | 1        | Order-0 Ordered Statistics Decoding               | Soft-Decision Decoding of Linear Block Codes Based on Ordered Statistics                                                            |
 
 ### 3.1. Decoders using only the common configuration
@@ -207,7 +214,75 @@ decoder:
 
 `bp4` consumes both Hx and Hz from the matrix bundle directly; `check_type` is not used.
 
-## 4. Decoder I/O contract
+### 3.8. relay_bp
+Relay BP (the `trmue/relay` crate's algorithm). It runs normalized min-sum over a sequence of "legs": leg 1 uses a constant memory strength `init_mem_strength`; each later (ensemble) leg resets the variable→check messages to the prior, carries the posterior forward (the "relay"), and applies random per-variable memory strengths drawn from `[center − width/2, center + width/2]`. Each converged leg yields a candidate solution; the lowest-weight valid one is kept. The leg ensemble stops once every sample has collected `solution` converged solutions (or after `legs` legs). Example configuration (`relay_bp_hx.decoder.yaml`):
+
+```
+decoder:
+  algorithm: relay_bp
+  check_type: hx
+  legs: 20
+  iteration_initial: 80
+  iteration_count: 60
+  solution: 5
+  init_mem_strength: 0.35
+  center: 0.21
+  width: 0.9
+  alpha: 0.0
+  alpha_scaling: 1.0
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+```
+
+| Key                          | Description                                                                                       | Example   |
+|------------------------------|---------------------------------------------------------------------------------------------------|-----------|
+| `decoder.legs`               | Number of relay legs (ensemble size; the crate's `num_sets`)                                      | `20`      |
+| `decoder.iteration_initial`  | BP iterations in leg 1                                                                             | `80`      |
+| `decoder.iteration_count`    | BP iterations in each later (ensemble) leg                                                         | `60`      |
+| `decoder.solution`           | Converged solutions to collect before stopping (the crate's `stop_nconv`)                         | `5`       |
+| `decoder.init_mem_strength`  | Leg-1 memory strength `gamma0`                                                                     | `0.35`    |
+| `decoder.center`             | Center of the per-variable memory-strength interval for ensemble legs                             | `0.21`    |
+| `decoder.width`              | Width of that interval (drawn from `[center − width/2, center + width/2]`)                         | `0.9`     |
+| `decoder.alpha`              | Min-sum normalization: `0.0` → adaptive `1 − 2^(−i/alpha_scaling)`; `<0` → `1.0`; else constant   | `0.0`     |
+| `decoder.alpha_scaling`      | Divisor in the adaptive `alpha` schedule                                                           | `1.0`     |
+
+`relay_bp` uses `iteration_initial`/`iteration_count`/`legs` to bound its work, so it **ignores** the common `max_iter` field. The `center`/`width` defaults match the crate's `gamma_dist_interval = (−0.24, 0.66)`.
+
+## 4. Adaptive iteration speedup (`rebatch_speedup`)
+An opt-in, per-decoder block consumed by the iterative BP decoders `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp4`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, and `relay_bp` (other algorithms, e.g. `bp_branch_assisted`, `bp_sf`, and `osd_0`, ignore it). It reduces decoding **time** by stopping a batch once a warm-up-learned fraction of samples has converged and deferring the unconverged tail to be re-decoded uncapped.
+
+For these BP decoders the cap is **lossless**: every sample is still fully decoded, so the logical error rate is identical to a no-cap run. The deferred tail (`converge == 0`) is still re-decoded uncapped.
+
+**Setup.** Add an `rebatch_speedup` block to the decoder YAML; omit it to disable the feature.
+
+```
+decoder:
+  algorithm: bp_norm_min_sum
+  check_type: hx
+  max_iter: 181
+  dtype: float64
+  rebatch_speedup:
+    kl_eps: 0.001
+    kl_window: 2
+    kl_min: 3
+  device:
+    device_type: cuda
+    device_idx: 0
+```
+
+| Key                               | Description                                              | Example |
+|-----------------------------------|----------------------------------------------------------|---------|
+| `decoder.rebatch_speedup.kl_eps`     | Warm-up KL threshold (larger ⇒ shorter warm-up)          | `1.0`   |
+| `decoder.rebatch_speedup.kl_window`  | Consecutive settled batches that end warm-up             | `1`     |
+| `decoder.rebatch_speedup.kl_min`     | Minimum warm-up batches                                  | `2`     |
+| `decoder.rebatch_speedup.candidates` | (optional) cap percentiles to consider; default `0..99`  | -       |
+
+**Output.** When a decoder uses `rebatch_speedup`, its per-decoder block in the result YAML gains a `rebatch_speedup` entry reporting `warmup batches` (the number of warm-up batches the KL test consumed) and, once the cap is chosen, `chosen pct`. This entry is emitted **before** the `total time (s)` timing fields.
+
+
+## 5. Decoder I/O contract
 Every decoder consumes and returns an `io_dict` with the following entries.
 | Key                | Direction | Description                                                                                              |
 |--------------------|-----------|----------------------------------------------------------------------------------------------------------|
