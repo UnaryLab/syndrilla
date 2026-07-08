@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-version = "v1.0.4"
+version = "v1.0.5"
 name = "syndrilla"
 authors = [
   { name="Yanzhang Zhu", email="yanzhang.zhu@ucf.edu" },

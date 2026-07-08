@@ -41,7 +41,7 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
 1. High modularity: easily customizing your own **decoding algorithms** and **error models**
 2. High compatibility: cross-platform simulation on CPUs, **GPUs**, and even AI accelerators
 3. High performance: showing **10-20X** speedup on GPUs over CPUs
-4. Community focus: support for standard **BPOSD** decoder and **BP4** decoder
+4. Community focus: support for standard **BPOSD**, **BP4**, **MWPM**, and **Union-Find** decoders
 5. Flexible data format: support for **FP16/BF16/FP32/FP64** simulation
 6. Hardware awareness: support for **quantization** simulation
 7. Fine-grained measurement: support for a broad range of metrics, with **degeneracy errors** highlighted
@@ -240,7 +240,7 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `181`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 
-When `decoder.device.device_type` is set to `cuda`, every BP-based decoder automatically uses its fused CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
+When `decoder.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This now covers the full set: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
 
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 
@@ -252,6 +252,8 @@ The following table details the different types of decoding algorithms Syndrilla
 |Quaternary Belief Propagation (BP4)| 2                                                           | bp4                                                | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices|
 |Relay Belief Propagation (Relay BP)| 1                                                           | relay_bp                                           | Relay BP: normalized min-sum over multiple legs with disordered per-variable memory (relay-bp crate, `trmue/relay`)|
 |Belief Propagation with Syndrome Flipping (BP-SF)| 1                                               | bp_sf                                              | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)|
+|Minimum-Weight Perfect Matching (MWPM)| 1                                                     | mwpm                                               | PyMatching v2 sparse-blossom (Higgott & Gidney); graphlike codes only|
+|Union-Find (Delfosse-Nickerson)| 1                                                            | union_find                                         | Almost-linear-time decoding for topological codes (arXiv:1709.06218); toric/graphlike codes only|
 
 #### 2.5. Logical check module
 The check YAML file defines all configuration parameters associated with the computation of logical check error rates.

@@ -102,9 +102,18 @@ class create(torch.nn.Module):
         # set iteration
         self.i = 0
 
-        # convert to as the parameters in a model
-        self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
-        self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
+        # convert to as the parameters in a model. Move the bundle-derived index/mask/matrix
+        # tensors onto the decoder's device: the bundle is loaded on CPU, but forward() builds
+        # its tensors on self.device and ops like scatter_add_ require the index on the SAME
+        # device as the target (plain [] indexing tolerates a CPU index, scatter_add_ does not).
+        self.V_c_row = torch.nn.Parameter(
+            self.V_c_row.to(self.device), requires_grad=False
+        )
+        self.V_c_col = torch.nn.Parameter(
+            self.V_c_col.to(self.device), requires_grad=False
+        )
+        self.mask_dummy = self.mask_dummy.to(self.device)
+        self.H_matrix = self.H_matrix.to(self.device)
 
         self.algo = "bp_norm_min_sum"
         self.num_max_iter = self.max_iter
@@ -245,9 +254,9 @@ class create(torch.nn.Module):
         checker = torch.where(num_iters == -1)[0]
         e_out[checker] = e_v[checker]
         l_out[checker] = l_v[checker]
-        num_iters[checker] = (
-            self.i
-        )  # actual stop iter (== max_iter unless the cap broke early)
+        num_iters[
+            checker
+        ] = self.i  # actual stop iter (== max_iter unless the cap broke early)
         e_out = e_out[:, :-1]
         l_out = l_out[:, :-1]
 

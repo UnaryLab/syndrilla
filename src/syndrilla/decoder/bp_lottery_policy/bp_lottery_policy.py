@@ -139,7 +139,6 @@ class create(torch.nn.Module):
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
 
-        # print("beta = 0.75")
         logger.info(f'Initializing lotterybp (normailized min sum) decoding.')
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
         
@@ -470,7 +469,6 @@ class create(torch.nn.Module):
         unsat_cn_mask = synd_diff.bool()  # [B, M]
 
         batch_size, M = unsat_cn_mask.shape
-        N = l_v.shape[1]
 
         if self.random_machine.lower() == 'system':
             r1 = torch.rand(batch_size, device=self.device)
@@ -523,7 +521,6 @@ class create(torch.nn.Module):
         unsat_cn_mask = synd_diff.bool()  # [B, M]
 
         batch_size, M = unsat_cn_mask.shape
-        N = l_v.shape[1]
 
         if self.random_machine.lower() == 'system':
             r = torch.rand(batch_size, device=self.device)
