@@ -1,6 +1,6 @@
 /*
- * union_find_v2_kernel.cu -- standalone CUDA Union-Find decoder for the
- * union_find_cuda_v2 extension.
+ * union_find_kernel.cu -- standalone CUDA Union-Find decoder for the
+ * union_find_cuda extension.
  *
  * One file per decoder kernel, matching bp_kernel.cu / osd0_kernel.cu. This is a
  * from-scratch GPU port of the batched-tensor Union-Find decoder in

@@ -1,4 +1,4 @@
-"""union_find_cuda.py -- standalone CUDA Union-Find decoder (v1).
+"""union_find_cuda.py -- standalone CUDA Union-Find decoder.
 
 A from-scratch GPU Union-Find decoder built like ``osd_0_cuda`` / ``bp_norm_min_sum_cuda``:
 a self-contained ``nn.Module`` whose whole decode runs on the GPU via custom kernels
@@ -23,8 +23,7 @@ Two execution paths, mirroring the two reference files:
     large for shared memory and for debugging single phases. Bit-identical to the fused path
     (both call the same device functions).
 
-CUDA-only. For the qsurface-algorithm port validated by logical error rate (not bit-exact to
-``union_find.py``), see the sibling ``union_find_cuda_v2.py``.
+CUDA-only.
 """
 
 import os
