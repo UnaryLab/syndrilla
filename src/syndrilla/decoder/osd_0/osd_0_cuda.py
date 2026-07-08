@@ -199,8 +199,13 @@ class create(nn.Module):
             raise ValueError(
                 "osd_0_cuda requires a pre-loaded MatrixBundle via the `bundle` kwarg."
             )
-        H_shape, _, _, H_matrix = bundle.select(self.check_type)
+        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
         self.H_shape = H_shape
+        # V_c_col (parity-row -> qubit-column index map) is read by the perfect syndrome
+        # measurer when this decoder is the syndrome-facing decoders[0]; expose it like
+        # every other decoder. Registered (requires_grad=False, index tensor) so it moves
+        # with the module onto the CUDA device.
+        self.V_c_col = nn.Parameter(V_c_col.to(self.device), requires_grad=False)
         self.M, self.N = int(H_shape[0]), int(H_shape[1])
         self.W = ((self.N + 1) + 63) >> 6
 
@@ -210,7 +215,7 @@ class create(nn.Module):
         self.H_packed = nn.Parameter(H_packed.to(self.device), requires_grad=False)
 
         # ── metadata expected by the framework ────────────────────────────────
-        self.algo = "osd_0_cuda"
+        self.algo = "osd_0"
         self.num_max_iter = self.N  # matches osd_0.py:122
         self.batch_size = 1
 
@@ -248,8 +253,8 @@ class create(nn.Module):
 
         idx = (converge == 0).nonzero(as_tuple=True)[0].to(dev)
         if idx.numel() > 0:
-            llr_sub = io_dict["llr"][idx].to(dtype=self.dtype, device=dev)
-            synd_sub = io_dict["synd"][idx].to(device=dev)
+            llr_sub = io_dict["llr"].to(dtype=self.dtype, device=dev)[idx]
+            synd_sub = io_dict["synd"].to(device=dev)[idx]
 
             # Column order: most reliable handling matches osd_0.py:140
             # (stable ascending sort of the posterior LLR).

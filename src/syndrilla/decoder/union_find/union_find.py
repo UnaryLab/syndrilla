@@ -16,10 +16,13 @@ order exactly (``_RobinTable``, edge hash ``u ^ (v<<1)``, power-of-two growth fr
 max-load-factor 0.5, robin-hood insertion, backward-shift erase) so edge indexing matches
 the reference.
 
-The decoder is **toric-only**: every qubit column of H must touch *exactly two* parity
-rows (no boundary node). Weight-1 columns (open boundaries, e.g. planar surface codes) are
-rejected. The C++ reference ``UnionFindPy.Decoder`` is used only in the tests as the
-logical-error-rate oracle.
+The decoder handles any **graphlike** CSS code: every qubit column of H must touch *at
+most two* parity rows. A boundary vertex (index 0) is prepended and weight-1 columns
+(open boundaries, e.g. planar surface codes) become boundary edges, mirroring the repo's
+MWPM decoder; toric codes (all weight-2 columns) leave the boundary vertex isolated and
+decode exactly as before. Columns of weight > 2 (non-graphlike) are rejected. The C++
+reference ``UnionFindPy.Decoder`` is used only in the tests as the logical-error-rate
+oracle (its domain is toric codes).
 
 YAML algorithm key: union_find
 """
@@ -282,24 +285,47 @@ def build_lattice_from_parity(H) -> Lattice:
 # Batched decode graph build (toric edge endpoints from the parity matrix).
 # =========================================================================== #
 def _edge_endpoints_from_parity(H_np):
-    """Vectorized toric graph build: the two detector vertices each qubit column links.
+    """Vectorized graphlike graph build: the detector vertices each qubit column links.
 
-    Returns ``(eu, ev)`` int64 arrays of shape [N], the (min, max) endpoint per edge/qubit.
-    Raises if any column does not have weight exactly two (the toric-only domain).
+    A boundary vertex is prepended at index 0 and the M detector rows are shifted to
+    1..M (mirroring the repo's MWPM decoder's shared open-boundary node). Each qubit
+    column becomes one graph edge, by column weight:
+
+      * weight 2  -> ``(r0+1, r1+1)``   interior edge between two detectors
+      * weight 1  -> ``(0, r0+1)``      boundary edge (open boundary, e.g. surface code)
+      * weight 0  -> ``(0, 0)``         boundary self-loop (qubit in no check; inert)
+      * weight >2 -> rejected           not graphlike (as in MWPM); needs a hypergraph decoder
+
+    Returns ``(eu, ev, V, is_pure_toric)``: int64 arrays [N] of (min, max) endpoints, the
+    vertex count ``V = M + 1``, and whether every column has weight exactly two (a closed
+    toric code with no boundary edge -- the domain of the bit-exact CUDA kernel). Placing
+    the boundary at id 0 makes it every boundary-touching cluster's representative, so the
+    peel sinks that cluster's unpaired defect into the boundary (where it is absorbed).
     """
     H_np = np.asarray(H_np).astype(np.uint8)
     M, N = H_np.shape
     # np.nonzero on H^T visits columns 0..N-1 in order, rows increasing within a column.
     cols, rows = np.nonzero(H_np.T)
     counts = np.bincount(cols, minlength=N)
-    if not np.all(counts == 2):
-        bad = int(np.argmax(counts != 2))
+    if np.any(counts > 2):
+        bad = int(np.argmax(counts > 2))
         raise ValueError(
-            f"Column {bad} has weight {int(counts[bad])} != 2; the batched union_find "
-            f"decode is toric-only (every qubit column must touch exactly two parities)."
+            f"Column {bad} has weight {int(counts[bad])} > 2; H is not graphlike, so the "
+            f"union_find decoder does not apply (use a hypergraph/correlated decoder)."
         )
-    pairs = rows.reshape(N, 2)  # rows increasing within a column => already (min, max)
-    return pairs[:, 0].astype(np.int64), pairs[:, 1].astype(np.int64)
+    eu = np.zeros(N, dtype=np.int64)  # weight-0 default: boundary self-loop (0, 0)
+    ev = np.zeros(N, dtype=np.int64)
+    per_col = np.split(
+        rows + 1, np.cumsum(counts)[:-1]
+    )  # detectors per column, +1 shift
+    for q in range(N):
+        r = per_col[q]
+        if r.size == 2:
+            eu[q], ev[q] = int(r[0]), int(r[1])  # rows increasing => already (min, max)
+        elif r.size == 1:
+            ev[q] = int(r[0])  # boundary edge (0, detector); eu stays 0
+    is_pure_toric = bool(np.all(counts == 2))
+    return eu, ev, M + 1, is_pure_toric
 
 
 # =========================================================================== #
@@ -360,20 +386,20 @@ class create(torch.nn.Module):
         )
 
         H_np = np.asarray(self.H_matrix.detach().cpu().numpy()).astype(np.uint8)
-        # Build the toric lattice from the parity matrix; create's runtime decode
-        # (forward) is the fully-batched tensor algorithm below.
-        self.lattice = build_lattice_from_parity(H_np)
-        self.M, self.N = self.lattice.num_vertices, self.lattice.num_edges
+        self.M, self.N = H_np.shape  # M detector rows, N qubit columns
 
-        # Toric graph tensors for the batched decode -- the two detector vertices each
-        # qubit column links, constant across every decode, on-device as buffers.
-        eu, ev = _edge_endpoints_from_parity(H_np)
+        # Graphlike graph tensors for the batched decode -- the (up to two) detector
+        # vertices each qubit column links, constant across every decode, on-device as
+        # buffers. A boundary vertex is prepended at index 0, so the internal vertex
+        # dimension is V = M + 1 (self.M stays the syndrome width). ``is_pure_toric``
+        # tells the CUDA subclass whether the bit-exact (toric-only) kernel applies.
+        eu, ev, self.V, self.is_pure_toric = _edge_endpoints_from_parity(H_np)
         self.register_buffer("eu", torch.from_numpy(eu).to(self.device))
         self.register_buffer("ev", torch.from_numpy(ev).to(self.device))
 
         self.algo = "union_find"
         self.batch_size = 1
-        self.num_max_iter = self.lattice.num_edges + 1
+        self.num_max_iter = self.N + 1
         self.cap = None
         self.cap_bypass = False
         self.cap_active_last = False
@@ -406,7 +432,7 @@ class create(torch.nn.Module):
         labels are a valid, faster starting point. Returns root [B, M] int64.
         """
         B = grown.shape[0]
-        M, N = self.M, self.N
+        M, N = self.V, self.N  # M = internal vertex count (detectors + boundary)
         eu = self.eu.view(1, N).expand(B, N)
         ev = self.ev.view(1, N).expand(B, N)
         if init_root is None:
@@ -442,7 +468,7 @@ class create(torch.nn.Module):
     def _grow_fuse(self, synd):
         """Run the grow/fuse fixed point. Returns (root [B, M], grown [B, N])."""
         B = synd.shape[0]
-        M, N = self.M, self.N
+        M, N = self.V, self.N  # M = internal vertex count (detectors + boundary)
         eu, ev = self.eu, self.ev
         support = torch.zeros((B, N), dtype=torch.long, device=self.device)
         root = torch.arange(M, device=self.device).view(1, M).expand(B, M).contiguous()
@@ -451,6 +477,10 @@ class create(torch.nn.Module):
             parity_root.scatter_add_(1, root, synd)
             cluster_parity = torch.gather(parity_root, 1, root).remainder(2)
             odd = cluster_parity == 1  # [B, M]
+            # A cluster containing the boundary vertex (id 0, always its component's min ->
+            # its root) is even: the open boundary absorbs the unpaired defect, so it stops
+            # growing. No-op for toric codes, where the boundary vertex stays isolated.
+            odd = odd & (root != 0)
             if not odd.any():
                 break
             delta = odd[:, eu].long() + odd[:, ev].long()  # [B, N]
@@ -467,7 +497,7 @@ class create(torch.nn.Module):
         ``tree_edge[b, v]`` is the qubit index of the edge linking v to its parent.
         """
         B = root.shape[0]
-        M, N = self.M, self.N
+        M, N = self.V, self.N  # M = internal vertex count (detectors + boundary)
         eu = self.eu.view(1, N).expand(B, N)
         ev = self.ev.view(1, N).expand(B, N)
         vids = torch.arange(M, device=self.device).view(1, M).expand(B, M)
@@ -519,7 +549,7 @@ class create(torch.nn.Module):
     def _peel(self, synd, parent, tree_edge, has_parent):
         """Leaf-rake peeling of the spanning forest. Returns correction [B, N] int64."""
         B = synd.shape[0]
-        M, N = self.M, self.N
+        M, N = self.V, self.N  # M = internal vertex count (detectors + boundary)
         correction = torch.zeros((B, N), dtype=torch.long, device=self.device)
         synd_cur = synd.clone()
         active = has_parent.clone()  # representatives are never peeled
@@ -548,7 +578,10 @@ class create(torch.nn.Module):
         self.batch_size = B
         assert M == self.M, f"syndrome width {M} != H rows {self.M}"
 
-        synd = (synd_in != 0).to(device=self.device, dtype=torch.long)  # [B, M]
+        synd_det = (synd_in != 0).to(device=self.device, dtype=torch.long)  # [B, M]
+        # Prepend the boundary vertex (index 0, never a defect): internal syndrome is [B, V].
+        synd = torch.zeros((B, self.V), dtype=torch.long, device=self.device)
+        synd[:, 1:] = synd_det
         root, grown = self._grow_fuse(synd)
         parent, tree_edge, has_parent = self._spanning_forest(root, grown)
         correction = self._peel(synd, parent, tree_edge, has_parent)  # [B, N] int64

@@ -93,7 +93,11 @@ def _build_csr(matcher):
             nbr.append(other)
             qubits.append(j)
         offsets[r + 1] = len(nbr)
-    obs = np.zeros((len(qubits), _OBSW), dtype=np.uint64)
+    # Word count wide enough for the largest qubit id, but never below _OBSW so the
+    # kernel path (N <= 64*_OBSW) keeps its exact [E, _OBSW] shape. When N > 64*_OBSW the
+    # caller discards this obs (CPU fallback), so widening here just avoids an overflow.
+    words = max(_OBSW, (max(qubits) // 64) + 1) if qubits else _OBSW
+    obs = np.zeros((len(qubits), words), dtype=np.uint64)
     for e, j in enumerate(qubits):
         obs[e, j // 64] = np.uint64(1) << np.uint64(j % 64)
     return (

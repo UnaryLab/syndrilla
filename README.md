@@ -253,7 +253,7 @@ The following table details the different types of decoding algorithms Syndrilla
 |Relay Belief Propagation (Relay BP)| 1                                                           | relay_bp                                           | Relay BP: normalized min-sum over multiple legs with disordered per-variable memory (relay-bp crate, `trmue/relay`)|
 |Belief Propagation with Syndrome Flipping (BP-SF)| 1                                               | bp_sf                                              | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)|
 |Minimum-Weight Perfect Matching (MWPM)| 1                                                     | mwpm                                               | PyMatching v2 sparse-blossom (Higgott & Gidney); graphlike codes only|
-|Union-Find (Delfosse-Nickerson)| 1                                                            | union_find                                         | Almost-linear-time decoding for topological codes (arXiv:1709.06218); toric/graphlike codes only|
+|Union-Find (Delfosse-Nickerson)| 1                                                            | union_find                                         | Almost-linear-time decoding for topological codes (arXiv:1709.06218); graphlike codes only (surface and toric)|
 
 #### 2.5. Logical check module
 The check YAML file defines all configuration parameters associated with the computation of logical check error rates.
