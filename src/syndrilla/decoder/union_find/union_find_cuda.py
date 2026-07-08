@@ -1,224 +1,317 @@
-"""union_find_cuda.py -- CUDA port of the bit-exact Union-Find decoder in union_find.py.
+"""union_find_cuda.py -- standalone CUDA Union-Find decoder (v1).
 
-The compute path is a real CUDA kernel (``cuda/union_find_kernel.cu``), NOT the batched
-PyTorch tensor decode: one CUDA thread decodes one syndrome shot, faithfully reproducing
-the reference chaeyeunpark/UnionFind (Delfosse-Nickerson arXiv:1709.06218) tsl robin-map
-iteration order, with the batch as the parallel axis for speedup. See the kernel header
-for the arena/robin-table layout.
+A from-scratch GPU Union-Find decoder built like ``osd_0_cuda`` / ``bp_norm_min_sum_cuda``:
+a self-contained ``nn.Module`` whose whole decode runs on the GPU via custom kernels
+(``cuda/union_find_kernel.cu``). It subclasses nothing from ``union_find.py`` and uses
+nothing from ``mwpm.py`` -- no robin-hood hash-map order, no per-thread arena, no blossom,
+no CPU / PyTorch fallback.
 
-Scope: the kernel is **toric-only** (every qubit column of H has weight exactly two, so the
-detector graph has no boundary vertex -- ``is_pure_toric``). That is the reference's domain
-and what ``union_find_kernel.cu`` reproduces. For graphlike-but-not-toric codes (open
-boundaries, e.g. the surface code -- weight-1 columns), the kernel does not apply and this
-module falls back to the exact batched PyTorch decode in ``union_find.py`` for every shot.
-Individual toric shots whose per-thread bucket arena overflows (``err != 0``), or whose
-correction fails the syndrome check ``H @ e == s (mod 2)``, are likewise re-decoded on the
-PyTorch path, so the output is always valid.
+It reproduces the batched-tensor decoder in ``union_find.py``'s ``forward()`` bit-for-bit
+(``e-diff == 0``): the graphlike Delfosse-Nickerson pipeline grow/fuse -> spanning forest ->
+leaf-rake peel over the detector graph (V = M+1 vertices with a boundary vertex at id 0,
+N edges = qubit columns). Every tie-break is min-vertex-id / min-edge-index, so the kernel is
+general **graphlike** (toric *and* surface / open-boundary), matching ``union_find.py``'s
+domain and, transitively, its qsurface logical-error-rate match.
 
-Subclasses the pure-PyTorch ``union_find.create`` for __init__ (device/dtype/bundle, the
-one-time lattice build, ``V_c_col`` and ``is_pure_toric``), then overrides forward() to
-launch the kernel on the toric path.
+Two execution paths, mirroring the two reference files:
 
-YAML algorithm key: dispatched as ``union_find`` on a ``cuda`` device -- the factory
-(_create_one_decoder in decoder/decoder.py) picks this file because it is named
-``union_find_cuda.py``; there is no separate algorithm key.
+  * FUSED (default): one kernel launch, one thread block per shot, every working array in
+    shared memory. Used whenever the per-shot working set fits the shared-memory limit.
+
+  * PER-STEP (fallback / ``force_per_step: true``): a Python loop over the three modular phase
+    kernels (uf_grow_fuse -> uf_spanning_forest -> uf_peel) in global memory -- for codes too
+    large for shared memory and for debugging single phases. Bit-identical to the fused path
+    (both call the same device functions).
+
+CUDA-only. For the qsurface-algorithm port validated by logical error rate (not bit-exact to
+``union_find.py``), see the sibling ``union_find_cuda_v2.py``.
 """
 
 import os
+import math
 
 import numpy as np
 import torch
+import torch.nn as nn
 from loguru import logger
 
-from syndrilla.decoder.union_find.union_find import (
-    create as _UnionFindPy,
-    build_lattice_from_parity,
-    _make_edge,
-)
+
+# ── Extension loader (mirrors osd_0_cuda / bp_norm_min_sum_cuda) ────────────────
+
+_EXT = None  # module-level cache; compiled once per Python process
 
 
-_KERNEL = None  # compiled once per process
+def _dll_dirs():
+    """On Windows, add CUDA and torch/lib to the DLL search path for the JIT ext."""
+    handles = []
+    if os.name != "nt":
+        return handles
+    candidates = []
+    for var in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"):
+        p = os.environ.get(var)
+        if p:
+            candidates.append(os.path.join(p, "bin"))
+    try:
+        import torch as _torch
+
+        candidates.append(os.path.join(os.path.dirname(_torch.__file__), "lib"))
+    except ImportError:
+        pass
+    for d in candidates:
+        if os.path.isdir(d):
+            try:
+                handles.append(os.add_dll_directory(d))
+                logger.debug(f"Added DLL search dir: {d}")
+            except OSError:
+                pass
+    return handles
 
 
-def _load_kernel():
+def _load_ext():
     """JIT-compile union_find_kernel.cu on first call; cache thereafter."""
-    global _KERNEL
-    if _KERNEL is not None:
-        return _KERNEL
+    global _EXT
+    if _EXT is not None:
+        return _EXT
     from torch.utils.cpp_extension import load
 
+    handles = _dll_dirs()
     decoder_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    kernel_src = os.path.join(decoder_dir, "cuda", "union_find_kernel.cu")
+    src = os.path.join(decoder_dir, "cuda", "union_find_kernel.cu")
     if "TORCH_CUDA_ARCH_LIST" not in os.environ and torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
         os.environ["TORCH_CUDA_ARCH_LIST"] = f"{cap[0]}.{cap[1]}"
     logger.info(
-        "Compiling union_find_cuda kernel -- first use in each Python environment runs "
-        "nvcc (a few minutes, no progress output); later runs load from cache."
+        "Compiling union_find_cuda kernel -- first use in each Python environment "
+        "runs nvcc (a few minutes, no progress output); later runs load from cache."
     )
-    _KERNEL = load(
-        name="union_find_cuda_kernel",
-        sources=[kernel_src],
+    _EXT = load(
+        name="union_find_kernel",
+        sources=[src],
         extra_cuda_cflags=["-O3"],
         verbose=True,
     )
+    for h in handles:
+        try:
+            h.close()
+        except Exception:
+            pass
     logger.info("union_find_cuda kernel compiled.")
-    return _KERNEL
+    return _EXT
 
 
-# module-level alias so tests importing ``_load_ext`` (mwpm/osd naming) keep working
-_load_ext = _load_kernel
+# ── Host graph build (standalone replica of union_find.py's graphlike build) ─────
 
 
-def _build_csr(H_np):
-    """CSR of the toric detector graph in union_find.py's exact tsl-bucket connection order.
+def _edge_endpoints_from_parity(H_np):
+    """The (up to two) detector vertices each qubit column links, as graphlike edges.
 
-    ``build_lattice_from_parity`` (union_find.py) reproduces the reference's
-    ``tsl::robin_map`` edge iteration order, and its ``vertex_connections[u]`` lists each
-    vertex's neighbours in exactly that order -- the order the grow/fusion step visits them,
-    and therefore the tie-break the kernel must match byte-for-byte. Per vertex we emit each
-    neighbour ``v`` and the qubit index of the connecting edge ``(min(u,v), max(u,v))``.
+    Replicates ``union_find.py._edge_endpoints_from_parity`` exactly (kept local so this
+    module depends on nothing in ``union_find.py``). A boundary vertex is prepended at id 0
+    and the M detector rows shift to 1..M, so the internal vertex count is ``V = M + 1``:
 
-    Returns (conn_off[M+1] int64, conn_nbr[E2] int32, conn_qub[E2] int32, vcc[M] int32),
-    where M is the number of detector vertices and E2 == sum of vertex degrees.
+      * weight 2  -> ``(r0+1, r1+1)``   interior edge between two detectors
+      * weight 1  -> ``(0, r0+1)``      boundary edge (open boundary, e.g. surface code)
+      * weight 0  -> ``(0, 0)``         boundary self-loop (inert)
+      * weight >2 -> rejected           not graphlike
+
+    Returns ``(eu, ev, V, is_pure_toric)``: int64 arrays [N] of (min, max) endpoints, the
+    vertex count ``V = M + 1``, and whether every column has weight exactly two.
     """
-    lattice = build_lattice_from_parity(H_np)
-    M = lattice.num_vertices
-    conns = lattice.vertex_connections
-    e2q = lattice.edge_to_qubit
+    H_np = np.asarray(H_np).astype(np.uint8)
+    M, N = H_np.shape
+    # np.nonzero on H^T visits columns 0..N-1 in order, rows increasing within a column.
+    cols, rows = np.nonzero(H_np.T)
+    counts = np.bincount(cols, minlength=N)
+    if np.any(counts > 2):
+        bad = int(np.argmax(counts > 2))
+        raise ValueError(
+            f"Column {bad} has weight {int(counts[bad])} > 2; H is not graphlike, so the "
+            f"union_find decoder does not apply (use a hypergraph/correlated decoder)."
+        )
+    eu = np.zeros(N, dtype=np.int64)  # weight-0 default: boundary self-loop (0, 0)
+    ev = np.zeros(N, dtype=np.int64)
+    per_col = np.split(
+        rows + 1, np.cumsum(counts)[:-1]
+    )  # detectors per column, +1 shift
+    for q in range(N):
+        r = per_col[q]
+        if r.size == 2:
+            eu[q], ev[q] = int(r[0]), int(r[1])  # rows increasing => already (min, max)
+        elif r.size == 1:
+            ev[q] = int(r[0])  # boundary edge (0, detector); eu stays 0
+    is_pure_toric = bool(np.all(counts == 2))
+    return eu, ev, M + 1, is_pure_toric
 
-    conn_off = np.zeros(M + 1, dtype=np.int64)
-    nbr, qub = [], []
-    for u in range(M):
-        for v in conns[u]:
-            nbr.append(v)
-            qub.append(e2q[_make_edge(u, v)])
-        conn_off[u + 1] = len(nbr)
 
-    return (
-        conn_off,
-        np.asarray(nbr, dtype=np.int32),
-        np.asarray(qub, dtype=np.int32),
-        np.asarray(lattice.vertex_connection_count, dtype=np.int32),
-    )
+# ── Decoder class ───────────────────────────────────────────────────────────────
 
 
-class create(_UnionFindPy):
-    """Union-Find decoder running the bit-exact CUDA kernel (one thread per shot)."""
+class create(nn.Module):
+    """
+    Standalone CUDA Union-Find decoder, bit-exact to union_find.py's forward().
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
-        super().__init__(
-            decoder_cfg, **kwargs
-        )  # device/dtype/bundle + lattice + V_c_col
+    Accepted YAML keys (under ``decoder:``):
+        check_type  : hx | hz          (default: hx)
+        dtype       : float32 | float64 | float16 | bfloat16  (default: float64)
+        device:
+          device_type : cuda           (only cuda is supported)
+          device_idx  : int            (default: 0)
+        force_per_step : bool          (optional; selects the modular per-step path)
+    """
+
+    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+        super().__init__()
+        logger.info("Creating union_find_cuda decoder.")
+
         if not torch.cuda.is_available():
-            raise RuntimeError("union_find_cuda requires a CUDA GPU.")
-        self._kernel = _load_kernel()
-
-        # The kernel only reproduces the toric reference (no boundary vertex). Non-toric
-        # graphlike codes (surface, open boundaries) take the exact PyTorch fallback.
-        self._use_kernel = bool(self.is_pure_toric)
-
-        if self._use_kernel:
-            H_np = (self.H_matrix.detach().cpu().numpy() != 0).astype(np.uint8)
-            self._H_np = H_np  # [M, N] for the on-device syndrome-check safety net
-            off, nbr, qub, vcc = _build_csr(H_np)
-            dev = self.device
-            self._g_off = torch.as_tensor(
-                off, dtype=torch.int64, device=dev
-            ).contiguous()
-            self._g_nbr = torch.as_tensor(
-                nbr, dtype=torch.int32, device=dev
-            ).contiguous()
-            self._g_qub = torch.as_tensor(
-                qub, dtype=torch.int32, device=dev
-            ).contiguous()
-            self._g_vcc = torch.as_tensor(
-                vcc, dtype=torch.int32, device=dev
-            ).contiguous()
-
-            # Per-thread robin-hood bucket arena (int32 slots). Generous vs the O(M) live
-            # bucket regions a shot allocates; overflow trips err and that shot falls back.
-            self._arena_cap = max(4096, 128 * self.M)
-            # Bound per-launch device memory (~256 MB of int32) by chunking the batch.
-            per_shot = self._arena_cap + int(
-                15 * self.M + 4 * self.N + 9
-            )  # arena + work
-            self._chunk = max(1, 64_000_000 // per_shot)
-        else:
-            logger.warning(
-                "union_find_cuda: H is graphlike but not pure-toric (open boundaries) -- "
-                "the toric kernel does not apply; using the exact PyTorch Union-Find decode "
-                "for every shot."
+            raise RuntimeError(
+                "union_find_cuda requires a CUDA-capable GPU. Use union_find for CPU."
             )
 
+        # ── device ────────────────────────────────────────────────────────────
+        device_cfg = decoder_cfg.get("device", {})
+        device_type = device_cfg.get("device_type", "cuda")
+        if device_type != "cuda":
+            logger.warning(
+                f"union_find_cuda only supports cuda; ignoring "
+                f"device_type='{device_type}'."
+            )
+        device_idx = device_cfg.get("device_idx", 0)
+        if device_idx >= torch.cuda.device_count():
+            logger.warning(f"device_idx={device_idx} exceeds available GPUs; using 0.")
+            device_idx = 0
+        self.device = torch.device(f"cuda:{device_idx}")
+
+        # ── dtype ─────────────────────────────────────────────────────────────
+        dtype_str = decoder_cfg.get("dtype", "float64")
+        if dtype_str not in {"float16", "bfloat16", "float32", "float64"}:
+            logger.warning(f"Invalid dtype '{dtype_str}'; defaulting to float64.")
+            dtype_str = "float64"
+        self.dtype = torch.__dict__[dtype_str]
+
+        self.check_type = decoder_cfg.get("check_type", "hx").lower()
+        if self.check_type not in {"hx", "hz"}:
+            logger.warning(f"Invalid check_type='{self.check_type}'; defaulting to hx.")
+            self.check_type = "hx"
+
+        # ── matrix bundle -> graphlike edge endpoints ─────────────────────────
+        bundle = kwargs.get("bundle")
+        if bundle is None:
+            raise ValueError(
+                "union_find_cuda requires a pre-loaded MatrixBundle via `bundle`."
+            )
+        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
+        self.H_shape = H_shape
+        # V_c_col (parity-row -> qubit-column map) is read by the perfect syndrome measurer
+        # when this decoder is decoders[0]; expose it like every other decoder.
+        self.V_c_col = nn.Parameter(V_c_col.to(self.device), requires_grad=False)
+        self.M, self.N = int(H_shape[0]), int(H_shape[1])
+
+        H_np = (H_matrix.detach().cpu().numpy() != 0).astype(np.uint8)
+        eu, ev, self.V, self.is_pure_toric = _edge_endpoints_from_parity(H_np)
+        self.eu = nn.Parameter(
+            torch.from_numpy(eu.astype(np.int32)).to(self.device), requires_grad=False
+        )
+        self.ev = nn.Parameter(
+            torch.from_numpy(ev.astype(np.int32)).to(self.device), requires_grad=False
+        )
+
+        # ── metadata expected by the framework ────────────────────────────────
         self.algo = "union_find"
+        self.num_max_iter = self.N + 1
+        self.batch_size = 1
+
+        # ── load extension + choose path ──────────────────────────────────────
+        self._ext = _load_ext()
+        smem_needed = self._ext.fused_smem_bytes(self.V, self.N)
+        smem_limit = self._ext.fused_smem_limit()
+        self._use_fused = smem_needed <= smem_limit and not decoder_cfg.get(
+            "force_per_step", False
+        )
+        if not self._use_fused:
+            logger.info(
+                f"union_find_cuda using per-step path "
+                f"(fused needs {smem_needed} B shared memory, limit {smem_limit} B)."
+            )
+
+        # Block size: cover the larger of V vertices / N edges, round to a warp, cap 512.
+        span = max(self.V, self.N)
+        self._block_size = min(max(32 * math.ceil(span / 32), 64), 512)
         logger.info(
             f"union_find_cuda decoder ready ({self.device}, "
-            f"{'CUDA kernel' if self._use_kernel else 'PyTorch fallback'})."
+            f"{'fused' if self._use_fused else 'per-step'})."
         )
 
-    def _pytorch_decode(self, synd_rows):
-        """Exact batched PyTorch fallback for a sub-batch; returns e_v uint8 [k, N]."""
-        out = super().forward({"synd": synd_rows})
-        return (out["e_v"].detach().cpu().numpy() != 0).astype(np.uint8)
+    # ── Forward pass ────────────────────────────────────────────────────────────
 
-    def forward(self, io_dict):
-        if not self._use_kernel:
-            return super().forward(io_dict)  # surface / non-toric: exact PyTorch decode
-
-        dev, dt = self.device, self.dtype
-        synd = io_dict["synd"]
-        B, M = synd.shape
+    def forward(self, io_dict: dict) -> dict:
+        dev = self.device
+        synd_in = io_dict["synd"]
+        B, M = synd_in.shape
         self.batch_size = B
-        N = self.N
         assert M == self.M, f"syndrome width {M} != H rows {self.M}"
 
-        synd_np = (synd.detach().cpu().numpy() != 0).astype(np.uint8)  # [B, M]
-        synd_u8 = torch.as_tensor(synd_np, dtype=torch.uint8, device=dev)
+        # Internal syndrome [B, V] int32; boundary vertex 0 is never a defect.
+        synd_det = (synd_in != 0).to(device=dev, dtype=torch.int32)  # [B, M]
+        synd = torch.zeros((B, self.V), dtype=torch.int32, device=dev)
+        synd[:, 1:] = synd_det
+        synd = synd.contiguous()
 
-        e_v = np.zeros((B, N), dtype=np.uint8)
-        err = np.zeros(B, dtype=np.int64)
-        for start in range(0, B, self._chunk):
-            stop = min(start + self._chunk, B)
-            sub = synd_u8[start:stop].contiguous()
-            e_out, err_out = self._kernel.uf_decode(
-                self._g_off,
-                self._g_nbr,
-                self._g_qub,
-                self._g_vcc,
-                int(self.M),
-                int(N),
-                sub,
-                int(self._arena_cap),
+        if self._use_fused:
+            corr = self._ext.uf_fused(
+                synd, self.eu, self.ev, int(self.V), int(self.N), self._block_size
             )
-            e_v[start:stop] = e_out.detach().cpu().numpy()
-            err[start:stop] = err_out.detach().cpu().numpy().astype(np.int64)
+        else:
+            corr = self._run_per_step(synd)
 
-        # A shot needs the exact PyTorch redo if it overflowed the arena (err != 0) or its
-        # correction fails the syndrome check H @ e == s (mod 2). The kernel is bit-exact by
-        # design, so this is a pure safety net that should rarely fire.
-        bad_err = np.nonzero(err != 0)[0]
-        pred = (e_v.astype(np.int64) @ self._H_np.T.astype(np.int64)) & 1  # [B, M]
-        bad_inv = np.nonzero((pred.astype(np.uint8) != synd_np).any(axis=1))[0]
-        bad = np.union1d(bad_err, bad_inv)
-        if bad.size:
-            logger.warning(
-                f"union_find_cuda: {bad.size} shot(s) fell back to the exact PyTorch "
-                f"Union-Find ({bad_err.size} arena-cap, {bad_inv.size} failed the "
-                f"syndrome check)."
-            )
-            e_v[bad] = self._pytorch_decode(synd[torch.as_tensor(bad, device=dev)])
-
-        e_v_t = torch.from_numpy(e_v).to(device=dev, dtype=dt)
+        e_v = corr.to(device=dev, dtype=self.dtype)  # [B, N]
         # sign-encoded soft output (+1 bit 0, -1 bit 1); UF carries no real LLR
-        llr = (1.0 - 2.0 * e_v_t).to(device=dev, dtype=dt)
+        llr = (1.0 - 2.0 * e_v).to(device=dev, dtype=self.dtype)
         converge = torch.ones(B, dtype=torch.int64, device=dev)
         # iter mirrors the syndrome weight per shot (clamped >= 1), as in union_find.py
-        iters = (
-            torch.from_numpy(synd_np.sum(1).astype(np.int64))
-            .clamp(min=1)
-            .to(device=dev)
-        )
+        iters = synd.sum(dim=1).clamp(min=1).to(torch.int64)
 
-        io_dict.update({"e_v": e_v_t, "iter": iters, "llr": llr, "converge": converge})
+        io_dict.update({"e_v": e_v, "iter": iters, "llr": llr, "converge": converge})
         return io_dict
+
+    def _run_per_step(self, synd: torch.Tensor) -> torch.Tensor:
+        """Modular-kernel path: Python loop over the three phase kernels in global memory."""
+        dev = self.device
+        B = synd.shape[0]
+        V, N, bs = self.V, self.N, self._block_size
+
+        def _v(dtype=torch.int32):
+            return torch.empty((B, V), dtype=dtype, device=dev)
+
+        label = _v()
+        support = torch.empty((B, N), dtype=torch.int32, device=dev)
+        par = _v()
+        dist = _v()
+        best = _v()
+        parent = _v()
+        tree = _v()
+        child = _v()
+        syndcur = _v()
+        active = _v()
+        corr = torch.empty((B, N), dtype=torch.int32, device=dev)
+
+        self._ext.uf_grow_fuse(
+            synd, label, support, par, self.eu, self.ev, int(V), int(N), bs
+        )
+        self._ext.uf_spanning_forest(
+            label,
+            support,
+            dist,
+            best,
+            parent,
+            tree,
+            self.eu,
+            self.ev,
+            int(V),
+            int(N),
+            bs,
+        )
+        self._ext.uf_peel(
+            synd, parent, tree, child, syndcur, par, active, corr, int(V), int(N), bs
+        )
+        return corr

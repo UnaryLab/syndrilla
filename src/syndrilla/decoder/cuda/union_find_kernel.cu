@@ -1,449 +1,425 @@
-// union_find_kernel.cu -- bit-exact CUDA port of the Union-Find decoder in union_find.py.
-//
-// GOAL: produce, for every syndrome shot, the SAME correction bits as
-// decoder/union_find/union_find.py (a bit-exact reproduction of chaeyeunpark/UnionFind,
-// Delfosse-Nickerson arXiv:1709.06218). This is NOT an independent UF -- it faithfully
-// reproduces union_find.py's deterministic tsl::robin_map/robin_set iteration order
-// (identity vertex hash, pow2 growth from 0, load 0.5, robin-hood insert, backward-shift
-// erase, range-insert reserve), so e-diff == 0. Sorted order alone mismatches ~20% of shots.
-//
-// PARALLELISM: one CUDA thread decodes one shot. UF is inherently sequential per shot (the
-// grown clusters and the spanning-forest peel order depend on the robin-table visitation
-// order); the batch is the parallel axis.
-//
-// STRUCTURE: mirrors union_find.py 1:1. Python objects become fixed-capacity per-thread
-// int32 arenas. The robin tables (odd_roots + one border-vertex table per cluster root) live
-// in a per-thread bump-allocated bucket arena; every other Python dict/list is a dense [M]/[N]
-// array or a ring buffer. The reference is toric-only, so the edge lattice is built once on the
-// host and passed as read-only CSR (neighbour + qubit index per vertex, in tsl bucket order).
-//
-// STATUS: authored without a local GPU; validated bit-for-bit against union_find.py by an
-// arena-faithful numpy emulation (scratch uf_emulate.py) across toric d=3..13, and on hardware
-// by tests/test_union_find_cuda.py (assert e-diff == 0). Capacities are bounded by M/N; on
-// arena overflow a thread sets err and the host redoes that shot on the exact CPU decoder.
-
+/*
+ * union_find_v2_kernel.cu -- standalone CUDA Union-Find decoder for the
+ * union_find_cuda_v2 extension.
+ *
+ * One file per decoder kernel, matching bp_kernel.cu / osd0_kernel.cu. This is a
+ * from-scratch GPU port of the batched-tensor Union-Find decoder in
+ * decoder/union_find/union_find.py -- it reproduces that decoder's forward() output
+ * bit-for-bit (e-diff == 0), NOT the C++ chaeyeunpark reference. It borrows nothing
+ * from mwpm.py: no robin-hood hash-map order, no per-thread arena, no blossom.
+ *
+ * The decode is the classic Delfosse-Nickerson pipeline over the graphlike detector
+ * graph (V = M+1 vertices with a boundary vertex at id 0, N edges = qubit columns):
+ *
+ *     grow / fuse  ->  spanning forest  ->  leaf-rake peel
+ *
+ * Every tie-break is min-vertex-id / min-edge-index and every reduction is
+ * min / xor / parity (associative + commutative), so a block-parallel port is
+ * order-independent and therefore bit-exact regardless of thread scheduling. See
+ * union_find.py for the reference math (functions _grow_fuse / _spanning_forest /
+ * _peel), whose control flow this file mirrors 1:1.
+ *
+ * Two paths share the same block-cooperative device functions (d_grow_fuse /
+ * d_spanning_forest / d_peel) and are wired into one Python module at the bottom:
+ *
+ *   -- Fused path (default) --
+ *     Whole decode per shot in a single launch: one thread block decodes one shot,
+ *     staging every working array into shared memory.
+ *
+ *   -- Per-step path (fallback / debug) --
+ *     The three phase kernels driven by a Python loop over global-memory scratch,
+ *     for codes whose working set exceeds the fused kernel's shared-memory budget.
+ */
 #include <torch/extension.h>
-#include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <cstdint>
 
-namespace py = pybind11;
+#define UF_CHECK(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 
-#define THREADS 128
-static inline int grid1d(int64_t n) { return (int)((n + THREADS - 1) / THREADS); }
+// ════════════════════════════════════════════════════════════════════════════
+// Block-cooperative device phases (shared by the fused and per-step paths)
+//
+// Each function is called by every thread of a block and cooperates over the
+// shot's V vertices / N edges with grid-stride loops and __syncthreads(). The
+// working arrays are plain int* -- shared memory on the fused path, per-block
+// global scratch on the per-step path -- so the exact same code drives both,
+// which guarantees the two paths are bit-identical.
+// ════════════════════════════════════════════════════════════════════════════
 
-#define RT_EMPTY (-1)      // bucket dist sentinel (== None in _RobinTable)
-#define ERR_OK        0
-#define ERR_OVERFLOW  1    // per-thread bucket arena exceeded
+// Min-vertex-id connected components over the currently grown edges (support == 2).
+// One-hop label relaxation to a fixpoint: label[v] converges to the smallest vertex
+// id reachable from v via grown edges (== union_find.py _connected_components, whose
+// FastSV variant reaches the same unique min-label fixpoint). label ends flat
+// (label[v] IS the component min), so no separate flattening pass is needed.
+__device__ void d_components(
+    int* __restrict__ label, const int* __restrict__ support,
+    const int* __restrict__ eu, const int* __restrict__ ev, int V, int N
+) {
+    const int tid = threadIdx.x, bsz = blockDim.x;
+    for (int v = tid; v < V; v += bsz) label[v] = v;
+    __syncthreads();
 
-// ============================================================================
-// Per-thread state. `work` is one int32 slice with dense arrays at fixed offsets
-// (computed from M, N -- identical on host and device). `arena`/`top` is the
-// robin-hood bucket bump-allocator; `fail` trips on arena overflow.
-// ============================================================================
-struct St {
-    // read-only lattice (shared across threads)
-    const int64_t* conn_off;   // [M+1]
-    const int*     conn_nbr;   // [E2]
-    const int*     conn_qub;   // [E2]
-    const int*     vcc;        // [M] vertex_connection_count (degree)
-    int M, N;
-
-    // per-thread dense arrays (into `work`)
-    int* is_root;    // [M] 0/1
-    int* r_size;     // [M]
-    int* r_parity;   // [M]
-    int* support;    // [N] 0..2
-    int* conn_cnt;   // [M]
-    int* rov;        // [M] root_of_vertex
-    int* bt_mask;    // [M] border table: mask
-    int* bt_size;    // [M] border table: size
-    int* bt_off;     // [M] border table: bucket-region offset (-1 => absent/deleted)
-    int* vcount;     // [M] peeling degree
-    int* synd;       // [M] mutable syndrome
-    int* fu; int* fv; int* fq;   // [N+1] fuse_list FIFO (edge u,v,qubit)
-    int* pu; int* pv; int* pq;   // [M+1] peeling_edges deque
-    int* keybuf;     // [M] keys() snapshot for grow / merge_boundary
-    int* oddkeybuf;  // [M] keys() snapshot for the odd_roots decode loop
-    int* odd_mask; int* odd_size; int* odd_off;  // odd_roots scalars
-
-    // robin-hood bucket arena
-    int* arena; int top; int cap; int fail;
-};
-
-// number of int32 slots the dense `work` slice needs for one thread
-static inline int64_t work_stride(int M, int N) {
-    return (int64_t)15 * M + (int64_t)4 * N + 9;  // see the layout in st_bind()
-}
-
-__host__ __device__ static inline void st_bind(St& s, int* w, int M, int N) {
-    int o = 0;
-    s.is_root  = w + o; o += M;
-    s.r_size   = w + o; o += M;
-    s.r_parity = w + o; o += M;
-    s.support  = w + o; o += N;
-    s.conn_cnt = w + o; o += M;
-    s.rov      = w + o; o += M;
-    s.bt_mask  = w + o; o += M;
-    s.bt_size  = w + o; o += M;
-    s.bt_off   = w + o; o += M;
-    s.vcount   = w + o; o += M;
-    s.synd     = w + o; o += M;
-    s.fu = w + o; o += N + 1;
-    s.fv = w + o; o += N + 1;
-    s.fq = w + o; o += N + 1;
-    s.pu = w + o; o += M + 1;
-    s.pv = w + o; o += M + 1;
-    s.pq = w + o; o += M + 1;
-    s.keybuf    = w + o; o += M;
-    s.oddkeybuf = w + o; o += M;
-    s.odd_mask = w + o; o += 1;
-    s.odd_size = w + o; o += 1;
-    s.odd_off  = w + o; o += 1;
-}
-
-// ---------------------------------------------------------------- robin table
-// Identity hash on vertex ids (std::hash<uint32_t>). All ops mirror _RobinTable
-// in union_find.py. A table is (mask,size,off) scalars; buckets live in `arena`
-// at `off`: bucket ib -> [dist @ off+2*ib, key @ off+2*ib+1], dist=-1 => empty.
-
-__device__ static inline int rt_pow2(int v) {
-    if (v == 0) return 1;
-    if ((v & (v - 1)) == 0) return v;
-    int p = 1;
-    while (p < v) p <<= 1;
-    return p;
-}
-
-// allocate a fresh region of `nbuckets` empty buckets; returns off (or -1 on overflow)
-__device__ static inline int rt_alloc(St& s, int nbuckets) {
-    int off = s.top;
-    int need = 2 * nbuckets;
-    if (off + need > s.cap) { s.fail = 1; return -1; }
-    s.top += need;
-    for (int i = 0; i < nbuckets; i++) s.arena[off + 2 * i] = RT_EMPTY;
-    return off;
-}
-
-__device__ static inline void rt_place_on_rehash(St& s, int off, int mask, int key) {
-    int ib = key & mask, dist = 0;
-    for (;;) {
-        int* b = s.arena + off + 2 * ib;
-        if (b[0] == RT_EMPTY) { b[0] = dist; b[1] = key; return; }
-        if (dist > b[0]) { int d2 = b[0], k2 = b[1]; b[0] = dist; b[1] = key; dist = d2; key = k2; }
-        dist++; ib = (ib + 1) & mask;
-    }
-}
-
-__device__ static inline void rt_rehash_impl(St& s, int* pmask, int* psize, int* poff, int count) {
-    int old_off = *poff, old_mask = *pmask;
-    if (count == 0) { *poff = -1; *pmask = 0; return; }
-    int c = rt_pow2(count);
-    int new_off = rt_alloc(s, c);
-    if (new_off < 0) return;               // overflow: leave table as-is, s.fail set
-    int new_mask = c - 1;
-    if (old_off != -1) {
-        int nb = old_mask + 1;
-        for (int ib = 0; ib < nb; ib++) {
-            int* b = s.arena + old_off + 2 * ib;
-            if (b[0] != RT_EMPTY) rt_place_on_rehash(s, new_off, new_mask, b[1]);
-        }
-    }
-    *poff = new_off; *pmask = new_mask;
-}
-
-__device__ static inline void rt_rehash(St& s, int* pmask, int* psize, int* poff, int count) {
-    int c = count > 2 * (*psize) ? count : 2 * (*psize);
-    rt_rehash_impl(s, pmask, psize, poff, c);
-}
-
-__device__ static inline void rt_reserve(St& s, int* pmask, int* psize, int* poff, int count) {
-    rt_rehash(s, pmask, psize, poff, 2 * count);
-}
-
-__device__ static inline int rt_bucket_count(int* pmask, int* poff) {
-    return (*poff != -1) ? (*pmask + 1) : 0;
-}
-
-__device__ static inline void rt_insert_value_impl(St& s, int off, int mask, int ib, int dist, int key) {
-    int* b = s.arena + off + 2 * ib;
-    int d2 = b[0], k2 = b[1]; b[0] = dist; b[1] = key; dist = d2; key = k2;
-    ib = (ib + 1) & mask; dist++;
-    while (s.arena[off + 2 * ib] != RT_EMPTY) {
-        int* c = s.arena + off + 2 * ib;
-        if (dist > c[0]) { int dd = c[0], kk = c[1]; c[0] = dist; c[1] = key; dist = dd; key = kk; }
-        ib = (ib + 1) & mask; dist++;
-    }
-    s.arena[off + 2 * ib] = dist; s.arena[off + 2 * ib + 1] = key;
-}
-
-__device__ static inline bool rt_insert(St& s, int* pmask, int* psize, int* poff, int key) {
-    if (*poff != -1) {
-        int off = *poff, mask = *pmask, ib = key & mask, dist = 0;
-        for (;;) {
-            int* b = s.arena + off + 2 * ib;
-            if (b[0] == RT_EMPTY || dist > b[0]) break;
-            if (b[1] == key) return false;
-            ib = (ib + 1) & mask; dist++;
-        }
-    }
-    int bc = rt_bucket_count(pmask, poff);
-    int load_threshold = bc ? bc / 2 : 0;
-    if (*psize >= load_threshold) {
-        // grow by (mask+1)*2 -- for an empty table (off=-1, mask=0) this is 2, NOT
-        // bucket_count*2 which is 0. Mirrors _RobinTable.insert (union_find.py).
-        rt_rehash_impl(s, pmask, psize, poff, (*pmask + 1) * 2);
-        if (s.fail) return false;
-    }
-    int off = *poff, mask = *pmask, ib = key & mask, dist = 0;
-    while (s.arena[off + 2 * ib] != RT_EMPTY && dist <= s.arena[off + 2 * ib]) {
-        ib = (ib + 1) & mask; dist++;
-    }
-    if (s.arena[off + 2 * ib] == RT_EMPTY) {
-        s.arena[off + 2 * ib] = dist; s.arena[off + 2 * ib + 1] = key;
-    } else {
-        rt_insert_value_impl(s, off, mask, ib, dist, key);
-    }
-    (*psize)++;
-    return true;
-}
-
-__device__ static inline void rt_range_insert(St& s, int* pmask, int* psize, int* poff,
-                                              const int* keys, int nkeys) {
-    int bc = rt_bucket_count(pmask, poff);
-    int load_threshold = bc ? bc / 2 : 0;
-    int nb_free = load_threshold - *psize;
-    if (nkeys > 0 && nb_free < nkeys) {
-        rt_reserve(s, pmask, psize, poff, *psize + nkeys);
-        if (s.fail) return;
-    }
-    for (int i = 0; i < nkeys; i++) {
-        rt_insert(s, pmask, psize, poff, keys[i]);
-        if (s.fail) return;
-    }
-}
-
-__device__ static inline void rt_erase(St& s, int* pmask, int* psize, int* poff, int key) {
-    if (*poff == -1) return;
-    int off = *poff, mask = *pmask, ib = key & mask, dist = 0;
-    for (;;) {
-        int* b = s.arena + off + 2 * ib;
-        if (b[0] == RT_EMPTY || dist > b[0]) return;
-        if (b[1] == key) {
-            b[0] = RT_EMPTY;
-            (*psize)--;
-            int prev = ib, cur = (ib + 1) & mask;
-            while (s.arena[off + 2 * cur] != RT_EMPTY && s.arena[off + 2 * cur] > 0) {
-                s.arena[off + 2 * prev] = s.arena[off + 2 * cur] - 1;
-                s.arena[off + 2 * prev + 1] = s.arena[off + 2 * cur + 1];
-                s.arena[off + 2 * cur] = RT_EMPTY;
-                prev = cur; cur = (cur + 1) & mask;
+    __shared__ int s_changed;
+    for (int it = 0; it < V; it++) {
+        if (tid == 0) s_changed = 0;
+        __syncthreads();
+        for (int q = tid; q < N; q += bsz) {
+            if (support[q] == 2) {
+                const int u = eu[q], w = ev[q];
+                const int lu = label[u], lw = label[w];
+                const int m = lu < lw ? lu : lw;
+                if (lu > m && atomicMin(&label[u], m) > m) s_changed = 1;
+                if (lw > m && atomicMin(&label[w], m) > m) s_changed = 1;
             }
-            return;
         }
-        ib = (ib + 1) & mask; dist++;
+        __syncthreads();
+        if (s_changed == 0) break;
+        __syncthreads();
     }
 }
 
-// snapshot keys() in bucket order into out[]; returns count
-__device__ static inline int rt_keys(St& s, int* pmask, int* poff, int* out) {
-    if (*poff == -1) return 0;
-    int off = *poff, nb = *pmask + 1, n = 0;
-    for (int ib = 0; ib < nb; ib++)
-        if (s.arena[off + 2 * ib] != RT_EMPTY) out[n++] = s.arena[off + 2 * ib + 1];
-    return n;
+// Grow / fuse fixpoint (union_find.py _grow_fuse). Repeatedly: measure each cluster's
+// syndrome parity, grow every edge touching an odd cluster (delta = odd[eu]+odd[ev],
+// support saturating at 2), and recompute the min-id components. A cluster containing
+// the boundary vertex (id 0) is treated even -- the open boundary absorbs its unpaired
+// defect -- so it stops growing (no-op for toric codes, where vertex 0 stays isolated).
+// On return label[v] == component min and support[q] == 2 marks the grown edges.
+__device__ void d_grow_fuse(
+    const int* __restrict__ synd, int* __restrict__ label, int* __restrict__ support,
+    int* __restrict__ parity, const int* __restrict__ eu, const int* __restrict__ ev,
+    int V, int N
+) {
+    const int tid = threadIdx.x, bsz = blockDim.x;
+    for (int q = tid; q < N; q += bsz) support[q] = 0;
+    for (int v = tid; v < V; v += bsz) label[v] = v;
+    __syncthreads();
+
+    __shared__ int s_anyodd;
+    for (int r = 0; r < V; r++) {
+        // cluster parity: xor each vertex's syndrome bit into its root bucket
+        for (int v = tid; v < V; v += bsz) parity[v] = 0;
+        if (tid == 0) s_anyodd = 0;
+        __syncthreads();
+        for (int v = tid; v < V; v += bsz)
+            if (synd[v]) atomicXor(&parity[label[v]], 1);
+        __syncthreads();
+
+        // an odd, non-boundary cluster still wants to grow
+        for (int v = tid; v < V; v += bsz) {
+            const int lv = label[v];
+            if ((parity[lv] & 1) && lv != 0) s_anyodd = 1;
+        }
+        __syncthreads();
+        if (s_anyodd == 0) break;
+
+        // grow: +1 support per odd endpoint, saturating at 2 (fully grown)
+        for (int q = tid; q < N; q += bsz) {
+            const int lu = label[eu[q]], lw = label[ev[q]];
+            const int oddu = (parity[lu] & 1) && lu != 0;
+            const int oddw = (parity[lw] & 1) && lw != 0;
+            const int delta = oddu + oddw;
+            if (delta) { const int s = support[q] + delta; support[q] = s > 2 ? 2 : s; }
+        }
+        __syncthreads();
+
+        d_components(label, support, eu, ev, V, N);
+        __syncthreads();
+    }
 }
 
-// ------------------------------------------------------------ decoder helpers
-__device__ static inline int find_root(St& s, int vx) {
-    int* rov = s.rov;
-    int tmp = rov[vx];
-    if (tmp == vx) return vx;
-    // path compression: mirror union_find.py _find_root exactly. The path is
-    // [rov[vx], ..., root] (the query vertex itself is NOT compressed); flatten it.
-    int root = tmp;
-    for (;;) { root = tmp; tmp = rov[root]; if (tmp == root) break; }
-    int x = rov[vx];
-    while (x != root) { int nx = rov[x]; rov[x] = root; x = nx; }
-    return root;
+// Spanning forest over the grown edges (union_find.py _spanning_forest). BFS distance
+// from each component's representative (its min-id vertex, dist 0); a vertex's parent
+// edge is the smallest-index grown edge to a distance-1 neighbour. Writes parent[v]
+// (== v when a representative / isolated) and tree[v] (parent edge index, or -1).
+__device__ void d_spanning_forest(
+    const int* __restrict__ label, const int* __restrict__ support,
+    int* __restrict__ dist, int* __restrict__ best, int* __restrict__ parent,
+    int* __restrict__ tree, const int* __restrict__ eu, const int* __restrict__ ev,
+    int V, int N
+) {
+    const int tid = threadIdx.x, bsz = blockDim.x;
+    const int INF = V + 1;
+    for (int v = tid; v < V; v += bsz) dist[v] = (label[v] == v) ? 0 : INF;
+    __syncthreads();
+
+    __shared__ int s_changed;
+    for (int it = 0; it < V; it++) {
+        if (tid == 0) s_changed = 0;
+        __syncthreads();
+        for (int q = tid; q < N; q += bsz) {
+            if (support[q] == 2) {
+                const int u = eu[q], w = ev[q];
+                const int du = dist[u], dw = dist[w];
+                if (du + 1 < dw && atomicMin(&dist[w], du + 1) > du + 1) s_changed = 1;
+                if (dw + 1 < du && atomicMin(&dist[u], dw + 1) > dw + 1) s_changed = 1;
+            }
+        }
+        __syncthreads();
+        if (s_changed == 0) break;
+        __syncthreads();
+    }
+
+    // parent edge = smallest-index grown edge to a distance-1-closer neighbour
+    for (int v = tid; v < V; v += bsz) best[v] = N;
+    __syncthreads();
+    for (int q = tid; q < N; q += bsz) {
+        if (support[q] == 2) {
+            const int u = eu[q], w = ev[q];
+            const int du = dist[u], dw = dist[w];
+            if (du == dw - 1) atomicMin(&best[w], q);   // u is w's parent
+            if (dw == du - 1) atomicMin(&best[u], q);   // w is u's parent
+        }
+    }
+    __syncthreads();
+    for (int v = tid; v < V; v += bsz) {
+        const int be = best[v];
+        if (be < N) { const int a = eu[be], b = ev[be]; parent[v] = (a == v) ? b : a; tree[v] = be; }
+        else        { parent[v] = v; tree[v] = -1; }
+    }
+    __syncthreads();
 }
 
-__device__ static inline int get_size(St& s, int r) {
-    return s.is_root[r] ? s.r_size[r] : 0;
+// Leaf-rake peeling of the spanning forest (union_find.py _peel). Repeatedly rake the
+// active leaves: a leaf carrying a defect adds its tree edge to the correction and
+// pushes its parity up to its parent. Representatives (tree == -1) are never active.
+// correction[q] ends 1 iff qubit q is in the estimate.
+__device__ void d_peel(
+    const int* __restrict__ synd, const int* __restrict__ parent,
+    const int* __restrict__ tree, int* __restrict__ child, int* __restrict__ syndcur,
+    int* __restrict__ par, int* __restrict__ active, int* __restrict__ correction,
+    int V, int N
+) {
+    const int tid = threadIdx.x, bsz = blockDim.x;
+    for (int q = tid; q < N; q += bsz) correction[q] = 0;
+    for (int v = tid; v < V; v += bsz) { syndcur[v] = synd[v]; active[v] = tree[v] >= 0; }
+    __syncthreads();
+
+    __shared__ int s_anyleaf;
+    for (int it = 0; it < V; it++) {
+        for (int v = tid; v < V; v += bsz) child[v] = 0;
+        if (tid == 0) s_anyleaf = 0;
+        __syncthreads();
+        for (int v = tid; v < V; v += bsz)
+            if (active[v]) atomicAdd(&child[parent[v]], 1);
+        __syncthreads();
+        for (int v = tid; v < V; v += bsz)
+            if (active[v] && child[v] == 0) s_anyleaf = 1;
+        __syncthreads();
+        if (s_anyleaf == 0) break;
+
+        for (int v = tid; v < V; v += bsz) par[v] = 0;
+        __syncthreads();
+        for (int v = tid; v < V; v += bsz) {
+            if (active[v] && child[v] == 0 && syndcur[v] == 1) {   // defect-carrying leaf
+                correction[tree[v]] = 1;                           // distinct edge per leaf
+                atomicXor(&par[parent[v]], 1);
+            }
+        }
+        __syncthreads();
+        for (int v = tid; v < V; v += bsz) syndcur[v] ^= (par[v] & 1);
+        __syncthreads();
+        for (int v = tid; v < V; v += bsz)
+            if (active[v] && child[v] == 0) { syndcur[v] = 0; active[v] = 0; }
+        __syncthreads();
+    }
 }
 
-// ================================================================ main kernel
-__global__ void k_uf_decode(
-    const int64_t* conn_off, const int* conn_nbr, const int* conn_qub, const int* vcc,
-    int M, int N, const uint8_t* synd_in, int B,
-    int* work, int64_t work_str, int* arena, int arena_cap,
-    uint8_t* e_out, int* err_out)
-{
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+// ════════════════════════════════════════════════════════════════════════════
+// Fused path -- whole decode per shot in one launch (default)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// One thread block decodes one shot. Every working array lives in dynamic shared
+// memory (layout below, 10 int arrays of length V + 2 of length N); the constant
+// graph (eu / ev) is read from global memory. The three phases run back-to-back
+// with a barrier between them.
+
+__global__ void k_uf_fused(
+    const int* __restrict__ synd_all,    // [B, V]  internal syndrome (boundary col 0)
+    int*       __restrict__ corr_all,    // [B, N]  output correction
+    const int* __restrict__ eu,          // [N]     edge endpoint min
+    const int* __restrict__ ev,          // [N]     edge endpoint max
+    int V, int N, int B
+) {
+    const int b = blockIdx.x;
     if (b >= B) return;
+    const int tid = threadIdx.x, bsz = blockDim.x;
 
-    St s;
-    s.conn_off = conn_off; s.conn_nbr = conn_nbr; s.conn_qub = conn_qub; s.vcc = vcc;
-    s.M = M; s.N = N;
-    st_bind(s, work + (int64_t)b * work_str, M, N);
-    s.arena = arena + (int64_t)b * arena_cap; s.top = 0; s.cap = arena_cap; s.fail = 0;
+    extern __shared__ int smem[];
+    int* s_label   = smem;               // [V]
+    int* s_dist    = s_label   + V;      // [V]
+    int* s_parent  = s_dist    + V;      // [V]
+    int* s_tree    = s_parent  + V;      // [V]
+    int* s_child   = s_tree    + V;      // [V]
+    int* s_syndcur = s_child   + V;      // [V]
+    int* s_par     = s_syndcur + V;      // [V]  (parity in grow, par_flip in peel)
+    int* s_active  = s_par     + V;      // [V]
+    int* s_best    = s_active  + V;      // [V]
+    int* s_synd    = s_best    + V;      // [V]
+    int* s_support = s_synd    + V;      // [N]
+    int* s_corr    = s_support + N;      // [N]
 
-    // ---- reset dense state ----
-    for (int i = 0; i < M; i++) {
-        s.is_root[i] = 0; s.r_size[i] = 0; s.r_parity[i] = 0;
-        s.conn_cnt[i] = 0; s.rov[i] = i; s.bt_off[i] = -1; s.bt_mask[i] = 0; s.bt_size[i] = 0;
-        s.vcount[i] = 0;
-    }
-    for (int i = 0; i < N; i++) { s.support[i] = 0; e_out[(int64_t)b * N + i] = 0; }
-    for (int i = 0; i < M; i++) s.synd[i] = synd_in[(int64_t)b * M + i] ? 1 : 0;
-    *s.odd_off = -1; *s.odd_mask = 0; *s.odd_size = 0;
+    const int* synd = synd_all + (size_t)b * V;
+    for (int v = tid; v < V; v += bsz) s_synd[v] = synd[v];
+    __syncthreads();
 
-    // ---- init_cluster ----
-    // roots = syndrome vertices in ascending id order
-    int nroots = 0;
-    for (int n = 0; n < M; n++) if (s.synd[n] & 1) nroots++;
-    rt_reserve(s, s.odd_mask, s.odd_size, s.odd_off, 2 * nroots);
-    if (s.fail) { err_out[b] = ERR_OVERFLOW; return; }
-    for (int n = 0; n < M; n++) {
-        if (s.synd[n] & 1) {
-            s.is_root[n] = 1;
-            rt_insert(s, s.odd_mask, s.odd_size, s.odd_off, n);
-            s.r_size[n] = 1; s.r_parity[n] = 1;
-            if (s.fail) { err_out[b] = ERR_OVERFLOW; return; }
-        }
-    }
-    for (int n = 0; n < M; n++) {
-        if (s.synd[n] & 1) {
-            rt_insert(s, &s.bt_mask[n], &s.bt_size[n], &s.bt_off[n], n);  // creates region
-            if (s.fail) { err_out[b] = ERR_OVERFLOW; return; }
-        }
-    }
+    d_grow_fuse(s_synd, s_label, s_support, s_par, eu, ev, V, N);
+    __syncthreads();
+    d_spanning_forest(s_label, s_support, s_dist, s_best, s_parent, s_tree, eu, ev, V, N);
+    __syncthreads();
+    d_peel(s_synd, s_parent, s_tree, s_child, s_syndcur, s_par, s_active, s_corr, V, N);
+    __syncthreads();
 
-    int f_head = 0, f_tail = 0, FCAP = N + 1;
-    int p_head = 0, p_tail = 0, p_cnt = 0, PCAP = M + 1;
-
-    // ---- decode loop ----
-    while (*s.odd_size != 0) {
-        int nok = rt_keys(s, s.odd_mask, s.odd_off, s.oddkeybuf);
-        for (int oi = 0; oi < nok; oi++) {
-            int root = s.oddkeybuf[oi];
-            // grow(root)
-            int nbv = rt_keys(s, &s.bt_mask[root], &s.bt_off[root], s.keybuf);
-            for (int bi = 0; bi < nbv; bi++) {
-                int bv = s.keybuf[bi];
-                int64_t k0 = s.conn_off[bv], k1 = s.conn_off[bv + 1];
-                for (int64_t k = k0; k < k1; k++) {
-                    int v = s.conn_nbr[k], eidx = s.conn_qub[k];
-                    int elt = s.support[eidx];
-                    if (elt == 2) continue;
-                    elt++; s.support[eidx] = elt;
-                    if (elt == 2) {
-                        int e0 = bv < v ? bv : v, e1 = bv < v ? v : bv;
-                        s.conn_cnt[e0]++; s.conn_cnt[e1]++;
-                        s.fu[f_tail] = e0; s.fv[f_tail] = e1; s.fq[f_tail] = eidx;
-                        f_tail = (f_tail + 1) % FCAP;
-                    }
-                }
-            }
-        }
-        // fusion()
-        while (f_head != f_tail) {
-            int u = s.fu[f_head], v = s.fv[f_head], q = s.fq[f_head];
-            f_head = (f_head + 1) % FCAP;
-            int r1 = find_root(s, u), r2 = find_root(s, v);
-            if (r1 == r2) continue;
-            s.pu[p_tail] = u; s.pv[p_tail] = v; s.pq[p_tail] = q;
-            p_tail = (p_tail + 1) % PCAP; p_cnt++;
-            if (get_size(s, r1) < get_size(s, r2)) { int t = r1; r1 = r2; r2 = t; }
-            s.rov[r2] = r1;
-            if (!s.is_root[r2]) {
-                s.r_size[r1] += 1;
-                rt_insert(s, &s.bt_mask[r1], &s.bt_size[r1], &s.bt_off[r1], r2);
-                if (s.fail) { err_out[b] = ERR_OVERFLOW; return; }
-            } else {
-                // merge(r1, r2)
-                int new_parity = s.r_parity[r1] + s.r_parity[r2];
-                if (new_parity & 1) rt_insert(s, s.odd_mask, s.odd_size, s.odd_off, r1);
-                else                rt_erase(s, s.odd_mask, s.odd_size, s.odd_off, r1);
-                if (s.fail) { err_out[b] = ERR_OVERFLOW; return; }
-                s.r_size[r1] += s.r_size[r2];
-                s.r_parity[r1] = new_parity;
-                rt_erase(s, s.odd_mask, s.odd_size, s.odd_off, r2);
-                s.r_size[r2] = 0; s.r_parity[r2] = 0; s.is_root[r2] = 0;
-                // merge_boundary(r1, r2)
-                int nb2 = rt_keys(s, &s.bt_mask[r2], &s.bt_off[r2], s.keybuf);
-                rt_range_insert(s, &s.bt_mask[r1], &s.bt_size[r1], &s.bt_off[r1], s.keybuf, nb2);
-                if (s.fail) { err_out[b] = ERR_OVERFLOW; return; }
-                for (int i = 0; i < nb2; i++) {
-                    int vx = s.keybuf[i];
-                    if (s.conn_cnt[vx] == s.vcc[vx])
-                        rt_erase(s, &s.bt_mask[r1], &s.bt_size[r1], &s.bt_off[r1], vx);
-                }
-                s.bt_off[r2] = -1; s.bt_size[r2] = 0; s.bt_mask[r2] = 0;  // del
-            }
-        }
-    }
-
-    // ---- peeling ----
-    for (int i = 0; i < M; i++) s.vcount[i] = 0;
-    int idx = p_head;
-    for (int i = 0; i < p_cnt; i++) {
-        s.vcount[s.pu[idx]]++; s.vcount[s.pv[idx]]++;
-        idx = (idx + 1) % PCAP;
-    }
-    while (p_cnt > 0) {
-        int back = (p_tail - 1 + PCAP) % PCAP;
-        int eu = s.pu[back], ev = s.pv[back], eq = s.pq[back];
-        p_tail = back; p_cnt--;
-        int u, v;
-        if (s.vcount[eu] == 1) { u = eu; v = ev; }
-        else if (s.vcount[ev] == 1) { u = ev; v = eu; }
-        else {
-            p_head = (p_head - 1 + PCAP) % PCAP;
-            s.pu[p_head] = eu; s.pv[p_head] = ev; s.pq[p_head] = eq;
-            p_cnt++;
-            continue;
-        }
-        s.vcount[u]--; s.vcount[v]--;
-        if (s.synd[u] == 1) {
-            e_out[(int64_t)b * N + eq] = 1;
-            s.synd[u] = 0;
-            s.synd[v] ^= 1;
-        }
-    }
-    err_out[b] = ERR_OK;
+    int* corr = corr_all + (size_t)b * N;
+    for (int q = tid; q < N; q += bsz) corr[q] = s_corr[q];
 }
 
-// ==================================================================== host API
-#define UF_CHECK(x) TORCH_CHECK((x).is_cuda() && (x).is_contiguous(), #x " must be CUDA & contiguous")
+int64_t fused_smem_bytes(int64_t V, int64_t N) {
+    return (10 * V + 2 * N) * (int64_t)sizeof(int);
+}
 
-std::vector<torch::Tensor> uf_decode(
-    torch::Tensor conn_off, torch::Tensor conn_nbr, torch::Tensor conn_qub, torch::Tensor vcc,
-    int64_t M, int64_t N, torch::Tensor synd, int64_t arena_cap)
-{
-    UF_CHECK(conn_off); UF_CHECK(conn_nbr); UF_CHECK(conn_qub); UF_CHECK(vcc); UF_CHECK(synd);
+int64_t fused_smem_limit() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    int v = 48 * 1024;
+    cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    return (int64_t)v;
+}
+
+torch::Tensor uf_fused_cuda(
+    torch::Tensor synd, torch::Tensor eu, torch::Tensor ev,
+    int64_t V, int64_t N, int64_t block_size
+) {
+    UF_CHECK(synd); UF_CHECK(eu); UF_CHECK(ev);
     const int B = (int)synd.size(0);
-    auto dev = synd.device();
-    auto e_out = torch::zeros({B, N}, torch::dtype(torch::kUInt8).device(dev));
-    auto err_out = torch::zeros({B}, torch::dtype(torch::kInt32).device(dev));
-    if (B == 0) return {e_out, err_out};
+    auto corr = torch::empty({B, (long)N},
+                             torch::dtype(torch::kInt32).device(synd.device()));
+    if (B == 0) return corr;
 
-    const int64_t work_str = work_stride((int)M, (int)N);
-    auto work = torch::empty({(int64_t)B * work_str}, torch::dtype(torch::kInt32).device(dev));
-    auto arena = torch::empty({(int64_t)B * arena_cap}, torch::dtype(torch::kInt32).device(dev));
-
+    const size_t smem = (size_t)fused_smem_bytes(V, N);
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(k_uf_fused,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     auto stream = at::cuda::getCurrentCUDAStream();
-    k_uf_decode<<<grid1d(B), THREADS, 0, stream>>>(
-        conn_off.data_ptr<int64_t>(), conn_nbr.data_ptr<int32_t>(),
-        conn_qub.data_ptr<int32_t>(), vcc.data_ptr<int32_t>(),
-        (int)M, (int)N, synd.data_ptr<uint8_t>(), B,
-        work.data_ptr<int32_t>(), work_str, arena.data_ptr<int32_t>(), (int)arena_cap,
-        e_out.data_ptr<uint8_t>(), err_out.data_ptr<int32_t>());
-    return {e_out, err_out};
+    k_uf_fused<<<B, (int)block_size, smem, stream>>>(
+        synd.data_ptr<int32_t>(),
+        corr.data_ptr<int32_t>(),
+        eu.data_ptr<int32_t>(),
+        ev.data_ptr<int32_t>(),
+        (int)V, (int)N, B);
+    return corr;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Per-step path -- the three phase kernels, driven by a Python loop (fallback)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// One thread block per shot, exactly as the fused path, but every working array is
+// per-block global-memory scratch (allocated by the caller) instead of shared
+// memory -- for codes whose fused working set exceeds the shared-memory budget, and
+// for debugging one phase at a time. Because the same d_* device functions run, the
+// output is bit-identical to the fused path.
+
+__global__ void k_uf_grow_fuse(
+    const int* __restrict__ synd, int* __restrict__ label, int* __restrict__ support,
+    int* __restrict__ par, const int* __restrict__ eu, const int* __restrict__ ev,
+    int V, int N, int B
+) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    d_grow_fuse(synd + (size_t)b * V, label + (size_t)b * V, support + (size_t)b * N,
+                par + (size_t)b * V, eu, ev, V, N);
+}
+
+__global__ void k_uf_spanning_forest(
+    const int* __restrict__ label, const int* __restrict__ support,
+    int* __restrict__ dist, int* __restrict__ best, int* __restrict__ parent,
+    int* __restrict__ tree, const int* __restrict__ eu, const int* __restrict__ ev,
+    int V, int N, int B
+) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    d_spanning_forest(label + (size_t)b * V, support + (size_t)b * N,
+                      dist + (size_t)b * V, best + (size_t)b * V,
+                      parent + (size_t)b * V, tree + (size_t)b * V, eu, ev, V, N);
+}
+
+__global__ void k_uf_peel(
+    const int* __restrict__ synd, const int* __restrict__ parent,
+    const int* __restrict__ tree, int* __restrict__ child, int* __restrict__ syndcur,
+    int* __restrict__ par, int* __restrict__ active, int* __restrict__ corr,
+    int V, int N, int B
+) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    d_peel(synd + (size_t)b * V, parent + (size_t)b * V, tree + (size_t)b * V,
+           child + (size_t)b * V, syndcur + (size_t)b * V, par + (size_t)b * V,
+           active + (size_t)b * V, corr + (size_t)b * N, V, N);
+}
+
+void uf_grow_fuse_cuda(
+    torch::Tensor synd, torch::Tensor label, torch::Tensor support, torch::Tensor par,
+    torch::Tensor eu, torch::Tensor ev, int64_t V, int64_t N, int64_t block_size
+) {
+    UF_CHECK(synd); UF_CHECK(label); UF_CHECK(support); UF_CHECK(par);
+    const int B = (int)synd.size(0);
+    if (B == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    k_uf_grow_fuse<<<B, (int)block_size, 0, stream>>>(
+        synd.data_ptr<int32_t>(), label.data_ptr<int32_t>(),
+        support.data_ptr<int32_t>(), par.data_ptr<int32_t>(),
+        eu.data_ptr<int32_t>(), ev.data_ptr<int32_t>(), (int)V, (int)N, B);
+}
+
+void uf_spanning_forest_cuda(
+    torch::Tensor label, torch::Tensor support, torch::Tensor dist, torch::Tensor best,
+    torch::Tensor parent, torch::Tensor tree, torch::Tensor eu, torch::Tensor ev,
+    int64_t V, int64_t N, int64_t block_size
+) {
+    UF_CHECK(label); UF_CHECK(support); UF_CHECK(dist); UF_CHECK(best);
+    UF_CHECK(parent); UF_CHECK(tree);
+    const int B = (int)label.size(0);
+    if (B == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    k_uf_spanning_forest<<<B, (int)block_size, 0, stream>>>(
+        label.data_ptr<int32_t>(), support.data_ptr<int32_t>(),
+        dist.data_ptr<int32_t>(), best.data_ptr<int32_t>(),
+        parent.data_ptr<int32_t>(), tree.data_ptr<int32_t>(),
+        eu.data_ptr<int32_t>(), ev.data_ptr<int32_t>(), (int)V, (int)N, B);
+}
+
+void uf_peel_cuda(
+    torch::Tensor synd, torch::Tensor parent, torch::Tensor tree, torch::Tensor child,
+    torch::Tensor syndcur, torch::Tensor par, torch::Tensor active,
+    torch::Tensor corr, int64_t V, int64_t N, int64_t block_size
+) {
+    UF_CHECK(synd); UF_CHECK(parent); UF_CHECK(tree); UF_CHECK(child);
+    UF_CHECK(syndcur); UF_CHECK(par); UF_CHECK(active); UF_CHECK(corr);
+    const int B = (int)synd.size(0);
+    if (B == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    k_uf_peel<<<B, (int)block_size, 0, stream>>>(
+        synd.data_ptr<int32_t>(), parent.data_ptr<int32_t>(),
+        tree.data_ptr<int32_t>(), child.data_ptr<int32_t>(),
+        syndcur.data_ptr<int32_t>(), par.data_ptr<int32_t>(),
+        active.data_ptr<int32_t>(), corr.data_ptr<int32_t>(), (int)V, (int)N, B);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Python bindings
+// ════════════════════════════════════════════════════════════════════════════
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("uf_decode", &uf_decode,
-          "Bit-exact Union-Find decode, one thread per shot (CUDA). "
-          "Returns (e_out[B,N] uint8, err[B] int32).");
+    m.def("uf_fused", &uf_fused_cuda,
+          "Full Union-Find decode per shot in one launch (CUDA)");
+    m.def("fused_smem_bytes", &fused_smem_bytes,
+          "Dynamic shared memory (bytes) the fused kernel needs for [V, N]");
+    m.def("fused_smem_limit", &fused_smem_limit,
+          "Maximum opt-in dynamic shared memory per block on the current device");
+
+    m.def("uf_grow_fuse", &uf_grow_fuse_cuda,
+          "Per-step: grow/fuse fixpoint, writes min-id labels + grown support (CUDA)");
+    m.def("uf_spanning_forest", &uf_spanning_forest_cuda,
+          "Per-step: BFS spanning forest, writes parent + tree edge (CUDA)");
+    m.def("uf_peel", &uf_peel_cuda,
+          "Per-step: leaf-rake peel of the forest into the correction (CUDA)");
 }
