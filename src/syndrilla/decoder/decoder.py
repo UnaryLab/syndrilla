@@ -1,6 +1,5 @@
 import os
 import sys
-import copy
 import importlib.util
 import numpy as np
 import torch

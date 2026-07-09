@@ -5,14 +5,12 @@ from loguru import logger
 from syndrilla.decoder.decoder import RebatchSpeedup
 
 
-
 class create(torch.nn.Module):
     """
     This class creates a lotterybp decoder on a single GPU
     """
-    def __init__(self,
-                 decoder_cfg,
-                 **kwargs) -> None:
+
+    def __init__(self, decoder_cfg, **kwargs) -> None:
         """
         Initialization for lotterybp decoder
         Input:
@@ -32,77 +30,108 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f'Creating lotterybp decoder.')
+        logger.info(f"Creating lotterybp decoder.")
         # set up default device
-        device_cfg = decoder_cfg.get('device', {})
-        self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-        if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
-            logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device_cfg = decoder_cfg.get("device", {})
+        self.device = device_cfg.get(
+            "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        if self.device not in {
+            "cuda",
+            "cpu",
+            torch.device("cuda"),
+            torch.device("cpu"),
+        }:
+            logger.warning(
+                f"Invalid input device <{self.device}>, default to avaliable device in your machine."
+            )
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if self.device == 'cuda':
-            device_idx = device_cfg.get('device_idx', 0)
+        if self.device == "cuda":
+            device_idx = device_cfg.get("device_idx", 0)
             if device_idx >= torch.cuda.device_count():
-                logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device(f'cuda:0')
+                logger.warning(
+                    f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
+                )
+                self.device = torch.device(f"cuda:0")
             else:
-                self.device = torch.device(f'cuda:{device_idx}')
+                self.device = torch.device(f"cuda:{device_idx}")
 
         # set up default max_iter
-        self.max_iter = decoder_cfg.get('max_iter', 50)
+        self.max_iter = decoder_cfg.get("max_iter", 50)
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
-            logger.warning(f'Invalid input maximum iteration <{self.max_iter}>, default to <50>.')
+            logger.warning(
+                f"Invalid input maximum iteration <{self.max_iter}>, default to <50>."
+            )
             self.max_iter = 50
-        
+
         # set up default dtype
-        self.dtype = decoder_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}: 
-            logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
-            self.dtype = 'float64'
+        self.dtype = decoder_cfg.get("dtype", "float64")
+        if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
+            logger.warning(
+                f"Invalid input data type <{self.dtype}>, default to <torch.float64>."
+            )
+            self.dtype = "float64"
         self.dtype = torch.__dict__[self.dtype]
 
         self.batch_size = 1
 
-        self.check_type = decoder_cfg.get('check_type', 'hx')
-        if self.check_type.lower() not in {'hx', 'hz'}: 
-            logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
-            self.check_type = 'hx'
+        self.check_type = decoder_cfg.get("check_type", "hx")
+        if self.check_type.lower() not in {"hx", "hz"}:
+            logger.warning(
+                f"Invalid input check type <{self.check_type}>, default to <hx>."
+            )
+            self.check_type = "hx"
 
-        self.random_machine = decoder_cfg.get('random_machine', 'sobol')
-        if self.random_machine.lower() not in {'sobol', 'system'}: 
-            logger.warning(f'Invalid input machine type <{self.random_machine}>, default to <sobol>.')
-            self.random_machine = 'sobol'
+        self.random_machine = decoder_cfg.get("random_machine", "sobol")
+        if self.random_machine.lower() not in {"sobol", "system"}:
+            logger.warning(
+                f"Invalid input machine type <{self.random_machine}>, default to <sobol>."
+            )
+            self.random_machine = "sobol"
 
-        bundle = kwargs.get('bundle')
+        bundle = kwargs.get("bundle")
         if bundle is None:
-            raise ValueError('bp_lottery requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
+            raise ValueError(
+                "bp_lottery requires a pre-loaded MatrixBundle via the `bundle` kwarg."
+            )
         self.Hx_matrix = bundle.Hx_matrix
         self.Hz_matrix = bundle.Hz_matrix
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(
+            self.check_type
+        )
 
-        self.mask_dummy = (self.V_c_col == self.H_shape[1])
-        
+        self.mask_dummy = self.V_c_col == self.H_shape[1]
+
         # set iteration
         self.i = 0
-        
-        # convert to as the parameters in a model
-        self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
-        self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
-        self.algo = 'bp_lottery'
+        # convert to as the parameters in a model. Move the bundle-derived index/mask/matrix
+        # tensors onto the decoder's device: the bundle is loaded on CPU, but forward() builds
+        # its tensors on self.device and ops like scatter_add_ require the index on the SAME
+        # device as the target (plain [] indexing tolerates a CPU index, scatter_add_ does not).
+        self.V_c_row = torch.nn.Parameter(
+            self.V_c_row.to(self.device), requires_grad=False
+        )
+        self.V_c_col = torch.nn.Parameter(
+            self.V_c_col.to(self.device), requires_grad=False
+        )
+        self.mask_dummy = self.mask_dummy.to(self.device)
+        self.H_matrix = self.H_matrix.to(self.device)
+
+        self.algo = "bp_lottery"
         self.num_max_iter = self.max_iter
 
         # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is
         # in the config). When active it stops a batch once a learned % has converged
         # and leaves the rest unconverged for main's extra queue. See decoder.py.
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
-        self.cap_bypass = False       # set by main: True -> decode this batch uncapped
+        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get("rebatch_speedup"))
+        self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f'Complete.')
-
+        logger.info(f"Complete.")
 
     def forward(self, io_dict):
         """Iterative lotterybp (normalized min sum) decoding algorithm
@@ -124,51 +153,73 @@ class create(torch.nn.Module):
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
 
-        logger.info(f'Initializing lotterybp (normailized min sum) decoding.')
-        syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
-        
+        logger.info(f"Initializing lotterybp (normailized min sum) decoding.")
+        syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
+
         self.batch_size, _ = syndrome.size()
-        
+
         torch.set_default_dtype(self.dtype)
 
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
-        N_extended = self.H_shape[1] + 1 
-        l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
-        
+        N_extended = self.H_shape[1] + 1
+        l_v = torch.zeros(
+            [self.batch_size, N_extended], dtype=self.dtype, device=self.device
+        )
+        e_v = torch.zeros(
+            [self.batch_size, N_extended], dtype=self.dtype, device=self.device
+        )
+        s_est = torch.zeros(
+            [self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device
+        )
+
         # add dummy column
-        dummy_column = torch.full([self.batch_size,1], float('inf'), dtype=self.dtype, device=self.device)
-        u_init = torch.cat((io_dict['llr0'].to(self.device).to(self.dtype), dummy_column), dim=1)
-        e_out = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        l_out = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
+        dummy_column = torch.full(
+            [self.batch_size, 1], float("inf"), dtype=self.dtype, device=self.device
+        )
+        u_init = torch.cat(
+            (io_dict["llr0"].to(self.device).to(self.dtype), dummy_column), dim=1
+        )
+        e_out = torch.zeros(
+            [self.batch_size, N_extended], dtype=self.dtype, device=self.device
+        )
+        l_out = torch.zeros(
+            [self.batch_size, N_extended], dtype=self.dtype, device=self.device
+        )
         num_iters = torch.full([self.batch_size], -1, device=self.device)
         converges = torch.full([self.batch_size], 0, device=self.device)
 
-        # set up initialization for all parameters for decoding process 
+        # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
-        message = torch.zeros_like(self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
+        message = torch.zeros_like(
+            self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device
+        ).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
 
         # compute syndrome for multiplication
         self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
         self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
 
-        if self.random_machine.lower() == 'sobol':
-            if self.dtype in {'float32', 'float64'}:
+        if self.random_machine.lower() == "sobol":
+            if self.dtype in {"float32", "float64"}:
                 sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
                 self.r = sobol.draw(self.max_iter).to(self.device).to(self.dtype)
-            else: 
+            else:
                 sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-                self.r = sobol.draw(self.max_iter, dtype=torch.float32).to(self.device).to(self.dtype)
-        
-        logger.info(f'Complete.')
+                self.r = (
+                    sobol.draw(self.max_iter, dtype=torch.float32)
+                    .to(self.device)
+                    .to(self.dtype)
+                )
 
-        logger.info(f'Starting decoding iterations.')
+        logger.info(f"Complete.")
+
+        logger.info(f"Starting decoding iterations.")
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
-        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
+        self.cap_active_last = bool(
+            self.cap is not None and self.cap.done and not self.cap_bypass
+        )
         cap_frac = self.cap.frac if self.cap_active_last else None
 
         flip_start_iter = 4
@@ -212,7 +263,10 @@ class create(torch.nn.Module):
 
             # adaptive cap: stop once >= cap_frac of the batch has converged; the
             # unconverged remainder (converge == 0) becomes main's deferred tail.
-            if cap_frac is not None and int((num_iters != -1).sum()) >= cap_frac * self.batch_size:
+            if (
+                cap_frac is not None
+                and int((num_iters != -1).sum()) >= cap_frac * self.batch_size
+            ):
                 break
 
             if self.i > flip_start_iter:
@@ -229,16 +283,12 @@ class create(torch.nn.Module):
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
             self.cap.observe(num_iters, self.max_iter, self.batch_size)
 
-        logger.info(f'Complete.')
-        logger.info(f'Decoding iterations: <{(self.i)}>.')
-        io_dict.update({
-            'e_v': e_out,
-            'iter': num_iters,
-            'llr': l_out,
-            'converge': converges
-        })
+        logger.info(f"Complete.")
+        logger.info(f"Decoding iterations: <{(self.i)}>.")
+        io_dict.update(
+            {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
+        )
         return io_dict
-
 
     def v2c(self, l_v):
         """Format conversion (variable -> check layout).
@@ -248,7 +298,6 @@ class create(torch.nn.Module):
         and check-node updates operate on. Each edge (c, v) picks up `l_v[:, v]`.
         """
         return l_v[:, self.V_c_col]
-
 
     def vn_update(self, b_c2v, l_v_v2c):
         """Variable-node update: produce the v->c messages a_v2c.
@@ -263,10 +312,9 @@ class create(torch.nn.Module):
         else:
             return l_v_v2c - b_c2v
 
-
     def cn_update(self, a_v2c):
         base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype) 
+        exponent = torch.tensor(-(self.i), dtype=self.dtype)
 
         # Compute the power in PyTorch:
         beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
@@ -276,7 +324,7 @@ class create(torch.nn.Module):
         sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=2, keepdim=True)
         Q_sign = self.syndrome_neg * sign_prod
-        
+
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
         sorted, _ = torch.sort(abs_a_v2c, dim=2)
@@ -288,7 +336,6 @@ class create(torch.nn.Module):
         message[:, self.mask_dummy] = 0.0
         return message
 
-
     def c2v(self, b_c2v):
         """Format conversion (check -> variable layout).
 
@@ -299,12 +346,13 @@ class create(torch.nn.Module):
         # set up the format for both data and partition so they can matching each other
         data_flat = b_c2v.flatten(start_dim=1)
         partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
-        sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
+        sum_b_c2v = torch.zeros(
+            [self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device
+        )
 
         sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
 
         return sum_b_c2v
-
 
     def llr_update(self, u_init, b_c2v):
         """Elementwise LLR update: posterior LLR = channel LLR + sum of incoming c->v.
@@ -314,9 +362,8 @@ class create(torch.nn.Module):
         it is never decoded as an error.
         """
         l_v = u_init + b_c2v
-        l_v[:, -1] = float('inf')
+        l_v[:, -1] = float("inf")
         return l_v
-
 
     def hard_decision(self, l_v):
         """Hard decision: map posterior LLRs to a binary error estimate.
@@ -326,39 +373,37 @@ class create(torch.nn.Module):
         """
         return torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
 
-
     def syndrome_estimation(self, e_v):
         # calculate the syndrome by summing the number of 1s in each column in e
         temp_e = e_v
         temp_e[:, -1] = 0.0
-        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
-        
-        return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0)
-    
+        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
+
+        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
 
     def sign_flip(self, syndrome, s_est, l_v):
-        synd_diff = (syndrome + s_est)%2.0
-        
-        temp_ls = torch.matmul(synd_diff.float(), self.H_matrix.unsqueeze(0).float()) 
+        synd_diff = (syndrome + s_est) % 2.0
+
+        temp_ls = torch.matmul(synd_diff.float(), self.H_matrix.unsqueeze(0).float())
         temp_ls = temp_ls.squeeze(0)
 
-        total_ones = temp_ls.sum(dim=1).to(self.dtype) 
+        total_ones = temp_ls.sum(dim=1).to(self.dtype)
 
         valid_mask = total_ones > 0
-        
-        if self.random_machine.lower() == 'system':
+
+        if self.random_machine.lower() == "system":
             r = torch.rand(self.batch_size, device=self.device, dtype=self.dtype)
-        elif self.random_machine.lower() == 'sobol': 
-            r = self.r[(self.i-1)].repeat(self.batch_size)
+        elif self.random_machine.lower() == "sobol":
+            r = self.r[(self.i - 1)].repeat(self.batch_size)
 
         target = torch.zeros_like(total_ones).to(self.dtype)
-        
+
         target[valid_mask] = torch.floor(r[valid_mask] * (total_ones[valid_mask] - 1))
         target = target.unsqueeze(1)
         cumsum_x = torch.cumsum(temp_ls, dim=1)
         mask = cumsum_x >= target + 1
         selected_indices = torch.argmax(mask.float(), dim=1)
-        
+
         l_v[valid_mask, selected_indices[valid_mask]] *= -1.0
         return l_v
 
@@ -366,41 +411,45 @@ class create(torch.nn.Module):
         # Syndrome Residual
         synd_diff = (syndrome + s_est) % 2.0  # [B, M]
         unsat_cn_mask = synd_diff.bool()
-        
+
         batch_size, M = unsat_cn_mask.shape
-        
+
         total_unsat = unsat_cn_mask.sum(dim=1)
-        valid_mask = total_unsat > 0 
-        
+        valid_mask = total_unsat > 0
+
         # random selection setup
-        if self.random_machine.lower() == 'system':
+        if self.random_machine.lower() == "system":
             r = torch.rand(batch_size, device=self.device)
-        else: # sobol
-            r = self.r[(self.i-1)].repeat(batch_size)
-            
-        total_unsat_safe = total_unsat + (total_unsat == 0).float() 
-        
+        else:  # sobol
+            r = self.r[(self.i - 1)].repeat(batch_size)
+
+        total_unsat_safe = total_unsat + (total_unsat == 0).float()
+
         unsat_cumsum = unsat_cn_mask.cumsum(dim=1)
-        
+
         # CN Selection: Random
         rand_pos = torch.floor(r * total_unsat_safe).long() + 1
-        chosen_cn = ((unsat_cumsum >= rand_pos.unsqueeze(1)) & unsat_cn_mask).float() # [B, M]
-        chosen_cn_idx = torch.argmax(chosen_cn, dim=1) # [B]
-        
+        chosen_cn = (
+            (unsat_cumsum >= rand_pos.unsqueeze(1)) & unsat_cn_mask
+        ).float()  # [B, M]
+        chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
+
         # VN Selection: 1. Unsat CN count priority ->  2. Min LLR priority
-        H_expanded = self.H_matrix.unsqueeze(0).expand(batch_size, -1, -1) # [B, M, N]
-        candidate_vn_mask = H_expanded[torch.arange(batch_size), chosen_cn_idx, :].bool()
-        
+        H_expanded = self.H_matrix.unsqueeze(0).expand(batch_size, -1, -1)  # [B, M, N]
+        candidate_vn_mask = H_expanded[
+            torch.arange(batch_size), chosen_cn_idx, :
+        ].bool()
+
         vn_unsat_counts = torch.matmul(unsat_cn_mask.float(), self.H_matrix.float())
 
-        llr = torch.abs(l_v[:, :-1]) # [B, N]
+        llr = torch.abs(l_v[:, :-1])  # [B, N]
         score = vn_unsat_counts * 1e6 - llr
 
         masked_score = score + (~candidate_vn_mask).float() * -1e9
         selected_vn = torch.argmax(masked_score, dim=1)
-        
+
         l_v[valid_mask, selected_vn[valid_mask]] *= -1.0
-        
+
         return l_v
 
     def sign_flip_cn_random(self, syndrome, s_est, l_v):
@@ -409,25 +458,25 @@ class create(torch.nn.Module):
         unsat_cn_mask = synd_diff.bool()  # [B, M]
 
         batch_size, M = unsat_cn_mask.shape
-        
-        total_unsat = unsat_cn_mask.sum(dim=1)      # [B]
-        valid_mask = total_unsat > 0 
 
-        if self.random_machine.lower() == 'system':
+        total_unsat = unsat_cn_mask.sum(dim=1)  # [B]
+        valid_mask = total_unsat > 0
+
+        if self.random_machine.lower() == "system":
             r = torch.rand(batch_size, device=self.device)
-        elif self.random_machine.lower() == 'sobol':
-            r = self.r[(self.i-1)].repeat(batch_size)
+        elif self.random_machine.lower() == "sobol":
+            r = self.r[(self.i - 1)].repeat(batch_size)
 
         unsat_cumsum = unsat_cn_mask.cumsum(dim=1)  # [B, M]
-        
+
         total_unsat_safe = total_unsat + (~valid_mask).float()
-        
+
         rand_pos = torch.floor(r * total_unsat_safe).long() + 1
 
         chosen_cn = ((unsat_cumsum >= rand_pos.unsqueeze(1)) & unsat_cn_mask).float()
         chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
 
-        cn_mask = self.H_matrix[chosen_cn_idx, :].bool() # [B, N]
+        cn_mask = self.H_matrix[chosen_cn_idx, :].bool()  # [B, N]
 
         llr = l_v[:, :-1]  # [B, N]
         masked_llr = llr + (~cn_mask).float() * 1e9

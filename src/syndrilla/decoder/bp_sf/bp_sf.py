@@ -12,7 +12,7 @@ from syndrilla.decoder.decoder import RebatchSpeedup
 def sample_n_choose_k(iterable, k, num_samples):
     """Sample ``num_samples`` weight-``k`` combinations of ``iterable``.
 
-    Faithful port of ``mybp.sample_n_choose_k`` from the BP-SF reference: if the
+    Faithful transformation of ``mybp.sample_n_choose_k`` from the BP-SF reference: if the
     requested count meets/exceeds the number of combinations, return them all;
     if the sampling fraction is tiny, draw with replacement (collisions are
     vanishingly unlikely); otherwise draw a uniform subset without replacement.
@@ -288,65 +288,86 @@ class create(torch.nn.Module):
         candidates. Weight-``w`` (``w_min..w_max``) combinations of those candidates are
         tried in ascending weight: the candidate columns are XORed into the syndrome,
         BP is re-run, and on convergence the candidate bits are flipped back in the
-        estimate. The first converging trial wins (mirrors the reference's break).
+        estimate. The lowest-indexed (== weight-then-sample ordered) converging trial
+        wins, matching the reference's first-break.
+
+        Fully vectorized: every ``(unconverged sample x candidate combo)`` trial is
+        stacked into a single ``_bp_core`` call rather than looping combo-by-combo.
+        BP message passing is per-sample independent, so a trial's output is identical
+        whether run alone or inside the wide batch -- the result is bit-for-bit the same
+        as the loop, trading the early-exit for one parallel pass (larger peak memory:
+        ``U*C`` rows, where ``U`` = unconverged count, ``C`` = combo count).
         Results are written in place into ``e_out``/``l_out``/``converges``.
         """
         unconv = torch.where(converges == 0)[0]
-        if unconv.numel() == 0:
+        U = unconv.numel()
+        if U == 0:
             return
 
         N = self.H_shape[1]
         topk = min(self.topk, N)
 
-        # per-sample candidate bit indices, highest oscillation first: [batch, topk]
-        topk_full = torch.zeros(
-            [self.batch_size, topk], dtype=torch.long, device=self.device
+        # per-sample candidate bit indices, highest oscillation first: [U, topk]
+        cand = torch.argsort(osc[unconv], dim=1, descending=True)[:, :topk]
+
+        # weight-ordered candidate-slot combinations, as a membership mask [C, topk].
+        # `sample_n_choose_k` (the reference's random sampler) is called once per weight,
+        # so the combo set and its ordering are identical to the loop version; each combo
+        # becomes a variable-length row of slot indices.
+        combos = [
+            torch.tensor(list(slots), dtype=torch.long, device=self.device)
+            for w in range(self.w_min, self.w_max + 1)
+            for slots in sample_n_choose_k(range(topk), w, self.n_sample)
+        ]
+        C = len(combos)
+        if C == 0:
+            return
+        # pad the ragged slot rows to a rectangle (sentinel column `topk`), then scatter
+        # membership in one shot -- no per-element Python loop.
+        padded = torch.nn.utils.rnn.pad_sequence(
+            combos, batch_first=True, padding_value=topk
+        )  # [C, Lmax], missing slots point at the dummy column
+        combo_mask = torch.zeros([C, topk + 1], dtype=self.dtype, device=self.device)
+        if padded.numel() > 0:
+            combo_mask.scatter_(1, padded, 1.0)
+        combo_mask = combo_mask[:, :topk]  # drop the sentinel column
+
+        # syndrome shift per (sample, combo) = parity of the selected columns: [U, C, M]
+        Hcols = self.H_dense[:, cand]  # [M, U, topk]
+        shift = torch.einsum("muk,ck->ucm", Hcols, combo_mask).remainder(2.0)
+        new_synd = (syndrome[unconv].unsqueeze(1) + shift).remainder(2.0)  # [U, C, M]
+        M = new_synd.size(2)
+
+        # one batched BP over all U*C trials
+        llr_batch = llr0[unconv].unsqueeze(1).expand(U, C, N).reshape(U * C, N)
+        e_r, l_r, conv_r, _, _ = self._bp_core(
+            new_synd.reshape(U * C, M), llr_batch, track_osc=False
         )
-        ranked = torch.argsort(osc[unconv], dim=1, descending=True)[:, :topk]
-        topk_full[unconv] = ranked
+        e_r = e_r.view(U, C, N)
+        l_r = l_r.view(U, C, N)
+        conv_r = conv_r.view(U, C)
 
-        # build the (weight-ordered) list of candidate-slot combinations to try
-        all_combos = []
-        for w in range(self.w_min, self.w_max + 1):
-            for slots in sample_n_choose_k(range(topk), w, self.n_sample):
-                all_combos.append((w, list(slots)))
+        # pick the lowest-indexed converging combo per sample (first-break semantics)
+        order = torch.arange(C, device=self.device)
+        sel = (conv_r.to(torch.long) * (C - order)).argmax(dim=1)  # [U]
+        has = conv_r.bool().any(dim=1)  # [U]
 
-        remaining = unconv.clone()  # global batch indices still unsolved
-        for w, slots in all_combos:
-            if remaining.numel() == 0:
-                break
+        u_idx = torch.arange(U, device=self.device)
+        chosen_e = e_r[u_idx, sel]  # [U, N]
+        chosen_l = l_r[u_idx, sel]  # [U, N] (never flipped, mirrors the loop)
 
-            cand = topk_full[remaining]  # [R, topk]
-            if w == 0:
-                new_synd = syndrome[remaining]
-                test_bits = None
-            else:
-                test_bits = cand[:, slots]  # [R, w] actual bit indices
-                # syndrome shift = parity of the selected columns: [R, M]
-                shift = (
-                    self.H_dense[:, test_bits].sum(dim=2).remainder(2.0).transpose(0, 1)
-                )
-                new_synd = (syndrome[remaining] + shift).remainder(2.0)
+        # flip the winning combo's candidate bits back in the estimate
+        row_flip = torch.zeros([U, N], dtype=self.dtype, device=self.device)
+        row_flip.scatter_(1, cand, combo_mask[sel])
+        chosen_e = torch.where(row_flip > 0, 1.0 - chosen_e, chosen_e)
 
-            e_r, l_r, conv_r, _, _ = self._bp_core(
-                new_synd, llr0[remaining], track_osc=False
-            )
-
-            if test_bits is not None:
-                # flip the candidate bits back in the estimate
-                rows = torch.arange(e_r.size(0), device=self.device).unsqueeze(1)
-                e_r[rows, test_bits] = 1.0 - e_r[rows, test_bits]
-
-            solved = conv_r.bool()
-            if solved.any():
-                g = remaining[solved]
-                e_out[g] = e_r[solved]
-                l_out[g] = l_r[solved]
-                converges[g] = 1
-                # num_iters keeps the pass-1 BP cost (== max_iter for these samples);
-                # the SF retry is post-processing, so it is not counted as BP iterations
-                # (its cost shows up in wall-clock time, not the iteration histogram).
-                remaining = remaining[~solved]
+        # num_iters keeps the pass-1 BP cost (== max_iter for these samples); the SF
+        # retry is post-processing, so it is not counted as BP iterations (its cost
+        # shows up in wall-clock time, not the iteration histogram).
+        g = unconv[has]
+        e_out[g] = chosen_e[has]
+        l_out[g] = chosen_l[has]
+        converges[g] = 1
 
     # ------------------------------------------------------------------ #
     # BP message-passing primitives (identical to bp_norm_min_sum)

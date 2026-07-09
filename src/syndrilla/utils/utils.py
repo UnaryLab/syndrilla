@@ -326,30 +326,6 @@ def call_func_from_yaml(yaml_path: str=None, header: str=None, func_name: str=No
     return module_py.create(load_cfg, **kwargs)
 
 
-def call_func_from_yaml(yaml_path: str=None, header: str=None, func_name: str=None, py_path: str=None, **kwargs):
-    full_path = get_path(yaml_path)
-    load_cfg = read_yaml(full_path)
-
-    # check yaml header
-    check_yaml_header(load_cfg, header, full_path)
-
-    # get config
-    load_cfg = load_cfg[header]
-
-    # func_name has to be specified
-    check_yaml_cfg(load_cfg, func_name, full_path)
-    func = load_cfg[func_name].lower()
-
-    # find proper func_name to create the header
-    dst_file = os.path.join(py_path, func, func + '.py')
-    spec = importlib.util.spec_from_file_location(f'create_{header}_with_{func}', dst_file)
-    module_py = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module_py
-    spec.loader.exec_module(module_py)
-
-    return module_py.create(load_cfg, **kwargs)
-
-
 def call_func_from_cfg(cfg: dict, header: str, func_name: str, py_path: str, **kwargs):
     check_yaml_cfg(cfg, func_name, "<in-memory>")
     func = cfg[func_name].lower()

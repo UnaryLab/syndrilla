@@ -90,7 +90,6 @@ class create():
             
             for _ in range(m):
                 neighbors = list(map(int, f.readline().split()))
-                # print(neighbors)
                 neighbors = [r for r in neighbors if r != 0]
                 col_neighbors.append(neighbors)
 
@@ -98,7 +97,6 @@ class create():
         
         # Use the column neighbor lists to fill the matrix.
         for j, neighbors in enumerate(col_neighbors):
-            # print(f'j = {j}, neighbors = {neighbors}')
             for r in neighbors:
                 matrix[j, r-1] = 1
         
