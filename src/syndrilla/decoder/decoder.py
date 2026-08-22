@@ -257,21 +257,45 @@ class RoundFlattenWrapper(torch.nn.Module):
 # a decoder silently falling back to max_iter=50 instead of the configured 181 still
 # produces numbers, and they look like results.
 MOVED_TO_CONFIG = (
-    "max_iter", "damping_factor", "max_b_iter", "random_machine",
-    "sign_flip_policy", "int_width", "frac_width", "sf",
-    "mp_min_batch", "num_workers",
+    "max_iter",
+    "damping_factor",
+    "max_b_iter",
+    "random_machine",
+    "sign_flip_policy",
+    "int_width",
+    "frac_width",
+    "sf",
+    "mp_min_batch",
+    "num_workers",
     # saq's blocks, and the weights only a learned decoder loads
-    "model", "cpnd", "optimizer", "train", "checkpoint",
+    "model",
+    "cpnd",
+    "optimizer",
+    "train",
+    "checkpoint",
     # relay_bp's schedule
-    "legs", "iteration_initial", "iteration_count", "solution",
-    "init_mem_strength", "center", "width", "alpha", "alpha_scaling", "type",
+    "legs",
+    "iteration_initial",
+    "iteration_count",
+    "solution",
+    "init_mem_strength",
+    "center",
+    "width",
+    "alpha",
+    "alpha_scaling",
+    "type",
 )
 
 # The other half of the same rule: these stay at the top of the block, so a `config`
 # entry that carries one is rejected too. Each key keeps exactly one home.
 SHARED_KEYS = (
-    "algorithm", "check_type", "dtype", "device", "force_pytorch",
-    "rebatch_speedup", "config",
+    "algorithm",
+    "check_type",
+    "dtype",
+    "device",
+    "force_pytorch",
+    "rebatch_speedup",
+    "config",
 )
 
 
@@ -354,6 +378,26 @@ TRAINABLE_STAGES = (
 def is_trainable(decoder):
     """True if `decoder` implements the whole training protocol."""
     return all(hasattr(decoder, stage) for stage in TRAINABLE_STAGES)
+
+
+def assert_trainable(decoders):
+    """Raise unless the chain's last decoder implements the whole training protocol.
+
+    `-t` drives the chain's last stage, so that is the decoder a run updates: a stage
+    after it would leave the run learning from output its gradient never passed
+    through. Checked once, before any batch, so an untrainable chain stops the run
+    rather than half-running it.
+    """
+    tail = decoders[-1]
+    inner = getattr(tail, "decoder", tail)
+    if is_trainable(inner):
+        return
+    missing = [stage for stage in TRAINABLE_STAGES if not hasattr(inner, stage)]
+    raise ValueError(
+        f'Decoder <{getattr(tail, "algo", type(inner).__name__)}> cannot train: it '
+        f'implements none of <{", ".join(missing)}>. `-t` trains the last entry of '
+        f"`decoder.algorithm`, so that entry has to be a trainable decoder."
+    )
 
 
 def resolve_configs(dec_cfg: dict, source: str = "dict"):

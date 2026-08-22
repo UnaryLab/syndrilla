@@ -164,8 +164,9 @@ def main():
 
     if args.train:
         # the schedule sits under the trained decoder's `config` entry, so it is read
-        # through the loader's resolver rather than off the raw block
-        trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[0]
+        # through the loader's resolver rather than off the raw block. `-t` trains the
+        # chain's last stage, so it is that entry's block the schedule comes from.
+        trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[-1]
         train_metrics = TrainMetrics.from_cfg(
             trained_cfg.get("train"), args.run_dir, args.decoder_yaml
         )
@@ -222,7 +223,7 @@ def main():
         syndrome_generator = create_syndrome(args.syndrome_yaml)
 
         if args.train:
-            loss_fn = create_loss(args.loss_yaml, decoder=decoders[0])
+            loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
 
         logger.success(
             f"\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
@@ -263,6 +264,8 @@ def main():
     num_err = 0
 
     inner0 = getattr(decoders[0], "decoder", decoders[0])
+    # the trained stage is the chain's last one; on a single-decoder chain it is inner0
+    trainee = getattr(decoders[-1], "decoder", decoders[-1])
     cap_on = getattr(inner0, "cap", None) is not None
     if cap_on and getattr(syndrome_generator, "rounds", 1) != 1:
         logger.warning("rebatch_speedup supports rounds==1 only; disabling the cap.")
@@ -274,16 +277,16 @@ def main():
 
     if args.train:
         assert_trainable(decoders)
-        inner0.check_train_batch(error_model.rounds, error_model.number_channel)
+        trainee.check_train_batch(error_model.rounds, error_model.number_channel)
         num_batches = train_metrics.begin_run(
-            inner0,
+            trainee,
             args.batch_size,
             args.train_checkpoint,
             decoder_device,
             error_model.rate,
         )
-        inner0.set_training(train_metrics.begin_batch(num_batches))
-        train_lr = inner0.current_lr()
+        trainee.set_training(train_metrics.begin_batch(num_batches))
+        train_lr = trainee.current_lr()
     else:
         metrics, num_err, num_batches = MetricState.begin_run(
             args.checkpoint_yaml,
@@ -356,21 +359,23 @@ def main():
                 start_time = time.time()
                 io_dict = decoders[decoder_idx](io_dict)
 
-                if args.train and decoder_idx == num_batches - 1:
+                # the trained stage is the chain's last one, so the loss is read off the
+                # output of that stage, after every earlier stage has run
+                if args.train and decoder_idx == num_decoders - 1:
                     training = train_metrics.is_training(num_batches - 1)
                     terms = loss_fn.terms(io_dict, err)
                     total = loss_fn.combine(*terms)
                     if training:
-                        inner0.backward(total)
-                        inner0.update()
+                        trainee.backward(total)
+                        trainee.update()
                     train_metrics.accumulate(
                         training, (total, *terms), loss_fn.class_error(io_dict, err)
                     )
                     if train_metrics.epoch_done(num_batches):
-                        inner0.lr_step()
+                        trainee.lr_step()
                         train_metrics.record_epoch(train_lr)
-                        train_lr = inner0.current_lr()
-                    inner0.set_training(train_metrics.begin_batch(num_batches))
+                        train_lr = trainee.current_lr()
+                    trainee.set_training(train_metrics.begin_batch(num_batches))
                     break
                 elapsed = time.time() - start_time
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
