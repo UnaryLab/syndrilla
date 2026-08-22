@@ -464,9 +464,7 @@ def test_cpnd_weights_use_signed_llr_magnitudes():
 
 def test_cpnd_can_be_disabled():
     """`cpnd: false` must skip the stage and its precompute entirely."""
-    decoder, saq = _make_decoder(
-        SURFACE_MATRIX_YAML, cpnd={"enable": False}
-    )
+    decoder, saq = _make_decoder(SURFACE_MATRIX_YAML, cpnd={"enable": False})
     decoder.eval()
     assert not saq.use_cpnd
     assert not hasattr(saq, "cpnd_supports")
@@ -487,9 +485,7 @@ def test_checkpoint_round_trip(tmp_path):
     path = tmp_path / "saq.pt"
     torch.save(saq.state_dict(), path)
 
-    reloaded, saq2 = _make_decoder(
-        SURFACE_MATRIX_YAML, checkpoint=str(path)
-    )
+    reloaded, saq2 = _make_decoder(SURFACE_MATRIX_YAML, checkpoint=str(path))
     reloaded.eval()
     assert torch.allclose(
         reloaded(_io_dict(saq2, synd, H))["llr"], reference, atol=1e-6
@@ -898,20 +894,20 @@ def test_resume_continues_optimizer_and_schedule(tmp_path):
 
 
 def test_train_metrics_hand_over_epoch_best_and_history(tmp_path):
-    """`TrainMetrics` must export the run position it owns, and take it back.
+    """The training half of `MetricState` must export the run position it owns, and take it back.
 
     This is the half of `last.pt` the decoder does not own: which epoch is next,
     which was best, and the history so far. `main.py`'s resume calls exactly these.
     """
-    from syndrilla.metric import TrainMetrics
+    from syndrilla.metric import MetricState
 
     cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 0}
-    metrics = TrainMetrics(str(tmp_path), cfg)
+    metrics = MetricState.for_training(str(tmp_path), cfg)
     metrics.epoch = 3
     metrics.best = 0.25
     metrics.history = [{"epoch": 1}, {"epoch": 2}]
 
-    restored = TrainMetrics(str(tmp_path), cfg)
+    restored = MetricState.for_training(str(tmp_path), cfg)
     restored.load_train_state(metrics.train_state())
 
     assert restored.epoch == 3
@@ -933,10 +929,10 @@ def test_every_epoch_trains_on_the_same_batches(tmp_path):
     With errors generated per batch, an unseeded stream would hand the model new noise
     every epoch. Pinning the training seed makes the training set finite and repeatable.
     """
-    from syndrilla.metric import TrainMetrics
+    from syndrilla.metric import MetricState
 
     cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = TrainMetrics(str(tmp_path), cfg)
+    metrics = MetricState.for_training(str(tmp_path), cfg)
 
     first = _sequence(metrics, 0)  # epoch 1, first training batch
     metrics.epoch = 3
@@ -947,10 +943,10 @@ def test_every_epoch_trains_on_the_same_batches(tmp_path):
 
 def test_validation_draws_new_errors_each_epoch(tmp_path):
     """Validation is not the training set replayed, and not the same twice."""
-    from syndrilla.metric import TrainMetrics
+    from syndrilla.metric import MetricState
 
     cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = TrainMetrics(str(tmp_path), cfg)
+    metrics = MetricState.for_training(str(tmp_path), cfg)
 
     metrics.epoch = 1
     val_1 = _sequence(metrics, cfg["batches_per_epoch"])
@@ -964,23 +960,54 @@ def test_validation_draws_new_errors_each_epoch(tmp_path):
 
 def test_begin_batch_reports_the_phase(tmp_path):
     """Seeding must not disturb which batches count as training."""
-    from syndrilla.metric import TrainMetrics
+    from syndrilla.metric import MetricState
 
     cfg = {"epochs": 2, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = TrainMetrics(str(tmp_path), cfg)
+    metrics = MetricState.for_training(str(tmp_path), cfg)
 
     phases = [metrics.begin_batch(i) for i in range(metrics.period * 2)]
 
-    assert phases == [True, True, False, True, True, False]
+    assert phases == ["train", "train", "val", "train", "train", "val"]
+    # the phase it returns is the phase it is left in, so a caller can read it back
+    # instead of asking the schedule a second time
+    assert metrics.phase == "val"
+
+
+def test_begin_batch_puts_the_decoder_in_the_phase_it_opened(tmp_path):
+    """The phase the metrics pick and the mode the decoder runs in are one decision.
+
+    A validation batch that still built a graph, or a training batch that did not,
+    would train on the wrong set while reporting the right one, so `begin_batch` moves
+    the bound decoder itself rather than leaving each caller to pair the two.
+    """
+    from syndrilla.metric import MetricState
+
+    class _Decoder:
+        training = None
+
+        def set_training(self, training):
+            self.training = training
+
+    cfg = {"epochs": 2, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
+    metrics = MetricState.for_training(str(tmp_path), cfg)
+    decoder = _Decoder()
+    metrics.bind_decoder(decoder, fingerprint={})
+
+    modes = []
+    for i in range(metrics.period):
+        metrics.begin_batch(i)
+        modes.append(decoder.training)
+
+    assert modes == [True, True, False]
 
 
 def test_neighbouring_run_seeds_do_not_share_streams(tmp_path):
     """`seed` and `seed + 1` must not produce the same training set."""
-    from syndrilla.metric import TrainMetrics
+    from syndrilla.metric import MetricState
 
     def train_draw(seed):
         cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": seed}
-        return _sequence(TrainMetrics(str(tmp_path), cfg), 0)
+        return _sequence(MetricState.for_training(str(tmp_path), cfg), 0)
 
     assert not torch.equal(train_draw(7), train_draw(8))
 
@@ -1132,9 +1159,7 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     assert json.loads((resumed_dir / "history.json").read_text()) == json.loads(
         (straight_dir / "history.json").read_text()
     )
-    expected = torch.load(
-        straight_dir / LAST_PT, map_location="cpu", weights_only=True
-    )
+    expected = torch.load(straight_dir / LAST_PT, map_location="cpu", weights_only=True)
     actual = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
     for key, value in expected["state_dict"].items():
         assert torch.equal(actual["state_dict"][key], value), key
@@ -1293,11 +1318,11 @@ def test_train_cli_reports_the_decoders_own_batch_constraint(tmp_path):
 def test_decoder_describes_itself_in_the_resume_fingerprint(tmp_path):
     """The model half of the fingerprint must come from the decoder, not the metrics.
 
-    `TrainMetrics` owns the schedule and the batch size; what algorithm this is, what
+    `MetricState` owns the schedule and the batch size; what algorithm this is, what
     code shape it was built for, and what optimizer settings it will use are the
     decoder's to state. The metrics merge the two rather than reaching into the model.
     """
-    from syndrilla.metric import TrainMetrics
+    from syndrilla.metric import MetricState
 
     _, saq = _make_decoder(SURFACE_MATRIX_YAML)
     model = saq.train_fingerprint()
@@ -1312,7 +1337,9 @@ def test_decoder_describes_itself_in_the_resume_fingerprint(tmp_path):
     }
 
     cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 0}
-    merged = TrainMetrics(str(tmp_path), cfg).fingerprint(saq, batch_size=16)
+    merged = MetricState.for_training(str(tmp_path), cfg).fingerprint(
+        saq, batch_size=16
+    )
     # every model key survives the merge, and the schedule half is added to it
     assert merged.items() >= model.items()
     assert merged["batch_size"] == 16
@@ -1323,7 +1350,7 @@ def test_decoder_describes_itself_in_the_resume_fingerprint(tmp_path):
 # Config layout
 #
 # The decoder yaml is grouped so each block has exactly one reader: `model` and
-# `cpnd` and `optimizer` are the decoder's, `train` is TrainMetrics'. Nothing
+# `cpnd` and `optimizer` are the decoder's, `train` is the metrics'. Nothing
 # reaches across, which is what these tests pin.
 # --------------------------------------------------------------------------- #
 
@@ -1362,9 +1389,7 @@ def test_training_mode_turns_cpnd_off_in_the_decoder():
     assert trained.use_cpnd is False
     assert not hasattr(trained, "cpnd_supports")  # precompute skipped entirely
 
-    _, decoded = _make_decoder(
-        SURFACE_MATRIX_YAML, cpnd={"enable": True}
-    )
+    _, decoded = _make_decoder(SURFACE_MATRIX_YAML, cpnd={"enable": True})
     assert decoded.use_cpnd is True and hasattr(decoded, "cpnd_supports")
 
 
