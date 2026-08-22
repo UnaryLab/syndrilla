@@ -1,0 +1,8 @@
+error:
+  model: bsc_train
+  number_channel: 1
+  device:
+    device_type: cpu
+    device_idx: 0
+  rate: [0.01, 0.20]
+  rate_points: 9

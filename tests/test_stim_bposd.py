@@ -36,9 +36,9 @@ def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
         decoder_cfg={
             'algorithm': ['bp_norm_min_sum', 'osd_0'],
             'check_type': 'hx',
-            'max_iter': max_iter,
             'dtype': 'float64',
             'device': {'device_type': 'cpu', 'device_idx': 0},
+            'config': [{'max_iter': max_iter}],  # osd_0 configures nothing
         },
     )
 

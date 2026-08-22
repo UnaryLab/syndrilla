@@ -23,9 +23,9 @@ def _setup(distance=DISTANCE):
     dec_cfg = {
         'algorithm': ['bp_lottery'],
         'check_type': 'hx',
-        'max_iter': 10,
         'dtype': 'float64',
         'device': {'device_type': 'cpu', 'device_idx': 0},
+        'config': [{'max_iter': 10}],
     }
     mat_cfg = {
         'parity_matrix_hx': {'file_type': 'alist', 'path': f'{SURFACE_DIR}/surface_{distance}_hx.alist'},

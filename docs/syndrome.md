@@ -26,18 +26,18 @@ An example syndrome configuration file using the phenomenological model is provi
 ```
 syndrome:
   measure: phenomenological
-  rounds: 3
-  measurement_error_rate: 0.01
+  rounds: 10
+  measurement_error_rate: 0.05
 ```
 
 The following table details the configuration parameters used in the phenomenological syndrome YAML file.
 | Key                              | Description                                                                                         | Example            |
 |----------------------------------|-----------------------------------------------------------------------------------------------------|--------------------|
 | `syndrome.measure`               | Model for syndrome measurement                                                                      | `phenomenological` |
-| `syndrome.rounds`              | Number of syndrome rounds replicated from the true syndrome                                         | `3`                |
-| `syndrome.measurement_error_rate`| Per-bit bit-flip probability applied independently to each round                                    | `0.01`             |
+| `syndrome.rounds`              | Number of syndrome measurement rounds; each is measured from that round's own error, defaults to `1` | `10`               |
+| `syndrome.measurement_error_rate`| Per-bit bit-flip probability applied independently to each round, defaults to `0.0`                 | `0.05`             |
 
-When `rounds > 1`, the BSC error model emits a per-round error tensor `[B, rounds, N]` whose data flips are **cumulative** across rounds (a flipped qubit stays flipped — see [error.md](error.md) §1). `rounds` is read from this syndrome config and propagated to the error model (`error_model.rounds`), so it sets the round count for the whole pipeline.
+When `rounds > 1`, the BSC error model emits a per-round error tensor `[B, rounds, N]` whose data flips are **cumulative** across rounds (see [error.md](error.md) §1). `rounds` is read from this syndrome config and propagated to the error model as `error_model.rounds`, but only `bsc` in 1-channel mode acts on it: `bsc_train` rejects `rounds > 1`, and `depol` and `stim_circuit` have no round handling, so the value is set and ignored. Pairing `rounds > 1` with any of those leaves the error model 2-D while the measurer expects a rounds axis.
 
 The measurer then:
 - For a per-round `[B, rounds, N]` error: computes the noiseless per-round syndrome `H · e_t (mod 2)` for each round directly (no replication — every round already carries its own accumulated data error), then independently flips each measured bit with probability `measurement_error_rate`, producing `[B, rounds, M]`.
@@ -49,21 +49,23 @@ The noiseless per-round syndrome is stored in `syndrome_actual` for analysis (un
 Because a flipped syndrome bit is statistically indistinguishable from an extra data flip, the measurer also exposes `adjust_llr0(llr0)`, which the pipeline calls to fold the measurement-error rate `q` into the per-data-qubit channel prior before decoding. It inflates the data-error probability `p` (recovered from `llr0 = log((1 - p)/p)`) to the effective `p_eff = p + q − 2·p·q` and rebuilds the prior. This keeps the decoder's prior physically consistent with the noisy syndromes; a zero rate leaves `llr0` untouched.
 
 ## 3. Stim model
-The stim syndrome measurer samples syndromes (and observable flips) directly from a stim circuit's detector error model. Used together with the stim interface, error model, and matrix loader (see [interface.md](interface.md)).
+The stim syndrome measurer samples syndromes (and observable flips) directly from the compiled stim circuit; it is the matrix loader and the stim error model that read the circuit's detector error model. Used together with the stim interface, error model, and matrix loader (see [interface.md](interface.md)).
 An example syndrome configuration file using the stim model is provided in ```stim_generated.syndrome.yaml```:
 
 ```
 syndrome:
   measure: stim
-  rounds: 1
-  measurement_error_rate: 0.01
+  rounds: 3
+  measurement_error_rate: 0.1
 ```
 
 The following table details the configuration parameters used in the stim syndrome YAML file.
 | Key                                | Description                                                                                                            | Example  |
 |------------------------------------|------------------------------------------------------------------------------------------------------------------------|----------|
 | `syndrome.measure`                 | Model for syndrome measurement                                                                                          | `stim`   |
-| `syndrome.rounds`                | Number of QEC rounds in the generated stim circuit and syndrome samples taken per error instance                       | `1`      |
-| `syndrome.measurement_error_rate`  | Per-measurement bit-flip probability. Forwarded to `before_measure_flip_probability` when the stim circuit is generated | `0.01`   |
+| `syndrome.rounds`                | Number of QEC rounds baked into the generated stim circuit                                                             | `3`      |
+| `syndrome.measurement_error_rate`  | Per-measurement bit-flip probability. Forwarded to `before_measure_flip_probability` when the stim circuit is generated | `0.1`    |
 
-The stim interface assembles the circuit from `interface.yaml` (`code`, `distance`), `syndrome.yaml` (`rounds` → stim `rounds`, `measurement_error_rate` → `before_measure_flip_probability`), and `error.yaml` (the four `after_*`/`before_*` noise rates; see [error.md](error.md) §3). When both `syndrome.measurement_error_rate` and `error.before_measure_flip_probability` are set, the syndrome value wins and a warning is logged. The decoder's DEM-derived LLR priors automatically reflect whichever rate ends up in the circuit, so the decoder remains physically consistent with the sampled syndromes.
+Unlike the phenomenological measurer, this one produces **no rounds axis**. The generated circuit's detectors already span every round, so one shot is taken per batch element and the syndrome is always `[B, num_detectors]`, with `observable_flips` at `[B, num_observables]`, whatever `rounds` is set to. The measurer therefore stores the value as `qec_rounds` rather than `rounds`, which keeps the rest of the pipeline, including `error_model.rounds`, on a round count of 1.
+
+The stim interface assembles the circuit from `interface.yaml` (`code`, `distance`), `syndrome.yaml` (`rounds` → stim `rounds`, `measurement_error_rate` → `before_measure_flip_probability`), and `error.yaml` (the four `after_*`/`before_*` noise rates; see [error.md](error.md) §4). When both `syndrome.measurement_error_rate` and `error.before_measure_flip_probability` are set, the syndrome value wins and a warning is logged. The decoder's DEM-derived LLR priors automatically reflect whichever rate ends up in the circuit, so the decoder remains physically consistent with the sampled syndromes.

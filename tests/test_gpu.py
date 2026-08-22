@@ -14,7 +14,6 @@ from syndrilla.syndrome import create_syndrome
 from syndrilla.metric import report_metric, save_metric, MetricState, BatchTracker
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.vote import create_vote
 from syndrilla.utils import read_yaml, get_path, parse_device_dtype
 
 
@@ -33,7 +32,7 @@ def get_gpu_memory_utilization(gpu_index=0):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA not available')
 def test_batch_alist_hx(batch_size=1000, target_error=1000,
-                        run_dir='tests/test_outputs', vote_stage='syndrome'):
+                        run_dir='tests/test_outputs'):
     decoder_yaml = 'examples/alist/bposd_hx.decoder.yaml'
     matrix_yaml = 'examples/alist/surface_10.matrix.yaml'
 
@@ -45,8 +44,6 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
     error_model = create_error_model(yaml_path='examples/alist/bsc.error.yaml')
     syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
     logical_check = create_check(yaml_path='examples/alist/lx.check.yaml')
-    voter = create_vote(cfg={'method': 'majority_vote'})
-
     num_decoders = len(decoders)
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
@@ -80,10 +77,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
 
-            rounds = getattr(syndrome_generator, 'rounds', 1)
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, rounds=rounds,
-                               vote_stage=vote_stage, current_stage='syndrome')
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
 
@@ -96,15 +90,6 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 for k, v in gpu_stats.items():
                     logger.info(f'GPU decoder_{decoder_idx} {k}: {v}')
 
-                decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds,
-                                             vote_stage=vote_stage, current_stage=decoder_stage)
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds,
-                                              vote_stage=vote_stage, current_stage=decoder_stage)
-                for key in ('llr', 'converge', 'iter'):
-                    if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds,
-                                                          vote_stage=vote_stage, current_stage=decoder_stage)
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
 
             has_obs_flips = hasattr(syndrome_generator, 'observable_flips') and syndrome_generator.observable_flips is not None

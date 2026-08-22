@@ -1,9 +1,10 @@
 decoder:
   algorithm: bp_lottery
   check_type: hz
-  max_iter: 181
   dtype: float64
-  random_machine: sobol
   device:
     device_type: cuda
     device_idx: 0
+  config:
+    max_iter: 181
+    random_machine: sobol

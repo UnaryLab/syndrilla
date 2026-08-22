@@ -9,7 +9,7 @@ def modify_yaml(file_path, changes):
     """
     Load a YAML file, apply the given changes, and write them back.
     changes is a dict like:
-        { 'decoder.int_width': 3, 'decoder.frac_width': 4 }
+        { 'decoder.config.int_width': 3, 'decoder.config.frac_width': 4 }
     """
     with open(file_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -53,8 +53,8 @@ def main(batch_size, target_error):
                 modify_yaml(
                     file_path=decoder_yaml,
                     changes={
-                        'decoder.int_width':  int_w,
-                        'decoder.frac_width': frac_w
+                        'decoder.config.int_width':  int_w,
+                        'decoder.config.frac_width': frac_w
                     }
                 )
 

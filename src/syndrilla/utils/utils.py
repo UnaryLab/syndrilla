@@ -245,21 +245,6 @@ def get_path(path):
     return path
 
 
-def majority_vote(tensor, dim=1):
-    """
-    Majority vote along the given dimension (typically the rounds dimension).
-
-    Args:
-        tensor: [..., d, ...] binary tensor with d rounds along `dim`
-        dim:    dimension to vote over (default 1 for [B, d, M])
-
-    Returns:
-        voted tensor with `dim` collapsed: [..., ...]
-        Each element is 1 if more than half the rounds had 1, else 0.
-    """
-    return (tensor.sum(dim=dim) > tensor.size(dim) / 2).to(tensor.dtype)
-
-
 def save_metrics_to_csv(csv_path, row_dict, fieldnames):
     """
     Save one row of metrics to a CSV file. Creates a new file with a header

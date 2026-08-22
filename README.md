@@ -15,6 +15,7 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
     - [Option 2: source installation](#option-2-source-installation)
   - [Basic usage](#basic-usage)
     - [1. Run with command line arguments](#1-run-with-command-line-arguments)
+      - [Training a learned decoder (`-t`)](#training-a-learned-decoder--t)
     - [2. Input format and configurations](#2-input-format-and-configurations)
       - [2.1. Error module](#21-error-module)
       - [2.2. Syndrome module](#22-syndrome-module)
@@ -22,8 +23,7 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
       - [2.4. Decoder module](#24-decoder-module)
       - [2.5. Logical check module](#25-logical-check-module)
       - [2.6. Interface module](#26-interface-module)
-      - [2.7. Vote module](#27-vote-module)
-      - [2.8. Metric module](#28-metric-module)
+      - [2.7. Metric module](#27-metric-module)
     - [3. Output format and metrics](#3-output-format-and-metrics)
       - [3.1. Per-decoder metrics](#31-per-decoder-metrics)
       - [3.2. Final metrics](#32-final-metrics)
@@ -56,7 +56,7 @@ Make sure you have [Anaconda](https://www.anaconda.com/) installed before the st
 ### Option 1: pip installation
 1. ```git clone``` [this repo](https://github.com/UnaryLab/syndrilla) and ```cd``` to the repo dir.
 2. ```conda env create -f environment.yaml```
-   - The ```name: syndrilla``` in ```evironment.yaml``` can be updated to a preferred one.
+   - The ```name: syndrilla``` in ```environment.yaml``` can be updated to a preferred one.
 3. ```conda activate syndrilla```
 4. ```pip install syndrilla```
 5. Validate installation via ```syndrilla -h``` in the command line or ```import syndrilla``` in python code
@@ -66,7 +66,7 @@ Make sure you have [Anaconda](https://www.anaconda.com/) installed before the st
 This is the developer mode, where you can edit the source code with live changes reflected for simulation.
 1. ```git clone``` [this repo](https://github.com/UnaryLab/syndrilla) and ```cd``` to the repo dir.
 2. ```conda env create -f environment.yaml```
-   - The ```name: syndrilla``` in ```evironment.yaml``` can be updated to a preferred one.
+   - The ```name: syndrilla``` in ```environment.yaml``` can be updated to a preferred one.
 3. ```conda activate syndrilla```
 4. ```python3 -m pip install -e . --no-deps```
 5. Validate installation via ```syndrilla -h``` in the command line or ```import syndrilla``` in python code
@@ -98,10 +98,43 @@ Following is a table for detailed explaination on each command line arguments:
 | `-c`     | Path to check matrix YAML file               | `-c=examples/alist/lx.check.yaml`                 |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/alist/perfect.syndrome.yaml`         |
 | `-m`     | Path to matrix YAML file                     | `-m=examples/alist/surface_10.matrix.yaml`        |
-| `-ckpt`  | Path to checkpoint YAML file to resume | `-ckpt=result_phy_err_0.01.yaml`                  |
+| `-i`     | Path to interface YAML file, replacing `-m`/`-e`/`-s`/`-c` | `-i=examples/stim/stim_generated.interface.yaml` |
+| `-ckpt`  | Path to checkpoint YAML file to resume | `-ckpt=tests/test_outputs/result_phy_err_0.1.yaml` |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
 | `-te`    | Total number of errors to stop decoding      | `-te=1000`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
+| `-t`     | Train the decoder instead of decoding        | `-t`                                              |
+| `-ls`    | Path to loss YAML file                       | `-ls=examples/alist/logical_centric.loss.yaml`    |
+| `-tckpt` | Path to a run's `*_last.pt`, to resume training | `-tckpt=runs/saq_hx/saq_hx_d5_last.pt` |
+
+#### Training a learned decoder (`-t`)
+
+Learned decoders (currently `saq`) need trained weights. `-t` trains the decoder given by `-d` and writes two checkpoints into `-r`, named after the configuration that produced them (`<algorithm>_<check_type>_<distance>`), so two configurations in one run directory do not overwrite each other:
+
+```command
+syndrilla -t
+          -r=runs/saq_surface_5
+          -d=examples/alist/saq_hx.decoder.yaml
+          -m=examples/alist/surface_5.matrix.yaml
+          -e=examples/alist/bsc_train.error.yaml
+          -s=examples/alist/perfect.syndrome.yaml
+          -ls=examples/alist/logical_centric.loss.yaml
+          -bs=256
+```
+
+Then point the decoder YAML's `config.checkpoint` key at `runs/saq_hx/saq_hx_d5.pt` and run the normal command above to evaluate.
+
+**Resuming an interrupted run (`-tckpt`).** The `*_last.pt` file is rewritten at every epoch boundary and holds the whole training state: weights, Adam's moments, the cosine schedule's position, the epoch counter, the best score so far, the history, and the generator state. The error stream is reseeded at each phase boundary from the run's `seed`: the training phase gets the same seed every epoch, so training runs on a fixed set of batches, while validation gets a fresh one each epoch. Either way a batch's errors depend on where the run is, not on how it got there. Add `-tckpt` to the same command to continue from it, leaving every other flag as it was:
+
+```command
+syndrilla -t -tckpt=runs/saq_hx/saq_hx_d5_last.pt
+          -r=runs/saq_surface_5
+          ... the same -d, -m, -e, -s, -ls and -bs as above
+```
+
+The run continues exactly where it stopped, not from a warm start: a run interrupted after epoch 20 and resumed finishes with the same weights a 100-epoch run would have reached uninterrupted. Because that guarantee depends on the settings being unchanged, the `*_last.pt` file also stores a fingerprint of them (schedule, batch size, code shape, optimizer settings), and resuming with any of them changed fails with a message naming the field rather than silently producing a different run. The plain `<name>.pt` stays a bare `state_dict` for decoding and sharing; only `*_last.pt` carries the extra state, and both still load through the decoder YAML's `config.checkpoint` key.
+
+Training needs `-d`, `-m`, `-e`, `-s` and `-ls`, takes its batch size from `-bs`, and writes into `-r`. It builds no logical check, so `-c` and `-te` are unused, and `-ckpt` resumes a *decode* run and should not be passed alongside `-t` (`-tckpt` is its training counterpart); `-i` is rejected with an error, since training takes the decoder through `-d` rather than an interface. Training hyperparameters come from three files: the decoder YAML holds the optimizer settings (`lr`, `weight_decay`, `min_lr`) under `config.optimizer` and the schedule (`epochs`, `batches_per_epoch`, `val_batches`, `seed`) under `config.train`, the `-ls` YAML holds the loss weights (`lambda_lc`, `lambda_lp`, `lambda_ent`) under its `loss` key, and the error YAML holds the physical error rates, where the training-only `bsc_train` model takes a rate range (`rate: [0.01, 0.20]` with `rate_points: 9`) so one model covers the whole curve. Errors and syndromes come from the same error model and syndrome measurer that decoding uses.
 
 ### 2. Input format and configurations
 <table>
@@ -112,13 +145,13 @@ Following is a table for detailed explaination on each command line arguments:
   </tr>
 </table>
 
-Syndrilla virtualizes the full decoder pipeline of data encoding, syndrome measurement, error decoding into five modules: error, syndrome, decoder, logical check, and metric, as shown in the figure above.
+Syndrilla virtualizes the full decoder pipeline of data encoding, syndrome measurement, and error decoding into modules: error, syndrome, matrix, decoder, logical check, interface, loss, and metric, as shown in the figure above.
 All configurations are defined through YAML files. 
-Each module requires its own dedicated YAML configuration file, with the exception of the metric module.
+Each module requires its own dedicated YAML configuration file, with the exception of the metric module. The loss module is used only for training and is selected with `-ls`.
 
 #### 2.1. Error module
 The error YAML file defines all configuration parameters associated with the error model. 
-It currently supports a 1-channel Binary Symmetric Channel (BSC) error model, as well as 2-channel error models for both depolarizing noise and BSC.
+It currently supports a 1-channel Binary Symmetric Channel (BSC) error model, 2-channel error models for both depolarizing noise and BSC, a training-only swept-rate BSC, and a stim circuit-level model.
 An example error configuration file using the Binary Symmetric Channel (BSC) model is provided in ```bsc.error.yaml```:
 
 ```
@@ -128,17 +161,17 @@ error:
   device: 
     device_type: cpu
     device_idx: 0
-  rate: 0.05
+  rate: 0.1
 ``` 
 
 The following table details the configuration parameters used in the error YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
-| `error.model`     | Type of quantum error model applied to data qubits           | `bsc` or `depol`          |
+| `error.model`     | Type of quantum error model applied to data qubits           | `bsc`, `bsc_train`, `depol` or `stim_circuit` |
 | `error.number_channel`     | The number of error channel applied to quantum circuit           | `1` or `2`                     |
 | `error.device.device_type`       | Type of the device where the error injection will happen                                       | `cpu` or `cuda`                                       |
 | `error.device.device_idx`       | Index of the device where the error injection will happen. This option only works when `device_type = cuda`.                                                        | 0                           |
-| `error.rate`      | Physical error rate                                          | `0.05`                    |
+| `error.rate`      | Physical error rate applied to each data qubit           | `0.05`  |
 
 The following table details all types of error model Syndrilla supports. (Using different error model may need different configuration format, which will be shown on [Error module](docs/error.md).)
 
@@ -146,6 +179,8 @@ The following table details all types of error model Syndrilla supports. (Using 
 |------------------|------------------------------------------------------------|---------------------------------------------------|
 |Binary Symmetric Channel (BSC)|Both 1 and 2                                    | bsc                                               |
 |Depolarizing Channel |2                                                        | depol                                             |
+|BSC with a swept rate (training only)|1                                       | bsc_train                                         |
+|Stim circuit-level model|1                                                    | stim_circuit                                      |
 
 #### 2.2. Syndrome module
 The syndrome YAML file defines all configuration parameters associated with the syndrome measurement.
@@ -223,11 +258,12 @@ An example decoder configuration file is provided in ```bposd_hx.decoder.yaml```
 decoder:
   algorithm: [bp_norm_min_sum, osd_0]
   check_type: hx
-  max_iter: 181
   dtype: float64
   device: 
     device_type: cuda
     device_idx: 0
+  config:
+    - max_iter: 181  # bp_norm_min_sum
 ``` 
 
 The following table details the configuration parameters used in the decoder module YAML file.
@@ -237,14 +273,18 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.check_type`   | Type of parity-check matrix used                                            | `hx` or `hz`                                       |
 | `decoder.device.device_type`       | Type of the device where the decoding will happen                                       | `cpu` or `cuda`                                       |
 | `decoder.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
-| `decoder.max_iter`     | Maximum number of decoding iterations for iterative algorithms              | `181`                                              |
 | `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
+| `decoder.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device                | `false`                                            |
+| `decoder.rebatch_speedup`| (optional) Adaptive batch-shrinking cap; see [Decoder module](docs/decoder.md) | `{kl_eps: 0.001}`                                |
+| `decoder.config`       | Algorithm-specific settings (e.g. `max_iter`, or a learned decoder's `checkpoint`), one entry per entry of `decoder.algorithm` | `- max_iter: 181`             |
 
-When `decoder.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This now covers the full set: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
+The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoder.config`, which is matched to `decoder.algorithm` by position — so `max_iter` above configures `bp_norm_min_sum`, and `osd_0`, which takes no settings of its own, needs no entry at all. A YAML naming a single algorithm can write `config` as a plain mapping instead of a list. Keys left at the old top level are rejected with a message naming the block they moved into. See [Decoder module](docs/decoder.md) for the full rule.
+
+When `decoder.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This covers every registered decoder except `saq`: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
 
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 
-| Error Model                       | #Channel                                          | Example                                            | Reference         |
+| Decoding Algorithm                | #Channel                                          | Example                                            | Reference         |
 |-----------------------------------|-------------------------------------------------------------|----------------------------------------------------|---------------------|
 |Min-Sum Belief Propagation  (Min-Sum BP)| 1                                                           | bp_norm_min_sum                                    | Factor Graphs and the Sum-Product Algorithm |
 |Branch-Assisted Sign-Flipping Belief Propagation (BSFBP) | 1                                     | bp_branch_assisted                                 | Branch-Assisted Sign-Flipping Belief Propagation Decoding for Topological Quantum Codes Based on Hypergraph Product Structure |
@@ -252,6 +292,11 @@ The following table details the different types of decoding algorithms Syndrilla
 |Quaternary Belief Propagation (BP4)| 2                                                           | bp4                                                | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices|
 |Relay Belief Propagation (Relay BP)| 1                                                           | relay_bp                                           | Relay BP: normalized min-sum over multiple legs with disordered per-variable memory (relay-bp crate, `trmue/relay`)|
 |Belief Propagation with Syndrome Flipping (BP-SF)| 1                                               | bp_sf                                              | Fully Parallelized BP Decoding for Quantum LDPC Codes Can Outperform BP-OSD (Dies-Irae/BP-SF)|
+|Quantized Min-Sum BP               | 1                                                           | bp_norm_min_sum_quant                              | Normalized min-sum BP with fixed-point quantized messages|
+|Lottery BP                         | 1                                                           | bp_lottery                                         | Sobol/system-driven sign-flip perturbations on the BP messages|
+|Quantized Lottery BP               | 1                                                           | bp_lottery_quant                                   | Lottery BP with fixed-point quantized messages|
+|Lottery BP with a sign-flip policy | 1                                                           | bp_lottery_policy                                  | Lottery BP with a selectable sign-flip policy|
+|SAQ (learned decoder)              | 1                                                           | saq                                                | SAQ: Stabilizer-Aware Quantum Error Correction Decoder (arXiv:2512.08914); trained with `-t`|
 |Minimum-Weight Perfect Matching (MWPM)| 1                                                     | mwpm                                               | PyMatching v2 sparse-blossom (Higgott & Gidney); graphlike codes only|
 |Union-Find (Delfosse-Nickerson)| 1                                                            | union_find                                         | Almost-linear-time decoding for topological codes (arXiv:1709.06218); graphlike codes only (surface and toric)|
 
@@ -275,24 +320,21 @@ An example configuration file using Stim is provided in ```stim_generated.interf
 ```
 interface:
   backend: stim
-  device:
-    device_type: cpu
-    device_idx: 0
-  dtype: float64
+  code: surface_code:rotated_memory_x
+  distance: 3
 ```
 
-The following table provides a detailed explanation of the configuration parameters used in the check module YAML file.
+The following table provides a detailed explanation of the configuration parameters used in the interface module YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
 | `interface.backend`| The quantum circuit simulator is used            | `stim`                     |
-| `interface.device.device_type`| Type of the device where the output result will be processed           | `cpu` or `cuda`                  |
-| `interface.device.device_idx`| The indice of the device where the output result will be processed           | `0`                     |
-| `interface.dtype`| The data type which the output result will be set as           | `0`                     |
-#### 2.7. Vote module
-This module does not take any YAML file as inputs, it will specified by ```-vs``` option. 
-For example, ```decoder_0``` will do the majority voting on the output result of first decoder.
+| `interface.code`| Stim code family to generate, required unless `interface.circuit` is given | `surface_code:rotated_memory_x` |
+| `interface.distance`| Code distance of the generated circuit, required unless `interface.circuit` is given | `3` |
+| `interface.circuit`| (optional) Inline stim circuit string, or a mapping of generation parameters, used instead of `code`/`distance` | `<stim circuit string>` |
+| `interface.number_channel`| (optional) Fallback channel count when `error.number_channel` is absent | `1` |
 
-#### 2.8. Metric module
+The device and dtype of an interface run come from the **decoder** YAML, not from this file. See [Interface module](docs/interface.md) for the full key list.
+#### 2.7. Metric module
 This module does not take any YAML file as inputs, it will report default metrics as output, which will be described in the output.
 
 ### 3. Output format and metrics
@@ -301,7 +343,7 @@ In the example above, the result YAML file can be found in the ```tests/test_out
 This file includes both the metric results for each decoder and a summary of the full decoding.
 Additionally, the result YAML file is updated every 100 batches, allowing Syndrilla to resume the simulation from the last checkpoint if the error budget was not reached in the previous run.
 
-Example output of running above code:
+Example output of a run like the one above, abridged:
 
 ```
 decoder_0:
@@ -362,6 +404,8 @@ decoder_full:
     logical error rate: 5.78029411764705681e-01
 ```
 
+The block above is abridged: a real result file also carries `sample count` and `iteration count` for every decoder, and its numbers reflect whichever batch size and error rate the run actually used.
+
 #### 3.1. Per-decoder metrics
 Since Syndrilla supports a sequence of decoding algorithms, there are two types of output metrics: (1) per-decoder metrics for each individual decoder, and (2) final metrics after all decoders.
 
@@ -407,17 +451,18 @@ To change the configuration of the simulator, user need to update the YAML files
 For example, if you want to use a different physical error rate, you need to find the input error YAML (e.g., ```examples/alist/bsc.error.yaml```) and update the ```rate``` field.
 
 ### 4. Resume from checkpoint
-If previous run is terminated by accident, the simulation can resume by setting ```-ckpt``` to the checkpoint YAML file, the results of a previous run (e.g., ```tests/test_outputs/result_phy_err_0.01.yaml```).
+If previous run is terminated by accident, the simulation can resume by setting ```-ckpt``` to the checkpoint YAML file, the results of a previous run (e.g., ```tests/test_outputs/result_phy_err_0.1.yaml```). The checkpoint's physical error rate has to match the one in the error YAML, or the run is rejected.
 
 ```command
 syndrilla -r=tests/test_outputs 
           -d=examples/alist/bposd_hx.decoder.yaml 
+          -m=examples/alist/surface_10.matrix.yaml 
           -e=examples/alist/bsc.error.yaml 
           -c=examples/alist/lx.check.yaml 
           -s=examples/alist/perfect.syndrome.yaml 
           -bs=10000 
           -te=1000
-          -ckpt=tests/test_outputs/result_phy_err_0.01.yaml
+          -ckpt=tests/test_outputs/result_phy_err_0.1.yaml
 ```
 
 ### 5. Sweep configurations
@@ -433,13 +478,15 @@ It allows specifying decoder (decoder algorithm), code (code type), probability 
 Below is an example:
 
 ```
-decoder: [bposd]
-code: [surface, toric]
+decoder: [bposd_quant]
+code: [surface]
 probability: [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
-check_type: [hx, hz]
+check_type: [hx]
 distance: [3, 5, 7, 9, 11, 13]
-dtype: ['bfloat16', 'float16', 'float32', 'float64']
+dtype: ['float32']
 ```
+
+This file lives at ```zoo/script/sweeping_configs.yaml```; it ships with the wider alternatives commented out above each line.
 
 *Note that currently supported data format includes ['bfloat16', 'float16', 'float32', 'float64'].*
 
@@ -457,6 +504,7 @@ There are command line arguments to control the script, allowing you to specify 
 | `-r`     | Path to configuration folder                 | `-r=zoo/bposd_sweeping/`                          |
 | `-d`     | Decoder algorithm to run                     | `-d=bposd`                                        |
 | `-bs`    | Number of samples run each batch             | `-bs=10000`                                       |
+| `-st`    | Syndrome type used for the sweep             | `-st=perfect`                                     |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
 
 ## Simulation results

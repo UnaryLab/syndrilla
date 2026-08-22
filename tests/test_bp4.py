@@ -24,6 +24,5 @@ def test_bp4(batch_size=10000, target_error=1000):
     print('STDERR:\n', result.stderr)
 
 
-
 if __name__ == '__main__':
     test_bp4(batch_size=10000, target_error=1000)

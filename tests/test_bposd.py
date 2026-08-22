@@ -10,12 +10,11 @@ from syndrilla.syndrome import create_syndrome
 from syndrilla.metric import report_metric, save_metric, MetricState, BatchTracker
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.vote import create_vote
 from syndrilla.utils import read_yaml, get_path, parse_device_dtype
 
 
 def test_batch_alist_hx(batch_size=1000, target_error=1000,
-                        run_dir='tests/test_outputs', vote_stage=None,
+                        run_dir='tests/test_outputs',
                         log_level='INFO'):
     decoder_yaml = 'examples/alist/bposd_hx.decoder.yaml'
     matrix_yaml = 'examples/alist/surface_11.matrix.yaml'
@@ -49,8 +48,6 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
     num_decoders = len(decoders)
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
-
-    voter = create_vote(cfg={'method': 'majority_vote'})
 
     number_channel = error_model.number_channel
     check_type = decoder_cfg.get('check_type', 'hx')
@@ -91,17 +88,9 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
 
-            rounds = getattr(syndrome_generator, 'rounds', 1)
-            vote_recorded = False
 
             logger.success(f'\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------')
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, rounds=rounds,
-                               vote_stage=vote_stage, current_stage='syndrome')
-            if not vote_recorded and voter.last_sample_count > 0:
-                metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count,
-                                        voter.last_voted_stage, voter.last_rounds)
-                vote_recorded = True
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
 
@@ -111,19 +100,6 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 io_dict = decoders[decoder_idx](io_dict)
                 elapsed = time.time() - start_time
 
-                decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds,
-                                             vote_stage=vote_stage, current_stage=decoder_stage)
-                if not vote_recorded and voter.last_sample_count > 0:
-                    metrics.accumulate_vote(voter.last_match_counts, voter.last_sample_count,
-                                            voter.last_voted_stage, voter.last_rounds)
-                    vote_recorded = True
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds,
-                                              vote_stage=vote_stage, current_stage=decoder_stage)
-                for key in ('llr', 'converge', 'iter'):
-                    if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds,
-                                                          vote_stage=vote_stage, current_stage=decoder_stage)
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
 
             logger.success(f'\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------')
@@ -151,16 +127,14 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 logger.success(f'\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------')
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name)
                 save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                            error_model.rate, num_batches, num_err, H_file_name, check_num,
-                            vote_info=metrics.get_vote_info())
+                            error_model.rate, num_batches, num_err, H_file_name, check_num)
                 logger.success(f'Saved log to <{output_log}>.')
                 logger.success(f'Saved metric results to <{run_dir}>.')
 
     logger.success(f'\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------')
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)
     save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                error_model.rate, num_batches, num_err, H_file_name, check_num, 1,
-                vote_info=metrics.get_vote_info())
+                error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
     logger.success(f'Saved log to <{output_log}>.')
     logger.success(f'Saved metric results to <{run_dir}>.')
 

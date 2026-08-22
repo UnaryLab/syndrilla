@@ -18,8 +18,8 @@ class create():
         # qec_rounds: number of QEC rounds baked into the stim circuit. The
         # circuit's detectors already cover all rounds, so the syndrome output
         # has no separate rounds dimension. Exposed under a different name so
-        # main.py's getattr(syndrome_generator, 'rounds', 1) returns 1 and the
-        # voter doesn't try to majority-vote a non-existent rounds axis.
+        # main.py's getattr(syndrome_generator, 'rounds', 1) returns 1 and
+        # nothing downstream looks for a rounds axis that isn't there.
         self.qec_rounds = int(syndrome_cfg.get('rounds', 1))
         self.number_channel = int(syndrome_cfg.get('number_channel', 1))
 

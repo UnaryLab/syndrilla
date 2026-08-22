@@ -242,6 +242,135 @@ class RoundFlattenWrapper(torch.nn.Module):
         return io_dict
 
 
+# --------------------------------------------------------------------------- #
+# `decoder.config`: the algorithm-specific half of a decoder block.
+#
+# Everything at the top of the block is framework-wide -- `algorithm`, `check_type`,
+# `dtype`, `device`, `force_pytorch`, `checkpoint` and `rebatch_speedup` are read by
+# main.py, this loader, or every decoder alike. What only one algorithm understands
+# (`max_iter`, `sf`, relay_bp's schedule, the quantization widths) lives under
+# `config`, one entry per entry of `algorithm`, so a chain can tune each stage
+# separately instead of sharing one flat namespace.
+# --------------------------------------------------------------------------- #
+
+# Keys that used to sit at the top of the block. Rejected there rather than ignored:
+# a decoder silently falling back to max_iter=50 instead of the configured 181 still
+# produces numbers, and they look like results.
+MOVED_TO_CONFIG = (
+    "max_iter", "damping_factor", "max_b_iter", "random_machine",
+    "sign_flip_policy", "int_width", "frac_width", "sf",
+    "mp_min_batch", "num_workers",
+    # saq's blocks, and the weights only a learned decoder loads
+    "model", "cpnd", "optimizer", "train", "checkpoint",
+    # relay_bp's schedule
+    "legs", "iteration_initial", "iteration_count", "solution",
+    "init_mem_strength", "center", "width", "alpha", "alpha_scaling", "type",
+)
+
+# The other half of the same rule: these stay at the top of the block, so a `config`
+# entry that carries one is rejected too. Each key keeps exactly one home.
+SHARED_KEYS = (
+    "algorithm", "check_type", "dtype", "device", "force_pytorch",
+    "rebatch_speedup", "config",
+)
+
+
+def _split_config(dec_cfg: dict, algorithms: list, source: str):
+    """Return one algorithm-specific config per algorithm, validating placement.
+
+    `config` is positional: entry i belongs to `algorithm[i]`, which is what lets the
+    same algorithm appear twice in a chain with different settings. A single-algorithm
+    block may write the mapping directly instead of a one-element list.
+    """
+    misplaced = [key for key in MOVED_TO_CONFIG if key in dec_cfg]
+    if misplaced:
+        per_algo = " (one entry per algorithm)" if len(algorithms) > 1 else ""
+        raise ValueError(
+            f'Decoder config {source} has <{", ".join(misplaced)}> at the top level; '
+            f"algorithm-specific keys moved into `decoder.config`{per_algo}."
+        )
+
+    blocks = dec_cfg.get("config")
+    n = len(algorithms)
+    if blocks is None:
+        blocks = [{}] * n
+    elif isinstance(blocks, dict):
+        if n != 1:
+            raise ValueError(
+                f"Decoder config {source} chains <{n}> algorithms, so `decoder.config` "
+                f"is matched to them by position and has to be a list. Write "
+                f"`- {{...}}` for the stage these settings belong to; a stage with no "
+                f"settings of its own needs no entry."
+            )
+        blocks = [blocks]
+    elif isinstance(blocks, list):
+        if len(blocks) > n:
+            raise ValueError(
+                f"Decoder config {source} has <{len(blocks)}> entries under "
+                f"`decoder.config` but only <{n}> under `decoder.algorithm`; they are "
+                f"matched by position, so there is no algorithm for the last "
+                f"<{len(blocks) - n}>."
+            )
+        # `- ` with nothing after it parses as None; read it as "no settings". A short
+        # list leaves the stages past its end on their defaults, so a chain ending in
+        # a decoder that configures nothing (osd_0 after BP) writes no entry for it.
+        # Only trailing entries can be dropped: position is what binds an entry to an
+        # algorithm, so a stage that takes no settings before one that does still
+        # needs its `- {}` slot.
+        blocks = [{} if b is None else b for b in blocks]
+        blocks = blocks + [{}] * (n - len(blocks))
+    else:
+        raise ValueError(
+            f"Decoder config {source} needs `decoder.config` to be a mapping or a "
+            f"list of mappings, got <{type(blocks).__name__}>."
+        )
+
+    for algo, block in zip(algorithms, blocks):
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"Decoder config {source} needs every `decoder.config` entry to be a "
+                f"mapping, got <{type(block).__name__}> for <{algo}>."
+            )
+        shared = [key for key in SHARED_KEYS if key in block]
+        if shared:
+            raise ValueError(
+                f'Decoder config {source} has <{", ".join(shared)}> under '
+                f"`decoder.config` for <{algo}>; those are read by the framework for "
+                f"the whole block and belong at the top of `decoder`."
+            )
+    return blocks
+
+
+# every call a training run makes on its decoder, in the order the run makes them
+TRAINABLE_STAGES = (
+    "check_train_batch",
+    "train_fingerprint",
+    "configure_optimizer",
+    "backward",
+    "update",
+)
+
+
+def is_trainable(decoder):
+    """True if `decoder` implements the whole training protocol."""
+    return all(hasattr(decoder, stage) for stage in TRAINABLE_STAGES)
+
+
+def resolve_configs(dec_cfg: dict, source: str = "dict"):
+    """Return one flat config per algorithm, in `decoder.algorithm` order.
+
+    Each is the shared keys with that algorithm's `config` entry merged on top, which
+    is what a decoder is actually built from. `main.py` needs one of these before
+    `create_decoder` runs, so the positional rule that binds a `config` entry to an
+    algorithm lives here alone rather than being re-derived at the call site.
+    """
+    algorithms = dec_cfg["algorithm"]
+    if isinstance(algorithms, str):
+        algorithms = [algorithms]
+    shared = {k: v for k, v in dec_cfg.items() if k != "config"}
+    return [{**shared, **block} for block in _split_config(dec_cfg, algorithms, source)]
+
+
 def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
     """
     Create decoder(s) from a '.decoder.yaml' file or a config dict.
@@ -254,6 +383,7 @@ def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
 
     if cfg is not None:
         dec_cfg = cfg
+        source = "dict"
         logger.info(f"Creating decoder class from config dict.")
     else:
         logger.info(f"Creating decoder class from <{get_path(yaml_path)}>.")
@@ -261,17 +391,22 @@ def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
         load_cfg = read_yaml(full_path)
         check_yaml_header(load_cfg, header, full_path)
         dec_cfg = load_cfg[header]
+        source = f"<{full_path}>"
 
     # Read algorithm(s)
     algorithms = dec_cfg[func_name]
     if isinstance(algorithms, str):
         algorithms = [algorithms]  # wrap single decoder into a list
 
+    # Each decoder still receives one flat config, so the decoders themselves keep
+    # reading `decoder_cfg.get(...)` without knowing the block is split.
+    algo_cfgs = resolve_configs(dec_cfg, source)
+
     MULTI_CHANNEL_DECODERS = {"bp4"}
 
     decoders = []
-    for algo in algorithms:
-        dec_cfg_copy = dec_cfg.copy()
+    for algo, algo_cfg in zip(algorithms, algo_cfgs):
+        dec_cfg_copy = dict(algo_cfg)
         dec_cfg_copy[func_name] = algo
         decoder = _create_one_decoder(dec_cfg_copy, header, func_name, **kwargs)
         decoder._base_synd_ndim = 3 if algo.lower() in MULTI_CHANNEL_DECODERS else 2

@@ -1,5 +1,6 @@
 decoder:
   algorithm: bp_norm_min_sum
   check_type: hx
-  max_iter: 50
   dtype: float64
+  config:
+    max_iter: 50

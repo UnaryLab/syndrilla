@@ -1,13 +1,11 @@
 import torch
 from loguru import logger
 
-from syndrilla.vote import create_vote
-
 
 class create():
 
     def __init__(self, check_cfg, **kwargs) -> None:
-        self.voter = create_vote(cfg={'method': 'majority_vote'})
+        pass
 
     def check(self, e_v_total, observable_flips, l_matrix, converge=None):
         """
@@ -19,6 +17,10 @@ class create():
 
         Returns:
             logical_check:    [B]  1 = logical error, 0 = success
+
+        A multi-round `observable_flips` is judged against its **final** round, which is
+        the outcome stim's own decoders are compared against. Earlier rounds are the
+        state on the way there, not competing verdicts to be reconciled.
         """
         logger.info(f'Measuring stim logical check rate.')
 
@@ -28,21 +30,10 @@ class create():
 
         predicted_obs = (e_v @ L.T) % 2
 
-        rounds = observable_flips.shape[1] if observable_flips.ndim > 2 else 1
-
-        if rounds > 1:
-            rounds_dim = 1
-            round_checks = []
-            for r in range(rounds):
-                obs_r = observable_flips.select(rounds_dim, r).to(device).to(torch.float32)
-                round_checks.append(self._check_single(predicted_obs, obs_r, converge))
-            logical_check = self.voter.apply(
-                torch.stack(round_checks, dim=1), number_channel=1, rounds=rounds,
-                vote_stage='check', current_stage='check'
-            )
-        else:
-            obs_flips = observable_flips.to(device).to(torch.float32)
-            logical_check = self._check_single(predicted_obs, obs_flips, converge)
+        if observable_flips.ndim > 2:
+            observable_flips = observable_flips[:, -1]
+        obs_flips = observable_flips.to(device).to(torch.float32)
+        logical_check = self._check_single(predicted_obs, obs_flips, converge)
 
         logger.info(f'Stim logical check rate measurement complete.')
         return logical_check

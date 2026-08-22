@@ -1,8 +1,9 @@
 decoder:
   algorithm: [bp_norm_min_sum, osd_0]
   check_type: hz
-  max_iter: 131
   dtype: float64
   device:
     device_type: cuda
     device_idx: 0
+  config:
+    - max_iter: 131  # bp_norm_min_sum

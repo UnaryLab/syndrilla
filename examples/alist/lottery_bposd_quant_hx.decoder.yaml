@@ -3,11 +3,12 @@ decoder:
   - bp_lottery_quant
   - osd_0
   check_type: hx
-  max_iter: 181
   dtype: float64
-  random_machine: sobol
-  int_width: 3
-  frac_width: 4
   device:
     device_type: cuda
     device_idx: 0
+  config:
+    - max_iter: 181  # bp_lottery_quant
+      random_machine: sobol
+      int_width: 3
+      frac_width: 4
