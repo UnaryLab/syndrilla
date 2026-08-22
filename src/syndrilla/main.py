@@ -10,7 +10,6 @@ from syndrilla.metric import (
     report_metric,
     save_metric,
     MetricState,
-    TrainMetrics,
     BatchTracker,
 )
 from syndrilla.matrix import load_matrices
@@ -163,14 +162,11 @@ def main():
     decoder_cfg = read_yaml(get_path(args.decoder_yaml))["decoder"]
 
     if args.train:
-        # the schedule sits under the trained decoder's `config` entry, so it is read
-        # through the loader's resolver rather than off the raw block. `-t` trains the
-        # chain's last stage, so it is that entry's block the schedule comes from.
         trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[-1]
-        train_metrics = TrainMetrics.from_cfg(
+        metrics = MetricState.from_cfg(
             trained_cfg.get("train"), args.run_dir, args.decoder_yaml
         )
-        torch.manual_seed(train_metrics.cfg["seed"])
+        torch.manual_seed(metrics.cfg["seed"])
 
     if args.interface_yaml is not None:
         logger.success(
@@ -264,8 +260,6 @@ def main():
     num_err = 0
 
     inner0 = getattr(decoders[0], "decoder", decoders[0])
-    # the trained stage is the chain's last one; on a single-decoder chain it is inner0
-    trainee = getattr(decoders[-1], "decoder", decoders[-1])
     cap_on = getattr(inner0, "cap", None) is not None
     if cap_on and getattr(syndrome_generator, "rounds", 1) != 1:
         logger.warning("rebatch_speedup supports rounds==1 only; disabling the cap.")
@@ -277,16 +271,13 @@ def main():
 
     if args.train:
         assert_trainable(decoders)
-        trainee.check_train_batch(error_model.rounds, error_model.number_channel)
-        num_batches = train_metrics.begin_run(
-            trainee,
+        num_batches = metrics.begin_train_run(
+            decoders[-1],
             args.batch_size,
             args.train_checkpoint,
             decoder_device,
-            error_model.rate,
+            error_model,
         )
-        trainee.set_training(train_metrics.begin_batch(num_batches))
-        train_lr = trainee.current_lr()
     else:
         metrics, num_err, num_batches = MetricState.begin_run(
             args.checkpoint_yaml,
@@ -304,7 +295,7 @@ def main():
         args.batch_size, args.target_error, decoder_device
     )  # deferred (hard) samples
 
-    max_batches = train_metrics.total_batches if args.train else float("inf")
+    max_batches = metrics.total_batches if args.train else float("inf")
 
     while num_batches < max_batches and (
         num_err <= args.target_error or (cap_on and queue.nonempty)
@@ -362,20 +353,15 @@ def main():
                 # the trained stage is the chain's last one, so the loss is read off the
                 # output of that stage, after every earlier stage has run
                 if args.train and decoder_idx == num_decoders - 1:
-                    training = train_metrics.is_training(num_batches - 1)
                     terms = loss_fn.terms(io_dict, err)
                     total = loss_fn.combine(*terms)
-                    if training:
-                        trainee.backward(total)
-                        trainee.update()
-                    train_metrics.accumulate(
-                        training, (total, *terms), loss_fn.class_error(io_dict, err)
+                    decoders[decoder_idx].backward(total)
+                    decoders[decoder_idx].update()
+                    metrics.record_batch(
+                        num_batches,
+                        (total, *terms),
+                        loss_fn.class_error(io_dict, err),
                     )
-                    if train_metrics.epoch_done(num_batches):
-                        trainee.lr_step()
-                        train_metrics.record_epoch(train_lr)
-                        train_lr = trainee.current_lr()
-                    trainee.set_training(train_metrics.begin_batch(num_batches))
                     break
                 elapsed = time.time() - start_time
                 bt.record_decoder(decoder_idx, io_dict, elapsed)
@@ -463,8 +449,8 @@ def main():
             queue.freeze_density(num_err - num_err_before_batch, n)
 
     if args.train:
-        train_metrics.save_history()
-        train_metrics.close_log()
+        metrics.save_history()
+        metrics.close_log()
         return
 
     logger.success(

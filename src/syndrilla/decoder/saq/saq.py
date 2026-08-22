@@ -920,7 +920,7 @@ class create(nn.Module):
 
         The decoder states its own algorithm, the code shape it was built for, and the
         optimizer settings `configure_optimizer` will read. The schedule half (epochs,
-        batches, seed, batch size) belongs to `TrainMetrics`, which merges the two, so
+        batches, seed, batch size) belongs to `MetricState`, which merges the two, so
         neither side has to reach into the other.
         """
         return {
@@ -969,20 +969,35 @@ class create(nn.Module):
             )
 
     def backward(self, loss):
-        """Training stage: accumulate this batch's gradients.
+        """Training stage: accumulate this batch's gradients, if this batch trains.
 
         The autograd counterpart of `forward`. Paired one-to-one with `update`; the loop
         does not accumulate over several batches.
+
+        A validation batch is skipped here rather than in the loop. `set_training` has
+        already put this decoder in the mode its batch runs in, so the mode is the
+        answer to whether a gradient step belongs to it -- asking the schedule a second
+        time at the call site is a second answer that can disagree with this one. It
+        cannot be left to fall through either: a validation batch is built with grad
+        off, so `loss.backward()` raises rather than quietly doing nothing.
         """
+        if not self.training:
+            return
         loss.backward()
 
     def update(self):
         """Training stage: apply one optimizer step, then reset the gradients.
 
+        Skipped on a validation batch for the reason given in `backward`, which this is
+        paired with: there are no gradients to apply, and applying the previous training
+        batch's would be worse than doing nothing.
+
         Resetting here rather than before the next `backward` keeps the loop reading
         backward -> update, and `configure_optimizer` establishes the same clean-gradient
         precondition for the very first step.
         """
+        if not self.training:
+            return
         self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1037,8 +1052,8 @@ class create(nn.Module):
     def _load_rng_state(self, state):
         """Put the draw sequence back where the interrupted run left it.
 
-        The error stream itself no longer depends on this: `TrainMetrics.seed_epoch`
-        reseeds at every epoch boundary, including after a resume, so epoch N draws the
+        The error stream itself no longer depends on this: `MetricState.begin_batch`
+        reseeds at every phase boundary, including after a resume, so epoch N draws the
         same errors whichever way it was reached. This restores the rest of the
         generator state for anything that resumes mid-epoch.
         """
