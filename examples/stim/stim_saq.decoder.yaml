@@ -9,7 +9,7 @@ decoder:
   check_type: hx
   dtype: float32
   device:
-    device_type: cuda
+    device_type: cpu
     device_idx: 0
   config:
     checkpoint: tests/test_outputs/saq_hx_dem24x221.pt
