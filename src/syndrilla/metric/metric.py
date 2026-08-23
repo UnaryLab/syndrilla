@@ -171,10 +171,13 @@ class MetricState:
     `for_training` to train; calling across the two halves is a bug the mode flag makes
     visible rather than one this class prevents.
 
-    The training half also owns the filtered train.log sink: decoders log several INFO
-    lines per forward pass, which over a real run would bury the epoch lines and grow
-    the log to hundreds of MB, so the sink takes only the records it tags. The caller's
-    own sinks are left alone.
+    The training half also owns the filtered <stem>_train.log sink: decoders log several
+    INFO lines per forward pass, which over a real run would bury the epoch lines and
+    grow the log to hundreds of MB, so the sink takes only the records it tags. The
+    caller's own sinks are left alone. Both that log and <stem>_history.json carry the
+    checkpoint stem, so a run dir shared with other runs and with the decode side --
+    `tests/test_outputs`, the default -- keeps one run's log and history clear of the
+    next one's rather than overwriting them.
     """
 
     # Names of scalar (per-decoder) fields
@@ -493,7 +496,7 @@ class MetricState:
 
     # ------------------------------------------------------------------
     # Training half (`-t`): per-epoch loss, the phase schedule, the run's
-    # checkpoints and history.json. Accumulates each batch's loss terms and logical
+    # checkpoints and <stem>_history.json. Accumulates each batch's loss terms and logical
     # class error under its phase ('train' or 'val'), averages them at the epoch
     # boundary, formats the epoch line, and writes the run out. Live only on a state
     # built by `from_cfg` / `for_training`; the fields below do not exist on a decode
@@ -584,9 +587,13 @@ class MetricState:
         self.acc = {"train": [0.0] * len(self.KEYS), "val": [0.0] * len(self.KEYS)}
 
     def open_log(self, header_lines):
-        """Start the train.log sink and emit the run header to stdout and the log."""
+        """Start the <stem>_train.log sink and emit the run header to stdout and the log.
+
+        The stem comes from the bound decoder, so this has to run after `bind_decoder`,
+        as `begin_train_run` does.
+        """
         self._sink_id = logger.add(
-            os.path.join(self.run_dir, "train.log"),
+            os.path.join(self.run_dir, f"{self._decoder.checkpoint_stem()}_train.log"),
             level="INFO",
             filter=lambda record: record["extra"].get("train", False),
             format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
@@ -903,13 +910,14 @@ class MetricState:
         self.lr = self._decoder.current_lr()
 
     def save_history(self):
-        """Write history.json and report where the run's checkpoints landed.
+        """Write <stem>_history.json and report where the run's checkpoints landed.
 
         The name comes from the bound decoder, so the paths printed are the ones
         actually written rather than a fixed pair this class assumed.
         """
         stem = self._decoder.checkpoint_stem()
-        with open(os.path.join(self.run_dir, "history.json"), "w") as fh:
+        history_path = os.path.join(self.run_dir, f"{stem}_history.json")
+        with open(history_path, "w") as fh:
             json.dump(self.history, fh, indent=2)
         best_path = os.path.join(self.run_dir, f"{stem}.pt")
         last_path = os.path.join(self.run_dir, f"{stem}_last.pt")
@@ -918,6 +926,7 @@ class MetricState:
             f"best val class error {self.best:.4f}"
         )
         print(f"checkpoints: {best_path}, {last_path}")
+        print(f"history: {history_path}")
         print(f"\nadd to the decoder yaml to use it:\n\n  checkpoint: {best_path}\n")
         print(
             f"to continue this run, add to the same command:\n\n  -tckpt {last_path}\n"

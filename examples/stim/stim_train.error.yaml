@@ -1,0 +1,13 @@
+# Training-only noise for the stim path: a swept circuit noise level rather than a
+# pinned one, so one run covers a stretch of the curve instead of a single point.
+# `rate` is a [lower, upper] range split into `rate_points` levels, and every shot draws
+# its own. Each level regenerates the circuit with the noise keys below scaled together,
+# so their ratios are preserved; here they are equal, so a level simply sets all three.
+# A scalar `rate` (or none) decodes at the circuit's own noise; see stim_generated.error.yaml.
+error:
+  model: stim_circuit
+  after_clifford_depolarization: 0.003
+  after_reset_flip_probability: 0.003
+  before_round_data_depolarization: 0.003
+  rate: [0.0005, 0.006]
+  rate_points: 9

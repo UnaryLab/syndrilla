@@ -1,6 +1,5 @@
 error:
-  model: bsc
-  number_channel: 1
+  model: depol
   device:
     device_type: cpu
     device_idx: 0

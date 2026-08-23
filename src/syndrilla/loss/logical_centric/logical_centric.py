@@ -36,13 +36,56 @@ def _logical_flipped(L, x):
 
 
 def _diff_GF2_mul(H, x):
-    """Differentiable GF(2) matrix-vector product used by the entropy loss.
+    """Differentiable GF(2) matrix-vector product, in the probability domain.
 
-    Replaces the XOR over each column's support with a product of +-1 Bernoulli means, so
-    gradients flow from the logical-error objective back to the per-qubit logits.
+    The XOR over each column's support becomes a product of +-1 Bernoulli means: with
+    `x_i = P(bit_i == 1)`, each factor `1 - 2*x_i` is `E[(-1)^bit_i]`, and their product
+    is `E[(-1)^parity]`, so `sign_to_bin` of it is `P(parity == 1)`.
+
+    Exact, and unusable as written on a support of any size: every factor has magnitude
+    below 1, so the product decays geometrically in the number of bits and takes its own
+    gradient down with it. `_parity_llr` computes the same quantity in the log domain
+    and is what the loss uses; this is kept because it is the plainest statement of what
+    that one approximates, and the tests check the two against each other.
     """
     tmp = bin_to_sign(H.unsqueeze(0) * x.unsqueeze(-1))
     return sign_to_bin(torch.prod(tmp, 1))
+
+
+def _parity_llr(H, llr):
+    """LLR of the GF(2) parity of `llr`'s bits over each column's support.
+
+    Input `llr` is `[B, n]`, positive meaning the bit is 0; `H` is `[n, k]` in {0, 1}.
+    Returns `[B, k]`, positive meaning that column's parity is 0.
+
+    The parity of independent bits is exactly `2*atanh(prod_i tanh(llr_i / 2))` over the
+    support, which is `_diff_GF2_mul` rewritten in the log domain. Taken literally that
+    is no better conditioned than the product: the magnitude is `exp(sum_i log|tanh|)`,
+    and with a support of 36 mechanisms on a circuit-level detector error model the sum
+    reaches -272, so both the value and its gradient underflow float32 to exactly zero.
+    The loss then reports a constant `ln 2` and trains nothing, which is self-sustaining:
+    a per-bit llr nothing supervises stays at 0, and an llr of 0 is what drives the sum
+    that far down.
+
+    So the magnitude is the standard max-log (min-sum) approximation of that sum,
+    `min_i |llr_i|`, the same one belief propagation's check node uses. It agrees with
+    the exact form to the extent one bit dominates, is an upper bound otherwise, and its
+    gradient is O(1) on the least certain bit in the support rather than exponentially
+    small in the support's size. The sign is exact: a parity flips with the parity of
+    the negative llrs, which no approximation touches.
+    """
+    mask = H.t().unsqueeze(0).to(llr.dtype)  # [1, k, n]
+    x = llr.unsqueeze(1)  # [B, 1, n]
+
+    # sign: exact, and a step function of the llrs, so it carries no gradient of its own
+    negatives = (x < 0).to(llr.dtype) * mask
+    sign = bin_to_sign(negatives.sum(dim=-1) % 2)  # [B, k]
+
+    # magnitude: min over the support. Bits outside it are held at +inf, the identity
+    # for a min, which is also their exact contribution (an llr of +inf is a certain 0)
+    outside = llr.new_tensor(float("inf"))
+    magnitude = torch.where(mask.bool(), x.abs(), outside)  # [B, k, n]
+    return sign * magnitude.min(dim=-1).values
 
 
 class create:
@@ -86,29 +129,35 @@ class create:
 
         Use `combine` to weight them with the configured lambdas.
 
-        Note on L_Ent: `_diff_GF2_mul` expects per-qubit `P(bit == 1)`, so the residual must
-        be supplied as `P(e_i XOR pred_i == 1)`. Upstream passes its complement
-        (`z*(1-sigmoid) + (1-z)*sigmoid`, i.e. `P(residual == 0)`). Since
-        `XOR_i not(r_i) == (XOR_i r_i) XOR (w mod 2)` over a logical operator of weight `w`,
-        that complement leaves the term correct for even-weight logicals but *inverts* it for
-        odd-weight ones, where minimising it maximises the logical error rate. Measured on a
-        perfect prediction vs one off by a logical operator: rotated surface d=5 (weight 5)
-        gives 6.39 vs 0.0017 upstream, exactly backwards; toric L=10 (weight 10) gives
-        0.0034 vs 2.85 either way. The correct form below is identical on even weights and
-        fixes the odd ones.
+        Note on L_Ent: the residual bit is `e_i XOR pred_i`, and its llr is the decoder's
+        own llr with the sign flipped wherever the true error is 1, since a positive llr
+        means the prediction is 0. That is exact, and cheaper and steadier than the round
+        trip through probabilities the term used to make: `sigmoid` then a product then
+        `log` loses on both ends of the range what the llr already holds directly.
+
+        The parity of that residual over each logical operator is then taken by
+        `_parity_llr`, in the log domain, and scored with `softplus(-parity)`, which is
+        `-log P(parity == 0)`: the same objective the probability-domain form wrote as a
+        binary cross-entropy against 0, without its underflow. Upstream instead passes
+        `P(residual == 0)`, the complement. Since
+        `XOR_i not(r_i) == (XOR_i r_i) XOR (w mod 2)` over a logical operator of weight
+        `w`, that complement leaves the term correct for even-weight logicals but
+        *inverts* it for odd-weight ones, where minimising it maximises the logical error
+        rate. Measured on a perfect prediction vs one off by a logical operator: rotated
+        surface d=5 (weight 5) gives 6.39 vs 0.0017 upstream, exactly backwards; toric
+        L=10 (weight 10) gives 0.0034 vs 2.85 either way. The form below is identical on
+        even weights and fixes the odd ones.
         """
         e, target_idx = self._prepare(e)
 
         loss_lc = F.cross_entropy(io_dict["logical_logits"], target_idx)
         loss_lp = F.cross_entropy(io_dict["logical_prior"], target_idx)
 
-        # positive LLR means "no error", so sigmoid(l_v) is P(prediction == 0)
-        p_no_err = torch.sigmoid(io_dict["llr"])
-        p_residual = e * p_no_err + (1 - e) * (1 - p_no_err)
-        logical_residual = _diff_GF2_mul(self.decoder.logic_matrix, p_residual)
-        loss_ent = F.binary_cross_entropy(
-            logical_residual, torch.zeros_like(logical_residual)
-        )
+        # positive llr means "no error", so the residual's llr is the decoder's own with
+        # the sign flipped on the bits the true error flips
+        llr_residual = bin_to_sign(e) * io_dict["llr"]
+        parity = _parity_llr(self.decoder.logic_matrix, llr_residual)
+        loss_ent = F.softplus(-parity).mean()
 
         return loss_lc, loss_lp, loss_ent
 

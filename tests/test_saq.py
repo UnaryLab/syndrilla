@@ -26,6 +26,7 @@ TORIC_MATRIX_YAML = "examples/alist/toric_10.matrix.yaml"
 CKPT_STEM = "saq_hx_d5"
 BEST_PT = f"{CKPT_STEM}.pt"
 LAST_PT = f"{CKPT_STEM}_last.pt"
+HISTORY = f"{CKPT_STEM}_history.json"
 TRAIN_ERROR_YAML = "examples/alist/bsc_train.error.yaml"
 TRAIN_SYNDROME_YAML = "examples/alist/perfect.syndrome.yaml"
 LOSS_YAML = "examples/alist/logical_centric.loss.yaml"
@@ -570,11 +571,11 @@ def test_train_cli_produces_a_loadable_checkpoint(tmp_path):
 
     best = tmp_path / BEST_PT
     assert best.is_file() and (tmp_path / LAST_PT).is_file()
-    assert (tmp_path / "history.json").is_file()
+    assert (tmp_path / HISTORY).is_file()
 
     # the schedule and the optimizer settings come from their own blocks of the same
     # decoder yaml
-    history = json.loads((tmp_path / "history.json").read_text())
+    history = json.loads((tmp_path / HISTORY).read_text())
     assert [entry["epoch"] for entry in history] == [1, 2]
     shipped = read_yaml(get_path(DECODER_YAML))["decoder"]
     assert history[0]["lr"] == shipped["config"]["optimizer"]["lr"]
@@ -1144,7 +1145,7 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
 
     resumed_dir = tmp_path / "resumed"
     _interrupt_after_epoch(resumed_dir, decoder_yaml, 3)
-    # an interrupted run writes no history.json -- that is `save_history`'s job at the
+    # an interrupted run writes no history file -- that is `save_history`'s job at the
     # end -- so the three finished epochs have to be in the checkpoint, or they are lost
     partial = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
     assert [entry["epoch"] for entry in partial["history"]] == [1, 2, 3]
@@ -1156,8 +1157,8 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     assert finished.returncode == 0, finished.stderr
 
     # the resumed run must reach the same place, epoch by epoch and weight by weight
-    assert json.loads((resumed_dir / "history.json").read_text()) == json.loads(
-        (straight_dir / "history.json").read_text()
+    assert json.loads((resumed_dir / HISTORY).read_text()) == json.loads(
+        (straight_dir / HISTORY).read_text()
     )
     expected = torch.load(straight_dir / LAST_PT, map_location="cpu", weights_only=True)
     actual = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)

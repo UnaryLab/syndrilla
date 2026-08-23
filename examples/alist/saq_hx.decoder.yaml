@@ -11,7 +11,7 @@ decoder:
   config:
     # weights written by a `-t` run, named after the configuration that produced them;
     # update the path to match the run directory and matrix you trained on
-    checkpoint: runs/saq_hx/saq_hx_d5.pt
+    checkpoint: tests/test_outputs/saq_hx_d5.pt
     # transformer architecture, read only by the decoder
     model:
       d_model: 128

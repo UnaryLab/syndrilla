@@ -424,6 +424,12 @@ class create(nn.Module):
                 "saq requires a pre-loaded MatrixBundle via the `bundle` kwarg."
             )
         self.H_shape, V_c_row, V_c_col, H_matrix = bundle.select(self.check_type)
+        # a circuit-level detector error model, where a column is a fault mechanism
+        # rather than a qubit, so the code-family relations below do not apply to it
+        source = (
+            bundle.Hx_matrix if self.check_type.lower() == "hx" else bundle.Hz_matrix
+        )
+        self.from_circuit_dem = getattr(source, "is_circuit_dem", False)
 
         l_matrix = (
             bundle.lx_matrix if self.check_type.lower() == "hx" else bundle.lz_matrix
@@ -583,6 +589,18 @@ class create(nn.Module):
         redundant row, while a surface code's does not. Both facts are measurable, so a
         `code_type` key could only ever disagree with the matrix it describes.
         """
+        if self.from_circuit_dem:
+            # a DEM's columns are circuit fault mechanisms, so neither test below means
+            # what it does on a code: its rank deficiency counts redundant detectors,
+            # not redundant stabilizers, and its column count is a fault count that can
+            # solve a code relation by coincidence (a distance-3 rotated circuit over 3
+            # rounds gives 221, which is the unrotated relation at distance 11)
+            logger.info(
+                f"saq is running on a circuit-level detector error model: "
+                f"<{self.m}> detectors, <{self.n}> fault mechanisms. The code-family "
+                f"checks do not apply and no distance is inferred."
+            )
+            return
         rank = _rref_gf2(H_matrix.detach().cpu().numpy())[2].size
         deficiency = self.m - rank
         if deficiency not in (0, 1):
@@ -1115,6 +1133,11 @@ class create(nn.Module):
         matching no relation leaves the distance unknown rather than guessed, since a
         wrong distance in a filename outlives the run that wrote it.
         """
+        if self.from_circuit_dem:
+            # named for what actually distinguishes two DEM runs. A code distance would
+            # be a coincidence of the fault count here, and a wrong distance in a
+            # filename outlives the run that wrote it
+            return f"dem{self.m}x{self.n}"
         fits = self._families()
         return f"d{fits[0][1]}" if fits else f"n{self.n}"
 

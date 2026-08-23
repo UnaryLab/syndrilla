@@ -12,6 +12,7 @@ Instead of manually providing parity-check matrices, error rates, and syndrome m
       - [2.1. Interface module](#21-interface-module)
       - [2.2. Error module](#22-error-module)
       - [2.3. Syndrome module](#23-syndrome-module)
+    - [3. Training on the stim path](#3-training-on-the-stim-path)
   - [Pipeline flow](#pipeline-flow)
 
 ## Basic usage
@@ -44,7 +45,7 @@ Following is a table for detailed explaination on each command line arguments:
 | `-l`     | Level of logger, default `INFO`              | `-l=SUCCESS`                                      |
 | `-ckpt`  | Path to a checkpoint YAML file to resume a decode run; a training run resumes with `-tckpt` instead, and passing `-ckpt` with `-t` is rejected rather than ignored. The stim path derives its physical error rate from the circuit's DEM, so the filename reflects that value rather than a rate you set | `-ckpt=<run dir>/result_phy_err_<rate>.yaml` |
 
-`-i` derives the matrix and logical-check matrices from the circuit, so `-m` and `-c` are not used. It also makes `-e` and `-s` optional, leaving `-d` as the only required flag; supply them anyway when you want to set noise rates or rounds, since both are still read when present. Training (`-t`, with `-ls` and `-tckpt`) is not supported on the interface path and is rejected with an error; see [decoder.md](decoder.md) for the training flags.
+`-i` derives the matrix and logical-check matrices from the circuit, so `-m` and `-c` are not used. It also makes `-e` and `-s` optional, leaving `-d` as the only required flag; supply them anyway when you want to set noise rates or rounds, since both are still read when present. Training (`-t`) works on the interface path too, and needs `-ls` for the objective, which the interface does not supply; see [decoder.md](decoder.md) for the training flags and [Training on the stim path](#3-training-on-the-stim-path) below.
 
 ### 2. Input format and configurations
 The stim workflow splits configuration across four modules: interface, decoder, error, and syndrome.
@@ -129,6 +130,36 @@ The following table details the configuration parameters used in the syndrome mo
 | `syndrome.measurement_error_rate` | Bit-flip noise before each measurement, forwarded to stim as `before_measure_flip_probability` | `0.1` |
 
 The circuit's detectors already span every round, so the sampled syndrome carries **no** rounds axis: one shot per batch element, shaped `[B, num_detectors]`, whatever `rounds` is set to. The stim measurer therefore exposes the value as `qec_rounds` rather than `rounds`, and the error model's round count stays `1`.
+
+### 3. Training on the stim path
+`-t` drives a learned decoder from circuit-level data exactly as it does from a code's parity-check matrix, with `-i` in place of `-m`, and `-ls` naming the loss. The interface supplies the matrices, the noise and the measurer; it does not supply the objective.
+
+```command
+syndrilla -t -r=tests/test_outputs \
+    -d=examples/stim/stim_saq_train.decoder.yaml \
+    -i=examples/stim/stim_generated.interface.yaml \
+    -e=examples/stim/stim_train.error.yaml \
+    -s=examples/stim/stim_train.syndrome.yaml \
+    -ls=examples/stim/logical_centric.loss.yaml \
+    -bs=1024
+```
+
+**Choosing the loss.** `logical_centric` is the same module and the same weights the alist path uses; the stim path ships its own copy of the YAML only because this is where one of its terms is delicate. `L_Ent` takes the parity of the residual over the logical observable's support, which is a handful of qubits on a code but 36 error mechanisms on the shipped distance-3 circuit's detector error model. Written in the probability domain, as a product of one `+-1` Bernoulli mean per bit, that parity decays geometrically in the support's size: on this circuit the term reported a constant `ln 2 = 0.6931` for every epoch of a 40-epoch run, with a gradient of **exactly** zero, and since `L_Ent` is the only term that supervises the per-mechanism llr at all, that llr stayed at 0, which is itself what drove the product down. The term is computed in the log domain instead, its magnitude by the same max-log (min-sum) rule belief propagation's check node uses, so its gradient is O(1) on the least certain bit rather than exponentially small in the support.
+
+Measured on the shipped configuration, comparing that fix against weighting the broken term to `0`: `L_Ent` now trains, `0.288` down to `0.018`, and the llr's logical parity agrees with the true logical class on `99.4%` of shots against `92.4%`. The end-to-end logical error rate is unchanged, `0.0081` against `0.0084` over 500 errors, which is within the sampling noise of those runs: `L_LC` already supervises the logical class directly, and CPND projects onto it, so the llr's parity is not what the final answer turns on. The term is left at `1.0` because it now does what it says, not because it moves the decoder.
+
+**Where the supervision comes from.** A training step needs a ground-truth error in the decoder's own coordinates, and a detector error model provides one: its error instructions *are* the columns of `H`, so a sampled mechanism vector `e` is the error the decoder is trying to recover, `H @ e` is the syndrome it sees, and `L @ e` is the observable flip it is scored on. The error model draws `e` and the measurer reads the other two off it, so all three describe one shot. Sampling is done with torch rather than stim's own DEM sampler so it runs off the global torch RNG, which is what the per-phase reseeding behind the resume guarantee drives; the two are equivalent, since a DEM's mechanisms are independent Bernoulli draws either way.
+
+**Sweeping the noise.** Training against one noise level gives a decoder that holds at that level. `rate` may instead be a `[lower, upper]` range with `rate_points`, the same swept form `bsc` takes: every shot draws its own level, so one run covers a stretch of the curve. Each rate point regenerates the circuit with the configured noise keys scaled together, so a circuit whose knobs were deliberately set to different values keeps their ratios; when they are equal, which is usual, a rate point simply sets all of them to it. The points share one `H`, which is checked rather than assumed: a rate point whose DEM has a different mechanism set is rejected instead of being fed to a decoder built from the base circuit's matrix. A range is training-only, and a decode run against one is refused, because a result file records a single physical error rate.
+
+| Key                 | Description                                                                                     | Example            |
+|---------------------|-------------------------------------------------------------------------------------------------|--------------------|
+| `error.rate`        | Scalar: the physical error rate a result file records, defaulting to the DEM's mean mechanism probability. `[lower, upper]`: a training-only sweep of the circuit's noise | `[0.0005, 0.006]`  |
+| `error.rate_points` | Number of evenly spaced levels a swept `rate` is split into. Required with a range               | `9`                |
+
+**Checkpoint names.** Weights trained here are named `<algorithm>_<check_type>_dem<detectors>x<mechanisms>`, not after a code distance: a DEM column is a circuit fault mechanism, so the column count carries no distance, and reading one off it would be a coincidence. The shipped distance-3 rotated circuit over 3 rounds gives 24 detectors and 221 mechanisms, so a `saq` run on `hx` writes `saq_hx_dem24x221.pt` and `saq_hx_dem24x221_last.pt`.
+
+**What a decoder can assume.** A decoder built from a DEM is not looking at a code's Tanner graph: its checks are detectors in spacetime and its variables are fault mechanisms, so anything keyed to a code family, a distance or a qubit count does not apply. Decoders that measure such things off their matrix are told which kind they have through the loader's `is_circuit_dem` flag, rather than guessing from the shape.
 
 
 

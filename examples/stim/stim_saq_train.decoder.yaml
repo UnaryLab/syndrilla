@@ -1,0 +1,31 @@
+# Training config for the learned `saq` decoder on the stim circuit-level path.
+# Drive it with `syndrilla -t -i=... -e=... -s=... -ls=...`; see run_stim_saq_train.args.
+# The model is smaller than the alist one because a distance-3 circuit's detector error
+# model is a small graph: 24 detectors and 221 fault mechanisms.
+decoder:
+  algorithm: saq
+  check_type: hx
+  dtype: float32
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    model:
+      d_model: 128
+      N_dec: 4
+      h: 8
+      dropout: 0.0
+      no_mask: 0
+    # inference-only stage; `-t` builds without it
+    cpnd:
+      enable: true
+      passes: 1
+    optimizer:
+      lr: 5.0e-4
+      weight_decay: 5.0e-8
+      min_lr: 1.0e-6
+    train:
+      epochs: 40
+      batches_per_epoch: 100
+      val_batches: 20
+      seed: 42

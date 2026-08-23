@@ -105,15 +105,15 @@ Following is a table for detailed explaination on each command line arguments:
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-ls`    | Path to loss YAML file                       | `-ls=examples/alist/logical_centric.loss.yaml`    |
-| `-tckpt` | Path to a run's `*_last.pt`, to resume training | `-tckpt=runs/saq_hx/saq_hx_d5_last.pt` |
+| `-tckpt` | Path to a run's `*_last.pt`, to resume training | `-tckpt=tests/test_outputs/saq_hx_d5_last.pt` |
 
 #### Training a learned decoder (`-t`)
 
-Learned decoders (currently `saq`) need trained weights. `-t` trains the decoder given by `-d` and writes two checkpoints into `-r`, named after the configuration that produced them (`<algorithm>_<check_type>_<distance>`), so two configurations in one run directory do not overwrite each other:
+Learned decoders (currently `saq`) need trained weights. `-t` trains the decoder given by `-d` and writes its two checkpoints, its epoch history and its log into `-r` (default `tests/test_outputs`, the same directory decode runs write to), all four named after the configuration that produced them (`<algorithm>_<check_type>_<distance>`), so two configurations in one run directory do not overwrite each other:
 
 ```command
 syndrilla -t
-          -r=runs/saq_surface_5
+          -r=tests/test_outputs
           -d=examples/alist/saq_hx.decoder.yaml
           -m=examples/alist/surface_5.matrix.yaml
           -e=examples/alist/bsc_train.error.yaml
@@ -122,19 +122,19 @@ syndrilla -t
           -bs=256
 ```
 
-Then point the decoder YAML's `config.checkpoint` key at `runs/saq_hx/saq_hx_d5.pt` and run the normal command above to evaluate.
+Then point the decoder YAML's `config.checkpoint` key at `tests/test_outputs/saq_hx_d5.pt` and run the normal command above to evaluate.
 
 **Resuming an interrupted run (`-tckpt`).** The `*_last.pt` file is rewritten at every epoch boundary and holds the whole training state: weights, Adam's moments, the cosine schedule's position, the epoch counter, the best score so far, the history, and the generator state. The error stream is reseeded at each phase boundary from the run's `seed`: the training phase gets the same seed every epoch, so training runs on a fixed set of batches, while validation gets a fresh one each epoch. Either way a batch's errors depend on where the run is, not on how it got there. Add `-tckpt` to the same command to continue from it, leaving every other flag as it was:
 
 ```command
-syndrilla -t -tckpt=runs/saq_hx/saq_hx_d5_last.pt
-          -r=runs/saq_surface_5
+syndrilla -t -tckpt=tests/test_outputs/saq_hx_d5_last.pt
+          -r=tests/test_outputs
           ... the same -d, -m, -e, -s, -ls and -bs as above
 ```
 
 The run continues exactly where it stopped, not from a warm start: a run interrupted after epoch 20 and resumed finishes with the same weights a 100-epoch run would have reached uninterrupted. Because that guarantee depends on the settings being unchanged, the `*_last.pt` file also stores a fingerprint of them (schedule, batch size, code shape, optimizer settings), and resuming with any of them changed fails with a message naming the field rather than silently producing a different run. The plain `<name>.pt` stays a bare `state_dict` for decoding and sharing; only `*_last.pt` carries the extra state, and both still load through the decoder YAML's `config.checkpoint` key.
 
-Training needs `-d`, `-m`, `-e`, `-s` and `-ls`, takes its batch size from `-bs`, and writes into `-r`. It builds no logical check, so `-c` and `-te` are unused, and `-ckpt` resumes a *decode* run and should not be passed alongside `-t` (`-tckpt` is its training counterpart); `-i` is rejected with an error, since training takes the decoder through `-d` rather than an interface. Training hyperparameters come from three files: the decoder YAML holds the optimizer settings (`lr`, `weight_decay`, `min_lr`) under `config.optimizer` and the schedule (`epochs`, `batches_per_epoch`, `val_batches`, `seed`) under `config.train`, the `-ls` YAML holds the loss weights (`lambda_lc`, `lambda_lp`, `lambda_ent`) under its `loss` key, and the error YAML holds the physical error rates, where the training-only `bsc_train` model takes a rate range (`rate: [0.01, 0.20]` with `rate_points: 9`) so one model covers the whole curve. Errors and syndromes come from the same error model and syndrome measurer that decoding uses.
+Training needs `-d`, `-m`, `-e`, `-s` and `-ls`, takes its batch size from `-bs`, and writes into `-r`. It builds no logical check, so `-c` and `-te` are unused, and `-ckpt` resumes a *decode* run and should not be passed alongside `-t` (`-tckpt` is its training counterpart). `-i` replaces `-m`/`-e`/`-s` here as it does for decoding, so a learned decoder trains on circuit-level data from a stim circuit with the same command and `-ls` still naming the loss; see [Interface module](docs/interface.md) for what supervises it and how its noise is swept. Training hyperparameters come from three files: the decoder YAML holds the optimizer settings (`lr`, `weight_decay`, `min_lr`) under `config.optimizer` and the schedule (`epochs`, `batches_per_epoch`, `val_batches`, `seed`) under `config.train`, the `-ls` YAML holds the loss weights (`lambda_lc`, `lambda_lp`, `lambda_ent`) under its `loss` key, and the error YAML holds the physical error rates, where a training run may give `rate` as a range (`rate: [0.01, 0.20]` with `rate_points: 9`) so one run covers the whole curve rather than a single point; the phenomenological measurer sweeps its `measurement_error_rate` the same way. Errors and syndromes come from the same error model and syndrome measurer that decoding uses.
 
 ### 2. Input format and configurations
 <table>
@@ -167,11 +167,11 @@ error:
 The following table details the configuration parameters used in the error YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
-| `error.model`     | Type of quantum error model applied to data qubits           | `bsc`, `bsc_train`, `depol` or `stim_circuit` |
+| `error.model`     | Type of quantum error model applied to data qubits           | `bsc`, `depol` or `stim_circuit` |
 | `error.number_channel`     | The number of error channel applied to quantum circuit           | `1` or `2`                     |
 | `error.device.device_type`       | Type of the device where the error injection will happen                                       | `cpu` or `cuda`                                       |
 | `error.device.device_idx`       | Index of the device where the error injection will happen. This option only works when `device_type = cuda`.                                                        | 0                           |
-| `error.rate`      | Physical error rate applied to each data qubit           | `0.05`  |
+| `error.rate`      | Physical error rate applied to each data qubit. A training run may sweep it as a `[lower, upper]` range with `error.rate_points`, one level drawn per shot | `0.05` or `[0.01, 0.20]` |
 
 The following table details all types of error model Syndrilla supports. (Using different error model may need different configuration format, which will be shown on [Error module](docs/error.md).)
 
@@ -179,7 +179,6 @@ The following table details all types of error model Syndrilla supports. (Using 
 |------------------|------------------------------------------------------------|---------------------------------------------------|
 |Binary Symmetric Channel (BSC)|Both 1 and 2                                    | bsc                                               |
 |Depolarizing Channel |2                                                        | depol                                             |
-|BSC with a swept rate (training only)|1                                       | bsc_train                                         |
 |Stim circuit-level model|1                                                    | stim_circuit                                      |
 
 #### 2.2. Syndrome module
@@ -201,7 +200,7 @@ The following table details all types of syndrome measurement Syndrilla supports
 | Syndrome model            | Description                                                                                                | Example            |
 |---------------------------|------------------------------------------------------------------------------------------------------------|--------------------|
 | Perfect                   | Ideal (error-free) syndrome measurement: returns `H * e mod 2`                                             | `perfect`          |
-| Phenomenological          | Replicates the true syndrome over `rounds` and flips each bit with probability `measurement_error_rate`  | `phenomenological` |
+| Phenomenological          | Replicates the true syndrome over `rounds` and flips each bit with probability `measurement_error_rate`, which a training run may sweep as a range | `phenomenological` |
 | Stim                      | Circuit-level syndrome sampler driven by a stim circuit (used with the stim interface)                     | `stim`             |
 
 

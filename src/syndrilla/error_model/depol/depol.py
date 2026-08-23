@@ -2,37 +2,63 @@ import torch
 
 from loguru import logger
 
-from syndrilla.utils import dataset
+from syndrilla.utils import dataset, is_rate_range, build_rate_sweep, draw_shot_rate
 
 
-class create():
+class create:
     """
-    This class creates a bsc error model.
+    This class creates a depolarizing error model.
+
+    <rate> is a scalar for a decode run. A training run may give it as a [lower, upper]
+    range with <rate_points> instead, exactly as <bsc> does: every shot draws its own
+    level and carries the matching Pauli priors, so one run covers a stretch of the
+    curve. A range outside training is refused.
     """
-    def __init__(self, 
-                 error_model_cfg, 
-                 **kwargs) -> None:
-        assert 'rate' in error_model_cfg.keys(), logger.error(f'Missing key <rate> in the configuration.')
-        self.rate = error_model_cfg['rate']
 
-        device_cfg = error_model_cfg.get('device', {})
-        self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-        if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
-            logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def __init__(self, error_model_cfg, **kwargs) -> None:
+        assert "rate" in error_model_cfg.keys(), logger.error(
+            f"Missing key <rate> in the configuration."
+        )
+        self.rate = error_model_cfg["rate"]
 
-        if self.device == 'cuda':
-            device_idx = device_cfg.get('device_idx', 0)
+        device_cfg = error_model_cfg.get("device", {})
+        self.device = device_cfg.get(
+            "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        if self.device not in {
+            "cuda",
+            "cpu",
+            torch.device("cuda"),
+            torch.device("cpu"),
+        }:
+            logger.warning(
+                f"Invalid input device <{self.device}>, default to avaliable device in your machine."
+            )
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if self.device == "cuda":
+            device_idx = device_cfg.get("device_idx", 0)
             if device_idx >= torch.cuda.device_count():
-                logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device(f'cuda:0')
+                logger.warning(
+                    f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
+                )
+                self.device = torch.device(f"cuda:0")
             else:
-                self.device = torch.device(f'cuda:{device_idx}')
+                self.device = torch.device(f"cuda:{device_idx}")
         self.number_channel = 2
 
+        self.rate_is_range = is_rate_range(self.rate)
+        self.rates = (
+            build_rate_sweep(
+                self.rate, error_model_cfg, kwargs.get("training", False), "depol"
+            )
+            if self.rate_is_range
+            else None
+        )
+        self.shot_rate = None
 
-    def inject_error(self, codeword, batch_size:int=0):
-        logger.info(f'Injecting error.')
+    def inject_error(self, codeword, batch_size: int = 0):
+        logger.info(f"Injecting error.")
 
         codeword = codeword.to(self.device)
         if batch_size == 0:
@@ -41,17 +67,30 @@ class create():
         random_values = torch.rand_like(codeword)
         self.dtype = codeword.dtype
         self.len = codeword.shape
-        
-        x_error = torch.where(random_values < 2*self.rate/3, 1 - codeword, codeword)
-        y_error = torch.where(random_values < self.rate/3, 1 - codeword, codeword)
+
+        # a scalar is used as-is, so a decode run is unchanged; a swept rate gives every
+        # shot its own level, broadcast over that shot's qubits
+        rate = self.rate
+        if self.rate_is_range:
+            self.shot_rate = draw_shot_rate(
+                self.rates, codeword.size(0), 2, codeword.device, codeword.dtype
+            )
+            rate = self.shot_rate
+
+        x_error = torch.where(random_values < 2 * rate / 3, 1 - codeword, codeword)
+        y_error = torch.where(random_values < rate / 3, 1 - codeword, codeword)
         error = torch.stack([x_error, y_error], dim=1)
-        dataloader = torch.utils.data.DataLoader(dataset(error, self.get_llr(error), torch.arange(0, codeword.size(0))), batch_size=batch_size, shuffle=False)
-        logger.info(f'Injection complete.')
+        dataloader = torch.utils.data.DataLoader(
+            dataset(error, self.get_llr(error), torch.arange(0, codeword.size(0))),
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        logger.info(f"Injection complete.")
         return error, dataloader
-    
 
     def get_llr(self, error):
-        p = self.rate
+        # <shot_rate> is written by inject_error, this method's only caller in a run
+        p = self.shot_rate if self.rate_is_range else self.rate
         # Probabilities for each Pauli event
         p_I = 1 - p
         p_X = p / 3
@@ -59,9 +98,20 @@ class create():
         p_Z = p / 3
 
         # Stack probabilities per qubit
-        probs = torch.tensor([p_I, p_X, p_Y, p_Z], device=self.device, dtype=self.dtype)
-        llr = probs.view(4, 1).expand(4, error.shape[2]).unsqueeze(0).repeat(error.shape[0], 1, 1)
+        if self.rate_is_range:
+            # one row of priors per shot, since each drew its own rate
+            probs = torch.cat([p_I, p_X, p_Y, p_Z], dim=1)
+            llr = probs.unsqueeze(2).expand(-1, -1, error.shape[2]).contiguous()
+        else:
+            probs = torch.tensor(
+                [p_I, p_X, p_Y, p_Z], device=self.device, dtype=self.dtype
+            )
+            llr = (
+                probs.view(4, 1)
+                .expand(4, error.shape[2])
+                .unsqueeze(0)
+                .repeat(error.shape[0], 1, 1)
+            )
         # Optional: return log-probabilities for BP4 initialization
         # llr = -torch.log(llr + 1e-12)
         return llr
-    

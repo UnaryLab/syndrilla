@@ -1,0 +1,13 @@
+# Logical-centric loss for the stim circuit-level path.
+#
+# Same weights as the alist configuration. They are kept in a separate file because the
+# stim path is where `L_Ent`'s conditioning matters: its parity runs over the logical
+# observable's support, which is 36 error mechanisms on the shipped distance-3 circuit
+# against a handful of qubits on a code. The term is computed in the log domain for
+# exactly that reason (see docs/interface.md and the loss module); in the probability
+# domain its gradient there was identically zero.
+loss:
+  function: logical_centric
+  lambda_lc: 1.0
+  lambda_lp: 0.2
+  lambda_ent: 1.0

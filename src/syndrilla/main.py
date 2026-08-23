@@ -30,7 +30,7 @@ def parse_commandline_args():
         "--run_dir",
         type=str,
         default="tests/test_outputs",
-        help="Run directory to store outputs.",
+        help="Run directory to store outputs, for both decoding and training.",
     )
     parser.add_argument(
         "-d", "--decoder_yaml", type=str, default=None, help="Path to decoder yaml."
@@ -87,7 +87,7 @@ def parse_commandline_args():
         "-t",
         "--train",
         action="store_true",
-        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<code>_<size>.pt and _last.pt to --run_dir.",
+        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<code>_<size>{.pt,_last.pt,_history.json,_train.log} to --run_dir.",
     )
     parser.add_argument(
         "-ls",
@@ -141,11 +141,6 @@ def main():
             "-ckpt resumes a decode run; a training run resumes with -tckpt."
         )
 
-    if args.train and args.interface_yaml is not None:
-        raise ValueError(
-            "Training uses -d and -m; the -i interface path is not supported."
-        )
-
     required = [("-d", "decoder_yaml")]
     if args.interface_yaml is None:
         required += [
@@ -154,6 +149,11 @@ def main():
             ("-s", "syndrome_yaml"),
             ("-ls", "loss_yaml") if args.train else ("-c", "logical_yaml"),
         ]
+    elif args.train:
+        # the interface supplies the matrix, error model and measurer, but not the
+        # objective: which loss supervises the run is the run's own choice, exactly as
+        # it is on the -m path
+        required += [("-ls", "loss_yaml")]
     missing = [flag for flag, name in required if getattr(args, name) is None]
     if missing:
         mode = "Training" if args.train else "Decoding"
@@ -167,6 +167,13 @@ def main():
             trained_cfg.get("train"), args.run_dir, args.decoder_yaml
         )
         torch.manual_seed(metrics.cfg["seed"])
+        yaml_ckpt = trained_cfg.get("checkpoint")
+        if args.train_checkpoint is not None and yaml_ckpt:
+            raise ValueError(
+                f"-tckpt <{args.train_checkpoint}> and the decoder yaml's "
+                f"`config.checkpoint` <{yaml_ckpt}> both supply weights. "
+                f"Resuming reads them from -tckpt; remove the yaml key."
+            )
 
     if args.interface_yaml is not None:
         logger.success(
@@ -177,6 +184,7 @@ def main():
             error_yaml=args.error_yaml,
             syndrome_yaml=args.syndrome_yaml,
             decoder_yaml=args.decoder_yaml,
+            training=args.train,
         )
         logger.success(
             f"\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
@@ -189,21 +197,18 @@ def main():
         logger.success(
             f"\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
         )
+        # the interface leaves this None when training, which reads its loss straight
+        # off the decoder output and never checks a logical error
         logical_check = interface.logical_check
         bundle = interface.matrix_bundle
         decoders = interface.decoders
+
+        if args.train:
+            loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
     else:
         logger.success(
             f"\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
         )
-        if args.train:
-            yaml_ckpt = trained_cfg.get("checkpoint")
-            if args.train_checkpoint is not None and yaml_ckpt:
-                raise ValueError(
-                    f"-tckpt <{args.train_checkpoint}> and the decoder yaml's "
-                    f"`config.checkpoint` <{yaml_ckpt}> both supply weights. "
-                    f"Resuming reads them from -tckpt; remove the yaml key."
-                )
         matrix_cfg = read_yaml(get_path(args.matrix_yaml))["matrix"]
         bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
         decoders = create_decoder(cfg=decoder_cfg, bundle=bundle, training=args.train)
@@ -211,12 +216,12 @@ def main():
         logger.success(
             f"\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
         )
-        error_model = create_error_model(args.error_yaml)
+        error_model = create_error_model(args.error_yaml, training=args.train)
 
         logger.success(
             f"\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
         )
-        syndrome_generator = create_syndrome(args.syndrome_yaml)
+        syndrome_generator = create_syndrome(args.syndrome_yaml, training=args.train)
 
         if args.train:
             loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
@@ -228,12 +233,8 @@ def main():
         # decoder output, so the checker is never built
         logical_check = None if args.train else create_check(args.logical_yaml)
 
-    if not args.train and getattr(error_model, "rate_is_range", False):
-        raise ValueError(
-            f"Decoding needs one physical error rate, got the range "
-            f"<{error_model.rate}>. A <rate> range is a training-only form; set "
-            f"a scalar <rate> to decode."
-        )
+    # a swept rate is refused by the error model and the measurer themselves, from the
+    # `training` flag they were built with, so there is nothing to re-check here
 
     error_model.rounds = getattr(syndrome_generator, "rounds", 1)
 
