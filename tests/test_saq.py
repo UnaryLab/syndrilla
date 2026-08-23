@@ -1,19 +1,18 @@
-import sys, os
-import subprocess, json
+import json
+import os
+import subprocess
+import sys
 
 import pytest
 import torch
-from loguru import logger
 import yaml
 
 sys.path.append(os.getcwd())
 
 from syndrilla.decoder import create_decoder
-from syndrilla.matrix import load_matrices
-from syndrilla.loss import create_loss
-from syndrilla.utils import read_yaml, get_path, parse_device_dtype
 from syndrilla.decoder.decoder import SHARED_KEYS
-
+from syndrilla.matrix import load_matrices
+from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 DECODER_YAML = "examples/alist/saq_hx_train.decoder.yaml"
 DECODE_YAML = "examples/alist/saq_hx.decoder.yaml"

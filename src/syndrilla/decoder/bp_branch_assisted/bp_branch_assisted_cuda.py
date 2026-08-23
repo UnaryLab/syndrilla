@@ -27,12 +27,12 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from syndrilla.decoder.decoder import RebatchSpeedup
 from syndrilla.decoder.bp_branch_assisted.bp_branch_assisted import create as _BranchPy
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import (
-    _load_ext,
     _build_vn_adj,
+    _load_ext,
 )
+from syndrilla.decoder.decoder import RebatchSpeedup
 
 
 class create(_BranchPy):

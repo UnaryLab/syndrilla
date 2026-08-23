@@ -1,12 +1,12 @@
+import importlib.util
 import os
 import sys
-import importlib.util
+
 import numpy as np
 import torch
 from loguru import logger
 
-from syndrilla.utils import call_func_from_cfg, get_path, read_yaml, check_yaml_header
-
+from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, read_yaml
 
 # --------------------------------------------------------------------------- #
 # Adaptive iteration speedup for iterative BP decoders (`rebatch_speedup`, KL-paced).
@@ -246,16 +246,16 @@ class RoundFlattenWrapper(torch.nn.Module):
 # `decoder.config`: the algorithm-specific half of a decoder block.
 #
 # Everything at the top of the block is framework-wide -- `algorithm`, `check_type`,
-# `dtype`, `device`, `force_pytorch`, `checkpoint` and `rebatch_speedup` are read by
+# `dtype`, `device`, `force_pytorch` and `rebatch_speedup` are read by
 # main.py, this loader, or every decoder alike. What only one algorithm understands
 # (`max_iter`, `sf`, relay_bp's schedule, the quantization widths) lives under
 # `config`, one entry per entry of `algorithm`, so a chain can tune each stage
 # separately instead of sharing one flat namespace.
 # --------------------------------------------------------------------------- #
 
-# Keys that used to sit at the top of the block. Rejected there rather than ignored:
-# a decoder silently falling back to max_iter=50 instead of the configured 181 still
-# produces numbers, and they look like results.
+# Keys that belong under `config`, not at the top of the block. Rejected there rather
+# than ignored: a decoder silently falling back to max_iter=50 instead of the configured
+# 181 still produces numbers, and they look like results.
 MOVED_TO_CONFIG = (
     "max_iter",
     "damping_factor",
@@ -428,7 +428,7 @@ def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
     if cfg is not None:
         dec_cfg = cfg
         source = "dict"
-        logger.info(f"Creating decoder class from config dict.")
+        logger.info("Creating decoder class from config dict.")
     else:
         logger.info(f"Creating decoder class from <{get_path(yaml_path)}>.")
         full_path = get_path(yaml_path)

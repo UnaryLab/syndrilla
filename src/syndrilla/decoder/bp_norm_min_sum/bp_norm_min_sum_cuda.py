@@ -27,15 +27,15 @@ YAML algorithm key: bp_norm_min_sum_cuda
 See README.md in this directory for architecture, workflow and tuning notes.
 """
 
-import os
 import math
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
-
 
 # ── Extension loader ───────────────────────────────────────────────────────────
 

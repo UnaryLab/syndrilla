@@ -1,8 +1,6 @@
-import yaml
 import subprocess
-import re
-import csv
-import os
+
+import yaml
 
 
 def modify_yaml(file_path, changes):

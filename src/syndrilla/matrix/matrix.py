@@ -3,8 +3,12 @@ import os
 import torch
 from loguru import logger
 
-from syndrilla.utils import call_func_from_yaml, call_func_from_cfg, get_path, compute_lz
-
+from syndrilla.utils import (
+    call_func_from_cfg,
+    call_func_from_yaml,
+    compute_lz,
+    get_path,
+)
 
 # Shared circuit cache for the stim matrix loader. Lives in this module
 # (instead of stim.py) because the factory dynamically re-imports loader
@@ -66,12 +70,12 @@ def create_parity_matrix(yaml_path=None, cfg=None, **kwargs):
     header = 'matrix'
     func_name = 'file_type'
     if cfg is not None:
-        logger.info(f'Creating parity matrix class from config dict.')
+        logger.info('Creating parity matrix class from config dict.')
         output = call_func_from_cfg(cfg, header, func_name, os.path.dirname(__file__), **kwargs)
     else:
         logger.info(f'Creating parity matrix class from <{get_path(yaml_path)}>.')
         output = call_func_from_yaml(yaml_path, header, func_name, os.path.dirname(__file__), **kwargs)
-    logger.info(f'Complete.')
+    logger.info('Complete.')
     return output
 
 
@@ -143,13 +147,13 @@ def load_matrices(matrix_cfg, device, dtype=None):
     if dtype is not None:
         kw['dtype'] = dtype
 
-    logger.info(f'Loading hx parity check matrix.')
+    logger.info('Loading hx parity check matrix.')
     Hx_matrix = _load_one_matrix(matrix_cfg['parity_matrix_hx'], **kw)
 
-    logger.info(f'Loading hz parity check matrix.')
+    logger.info('Loading hz parity check matrix.')
     Hz_matrix = _load_one_matrix(matrix_cfg['parity_matrix_hz'], **kw)
 
-    logger.info(f'Loading lx and lz logical matrices.')
+    logger.info('Loading lx and lz logical matrices.')
     if matrix_cfg.get('logical_check_matrix', False):
         lx_matrix = _load_one_matrix(matrix_cfg['logical_check_lx'], **kw).get_dense()
         lz_matrix = _load_one_matrix(matrix_cfg['logical_check_lz'], **kw).get_dense()

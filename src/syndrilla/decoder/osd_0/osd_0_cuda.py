@@ -21,13 +21,13 @@ YAML algorithm key: osd_0_cuda. Chain it after a BP stage, e.g.
 ``algorithm: [bp_norm_min_sum_cuda, osd_0_cuda]``.
 """
 
-import os
 import math
+import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from loguru import logger
-
 
 # ── Extension loader (mirrors bp_norm_min_sum_cuda) ─────────────────────────────
 

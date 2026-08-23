@@ -89,5 +89,5 @@ class create:
         self.observable_flips = ((e @ L.t()) % 2).to(torch.uint8)
         self.syndrome_actual = syndrome
 
-        logger.info(f"Stim syndrome measurement complete.")
+        logger.info("Stim syndrome measurement complete.")
         return syndrome

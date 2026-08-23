@@ -27,7 +27,7 @@ Every shot then draws its own measurement error rate, and the prior it folds int
 import torch
 from loguru import logger
 
-from syndrilla.utils import is_rate_range, build_rate_sweep, draw_shot_rate
+from syndrilla.utils import build_rate_sweep, draw_shot_rate, is_rate_range
 
 
 class create:
@@ -59,7 +59,7 @@ class create:
         )
 
     def measure_syndrome(self, error, decoder):
-        logger.info(f"Measuring syndrome.")
+        logger.info("Measuring syndrome.")
 
         if error.ndim == 2:
             # [B, N] — single round. (rounds > 1 always arrives as a 3-D
@@ -75,7 +75,7 @@ class create:
             syndrome = torch.where((syndrome % 2) > 0, 1, 0)
 
             self.syndrome_actual = syndrome
-            logger.info(f"Syndrome measurement complete.")
+            logger.info("Syndrome measurement complete.")
             return self._apply_noise(syndrome)
         else:
             # [B, rounds, N] — error already carries per-round data
@@ -91,7 +91,7 @@ class create:
             syndrome = torch.where((syndrome % 2) > 0, 1, 0)
 
             self.syndrome_actual = syndrome
-            logger.info(f"Syndrome measurement complete.")
+            logger.info("Syndrome measurement complete.")
 
             noisy = self._apply_noise(syndrome)
             logger.info(

@@ -20,8 +20,8 @@ YAML algorithm key: bp_lottery_policy_cuda
 import torch
 from loguru import logger
 
-from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _NmsCuda
 from syndrilla.decoder.bp_lottery_policy.bp_lottery_policy import create as _PolicyPy
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _NmsCuda
 
 
 class create(_NmsCuda, _PolicyPy):

@@ -36,6 +36,7 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
     - [Comparison across batch sizes and against CPU](#comparison-across-batch-sizes-and-against-cpu)
   - [Citation](#citation)
   - [Contribution](#contribution)
+  - [License](#license)
 
 ## Features
 1. High modularity: easily customizing your own **decoding algorithms** and **error models**
@@ -590,3 +591,6 @@ If you use Syndrilla in your research, please cite the following papers:
 
 ## Contribution
 We warmly welcome contributions to Syndrilla — just open a pull request!
+
+## License
+Syndrilla is released under the MIT License. See [LICENSE](LICENSE) for the full text.

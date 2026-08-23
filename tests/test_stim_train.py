@@ -29,8 +29,6 @@ from syndrilla.loss.logical_centric.logical_centric import (
     _parity_llr,
     bin_to_sign,
 )
-from syndrilla.matrix.stim.stim import _build_dem_matrices
-
 
 INTERFACE_YAML = "examples/stim/stim_generated.interface.yaml"
 TRAIN_ERROR_YAML = "examples/stim/stim_train.error.yaml"

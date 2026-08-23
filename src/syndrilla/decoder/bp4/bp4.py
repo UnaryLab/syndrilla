@@ -1,5 +1,4 @@
 import torch
-
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
@@ -30,7 +29,7 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f"Creating bp decoder.")
+        logger.info("Creating bp decoder.")
 
         # set up default device
         device_cfg = decoder_cfg.get("device", {})
@@ -54,7 +53,7 @@ class create(torch.nn.Module):
                 logger.warning(
                     f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
                 )
-                self.device = torch.device(f"cuda:0")
+                self.device = torch.device("cuda:0")
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
@@ -123,7 +122,7 @@ class create(torch.nn.Module):
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
     def forward(self, io_dict):
         """Iterative bp4 (Quaternary BP) decoding algorithm
@@ -144,7 +143,7 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f"Initializing bp4 (Quaternary BP) decoding.")
+        logger.info("Initializing bp4 (Quaternary BP) decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
 
@@ -192,7 +191,6 @@ class create(torch.nn.Module):
             self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device
         ).repeat(self.batch_size, 1, 1, 1)
 
-        # self.syndrome_neg = self.syndrome_neg[:, channel_idx[:, None, None], self.V_c_row]
         chan = torch.cat(
             (io_dict["llr0"].to(self.device).to(self.dtype), dummy_column), dim=2
         )
@@ -211,9 +209,9 @@ class create(torch.nn.Module):
         message[:, 0] = x_msg[:, self.V_c_col[0]]  # channel 0: X
         message[:, 1] = z_msg[:, self.V_c_col[1]]
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
-        logger.info(f"Starting decoding iterations.")
+        logger.info("Starting decoding iterations.")
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
@@ -281,7 +279,7 @@ class create(torch.nn.Module):
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
             self.cap.observe(num_iters, self.max_iter, self.batch_size)
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         logger.info(f"Decoding iterations: <{(self.i)}>.")
         io_dict.update(
             {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
@@ -299,14 +297,13 @@ class create(torch.nn.Module):
 
         check_node = check_node[:, channel_idx[:, None, None], self.V_c_row]
 
-        # sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=3, keepdim=True)
 
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=3)  # Changed from dim=2 to dim=3
-        min_0 = sorted[:, :, :, 0].unsqueeze(3)  # Added extra : for channel dimension
-        min_1 = sorted[:, :, :, 1].unsqueeze(3)  # Added extra : for channel dimension
+        sorted, _ = torch.sort(abs_a_v2c, dim=3)
+        min_0 = sorted[:, :, :, 0].unsqueeze(3)
+        min_1 = sorted[:, :, :, 1].unsqueeze(3)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
         message = check_node * sign_prod * sign * min_result
         message[:, :, self.mask_dummy] = float(0.0)

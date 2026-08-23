@@ -36,9 +36,8 @@ circuit's noise profile is preserved rather than flattened.
 import torch
 from loguru import logger
 
-from syndrilla.utils import dataset, is_rate_range, build_rate_sweep
 from syndrilla.interface.stim.stim import get_stim_circuit
-
+from syndrilla.utils import build_rate_sweep, dataset, is_rate_range
 
 # Every noise knob `stim.Circuit.generated` accepts. Kept in one place so the sweep
 # scales exactly the keys the circuit was built with and invents none.
@@ -233,7 +232,7 @@ class create:
         deferred-sample queue needs too: re-measuring a stored error reproduces its own
         syndrome rather than an unrelated fresh one.
         """
-        logger.info(f"Injecting error.")
+        logger.info("Injecting error.")
         if self.rounds > 1:
             raise ValueError(
                 f"Error model <stim_circuit> needs <rounds> 1, got <{self.rounds}>; a "
@@ -271,7 +270,7 @@ class create:
             batch_size=batch_size,
             shuffle=False,
         )
-        logger.info(f"Injection complete.")
+        logger.info("Injection complete.")
         return error, dataloader
 
     def get_llr(self, error):

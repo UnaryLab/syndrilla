@@ -1,8 +1,7 @@
 import torch
-
 from loguru import logger
 
-from syndrilla.utils import dataset, is_rate_range, build_rate_sweep, draw_shot_rate
+from syndrilla.utils import build_rate_sweep, dataset, draw_shot_rate, is_rate_range
 
 
 class create:
@@ -17,7 +16,7 @@ class create:
 
     def __init__(self, error_model_cfg, **kwargs) -> None:
         assert "rate" in error_model_cfg.keys(), logger.error(
-            f"Missing key <rate> in the configuration."
+            "Missing key <rate> in the configuration."
         )
         self.rate = error_model_cfg["rate"]
 
@@ -42,7 +41,7 @@ class create:
                 logger.warning(
                     f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
                 )
-                self.device = torch.device(f"cuda:0")
+                self.device = torch.device("cuda:0")
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
         self.number_channel = 2
@@ -58,7 +57,7 @@ class create:
         self.shot_rate = None
 
     def inject_error(self, codeword, batch_size: int = 0):
-        logger.info(f"Injecting error.")
+        logger.info("Injecting error.")
 
         codeword = codeword.to(self.device)
         if batch_size == 0:
@@ -85,7 +84,7 @@ class create:
             batch_size=batch_size,
             shuffle=False,
         )
-        logger.info(f"Injection complete.")
+        logger.info("Injection complete.")
         return error, dataloader
 
     def get_llr(self, error):
@@ -112,6 +111,4 @@ class create:
                 .unsqueeze(0)
                 .repeat(error.shape[0], 1, 1)
             )
-        # Optional: return log-probabilities for BP4 initialization
-        # llr = -torch.log(llr + 1e-12)
         return llr

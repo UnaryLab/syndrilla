@@ -1,5 +1,4 @@
 import torch
-
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
@@ -30,7 +29,7 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f"Creating bp decoder.")
+        logger.info("Creating bp decoder.")
 
         # set up default device
         device_cfg = decoder_cfg.get("device", {})
@@ -54,7 +53,7 @@ class create(torch.nn.Module):
                 logger.warning(
                     f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
                 )
-                self.device = torch.device(f"cuda:0")
+                self.device = torch.device("cuda:0")
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
@@ -125,7 +124,7 @@ class create(torch.nn.Module):
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
     def forward(self, io_dict):
         """Iterative bp (normalized min sum) decoding algorithm
@@ -146,7 +145,7 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f"Initializing bp (normailized min sum) decoding.")
+        logger.info("Initializing bp (normailized min sum) decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
 
@@ -193,9 +192,9 @@ class create(torch.nn.Module):
         self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
         self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
-        logger.info(f"Starting decoding iterations.")
+        logger.info("Starting decoding iterations.")
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
@@ -264,7 +263,7 @@ class create(torch.nn.Module):
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
             self.cap.observe(num_iters, self.max_iter, self.batch_size)
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         logger.info(f"Decoding iterations: <{(self.i)}>.")
         io_dict.update(
             {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}

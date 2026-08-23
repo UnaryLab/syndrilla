@@ -1,10 +1,9 @@
-import sys
 import os
-import math
+import sys
+
 import numpy as np
 import scipy.sparse as sp
 import torch
-import stim
 from ldpc import BpOsdDecoder
 
 sys.path.append(os.getcwd())
@@ -116,7 +115,7 @@ def decode_reference(H, priors, det_data, max_iter=100):
 # ----------------------------------------------------------------------------
 def test_stim_bposd(distance=3, rounds=1, p=0.05,
                     n_shots=100000, max_iter=100):
-    print(f'\n=== Stim BPOSD comparison ===')
+    print('\n=== Stim BPOSD comparison ===')
     print(f'  surface_code rotated_memory_z, distance={distance}, rounds={rounds}, p={p}')
 
     # ---- 1. create interface ----

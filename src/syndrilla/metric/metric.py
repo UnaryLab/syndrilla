@@ -1,11 +1,13 @@
-import torch, os
-import json, time
-import yaml
-import numpy as np
+import json
+import os
+import time
 
+import numpy as np
+import torch
+import yaml
 from loguru import logger
 
-from syndrilla.utils import read_yaml, get_path
+from syndrilla.utils import get_path
 
 
 class MetricResult(dict):
@@ -167,7 +169,7 @@ class MetricState:
     `mode` says which, and the training half's members carry a qualifier wherever the
     two would otherwise collide: `accumulate` and `accumulate_loss`, `begin_run` and
     `begin_train_run`, `validate_checkpoint` and `validate_train_checkpoint`. Build with
-    `MetricState(num_decoders, number_channel, device)` to decode, or with `from_cfg` /
+    `MetricState(num_decoders, number_channel, device)` to decode, or with
     `for_training` to train; calling across the two halves is a bug the mode flag makes
     visible rather than one this class prevents.
 
@@ -314,7 +316,7 @@ class MetricState:
             logger.info(f'Converge failure rate: {result["converge_fail"][ch]}')
             logger.info(f'Converge success rate: {result["converge_succ"][ch]}')
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         return result
 
     def get_all_metrics(self, num_batches, algo_names, decoders=None):
@@ -499,7 +501,7 @@ class MetricState:
     # checkpoints and <stem>_history.json. Accumulates each batch's loss terms and logical
     # class error under its phase ('train' or 'val'), averages them at the epoch
     # boundary, formats the epoch line, and writes the run out. Live only on a state
-    # built by `from_cfg` / `for_training`; the fields below do not exist on a decode
+    # built by `for_training`; the fields below do not exist on a decode
     # state, which is what keeps the two halves from being mistaken for each other.
     # ------------------------------------------------------------------
 
@@ -508,16 +510,18 @@ class MetricState:
     TRAIN_KEYS = ("epochs", "batches_per_epoch", "val_batches", "seed")
 
     @classmethod
-    def from_cfg(cls, cfg, run_dir, source):
-        """Validate a training schedule and build the run's metrics.
+    def validate_train_cfg(cls, cfg, source):
+        """Check a training schedule read off a decoder yaml and hand it back.
 
         Takes the schedule block itself, not the yaml it came from: this class has no
         business reading a decoder config. `source` is only used to name the file in
         error messages. `seed` stays inside `cfg` for the caller: it is the only key
         here that is not a metric concern.
 
-        The validation is why this, rather than `for_training`, is what `main.py`
-        calls: a schedule read off a yaml has to be checked before a run is built on it.
+        Split from `for_training` because `main.py` wants the two at different points:
+        the schedule has to be checked, and its seed applied, before the decoders that
+        seed initialises are built, while the state itself is only built once there is
+        a decoder for it to meter.
         """
         logger.info(f"Reading training schedule from <{get_path(source)}>.")
         if cfg is None:
@@ -541,7 +545,7 @@ class MetricState:
                     f"Decoder yaml {source} needs <{key}> to be an integer "
                     f">= {floor}, got <{value!r}>."
                 )
-        return cls.for_training(run_dir, cfg)
+        return cfg
 
     @classmethod
     def for_training(cls, run_dir, cfg):

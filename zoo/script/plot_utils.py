@@ -1,12 +1,9 @@
 import argparse
-import os
-import sys
-import yaml
-from pathlib import Path
 from collections import OrderedDict
-from yamlordereddictloader import SafeDumper
+from pathlib import Path
+
+import yaml
 from yamlordereddictloader import SafeLoader
-from loguru import logger
 
 
 def parse_commandline_args():
@@ -25,7 +22,7 @@ def parse_dirname_to_sorted_ordereddict(dirname):
     parts = dirname.split("_")
     output = sorted(parts)
     return output
-    
+
 
 def read_result_yaml_from_dir(directory):
     dir_path = Path(directory)
@@ -64,7 +61,7 @@ def load_results_dict(root_dir):
                 total_result += 1
                 output_key, output_value = read_result_yaml_from_dir(subfolder)
                 results_dict[str(output_key)] = output_value
-    
+
     print(f"{total_result/total_sim*100:.2f} % simulations are done in {root_dir}")
     return results_dict
 
@@ -103,5 +100,5 @@ def lookup_results_dict(input_dict: OrderedDict(), key_list: list):
                 # it is possible the returned result is None, as the input_dict is empty
                 output = float(temp_output)
                 return output
-    
+
     return None

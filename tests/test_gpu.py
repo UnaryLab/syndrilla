@@ -1,6 +1,9 @@
-import torch
-import sys, os, time
+import os
+import sys
+import time
+
 import pytest
+import torch
 
 sys.path.append(os.getcwd())
 
@@ -10,11 +13,11 @@ pynvml = pytest.importorskip('pynvml')
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
-from syndrilla.metric import report_metric, save_metric, MetricState, BatchTracker
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.utils import read_yaml, get_path, parse_device_dtype
+from syndrilla.metric import BatchTracker, MetricState, report_metric, save_metric
+from syndrilla.syndrome import create_syndrome
+from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 
 def get_gpu_memory_utilization(gpu_index=0):

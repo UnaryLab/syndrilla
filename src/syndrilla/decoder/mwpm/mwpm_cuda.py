@@ -32,7 +32,6 @@ from loguru import logger
 
 from syndrilla.decoder.mwpm.mwpm import create as _MwpmPy
 
-
 _KERNEL = None  # compiled once per process
 
 # Observable-mask width, in 64-bit words. MUST equal OBSW in cuda/mwpm_kernel.cu. The kernel
@@ -219,9 +218,9 @@ class create(_MwpmPy):
             #  (1) the kernel could not complete it (arena overflow, err != 0), OR
             #  (2) its correction fails the syndrome check H @ e != s (mod 2). This is a pure
             #      safety net for an invalid matching; it does NOT catch a valid-but-different
-            #      degenerate representative. That degeneracy was the old N>64 e-diff source
-            #      and is now removed at the root by the match-edge/SearchFlooder path above,
-            #      so a bit-exact correction no longer relies on this check firing.
+            #      degenerate representative. The match-edge/SearchFlooder path above rules
+            #      that degeneracy out at the root, so a bit-exact correction does not rely
+            #      on this check firing.
             bad_err = np.nonzero(err != 0)[0]
             pred = (e_v.astype(np.int64) @ self._H_np.T.astype(np.int64)) & 1  # [B, M]
             bad_inv = np.nonzero((pred.astype(np.uint8) != synd_np).any(axis=1))[0]

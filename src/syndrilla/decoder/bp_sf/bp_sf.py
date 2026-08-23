@@ -3,7 +3,6 @@ import math
 import random
 
 import torch
-
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
@@ -54,7 +53,7 @@ class create(torch.nn.Module):
     def __init__(self, decoder_cfg, **kwargs) -> None:
         super(create, self).__init__()
 
-        logger.info(f"Creating bp_sf decoder.")
+        logger.info("Creating bp_sf decoder.")
 
         # set up default device
         device_cfg = decoder_cfg.get("device", {})
@@ -78,7 +77,7 @@ class create(torch.nn.Module):
                 logger.warning(
                     f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
                 )
-                self.device = torch.device(f"cuda:0")
+                self.device = torch.device("cuda:0")
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
@@ -180,7 +179,7 @@ class create(torch.nn.Module):
     def forward(self, io_dict):
         """Decode a batch: normalized-min-sum BP, then SF post-processing on the
         samples BP left unconverged."""
-        logger.info(f"Initializing bp_sf decoding.")
+        logger.info("Initializing bp_sf decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
         llr0 = io_dict["llr0"].to(dtype=self.dtype).to(self.device)
@@ -198,7 +197,7 @@ class create(torch.nn.Module):
                 syndrome, llr0, e_out, l_out, converges, num_iters, osc
             )
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         io_dict.update(
             {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
         )

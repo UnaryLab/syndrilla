@@ -2,7 +2,7 @@ import os
 
 from loguru import logger
 
-from syndrilla.utils import call_func_from_yaml, call_func_from_cfg, get_path
+from syndrilla.utils import call_func_from_cfg, call_func_from_yaml, get_path
 
 
 def create_loss(yaml_path: str = None, cfg: dict = None, **kwargs):
@@ -16,10 +16,10 @@ def create_loss(yaml_path: str = None, cfg: dict = None, **kwargs):
     header = 'loss'
     func_name = 'function'
     if cfg is not None:
-        logger.info(f'Creating loss module from config dict.')
+        logger.info('Creating loss module from config dict.')
         output = call_func_from_cfg(cfg, header, func_name, os.path.dirname(__file__), **kwargs)
     else:
         logger.info(f'Creating loss module from <{get_path(yaml_path)}>.')
         output = call_func_from_yaml(yaml_path, header, func_name, os.path.dirname(__file__), **kwargs)
-    logger.info(f'Creating loss module complete.')
+    logger.info('Creating loss module complete.')
     return output

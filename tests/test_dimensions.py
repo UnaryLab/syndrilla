@@ -1,18 +1,18 @@
-import sys, os
+import os
+import sys
+
 import stim
 import torch
-import pytest
 
 sys.path.append(os.getcwd())
 
-from syndrilla.interface import create_interface
 from syndrilla.decoder import create_decoder
-from syndrilla.syndrome import create_syndrome
 from syndrilla.error_model import create_error_model
+from syndrilla.interface import create_interface
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
+from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import parse_device_dtype
-
 
 BATCH_SIZE = 10
 NOISE = 0.01

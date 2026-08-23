@@ -1,5 +1,6 @@
-import sys
 import os
+import sys
+
 import torch
 from loguru import logger
 
@@ -9,10 +10,9 @@ sys.path.append(os.getcwd())
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
 from syndrilla.matrix import load_matrices
+from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import parse_device_dtype
-
 
 SURFACE_DIR = 'examples/alist/surface'
 DISTANCE = 3

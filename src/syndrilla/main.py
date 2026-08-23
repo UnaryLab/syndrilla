@@ -1,21 +1,25 @@
+import argparse
+import sys
+import time
+
+import pyfiglet
 import torch
-import sys, time
-import pyfiglet, argparse
 from loguru import logger
-from syndrilla.utils import bcolors, read_yaml, get_path, parse_device_dtype, ExtraQueue
+
 from syndrilla.decoder import assert_trainable, create_decoder, resolve_configs
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
+from syndrilla.interface import create_interface
+from syndrilla.logical_check import create_check
+from syndrilla.loss import create_loss
+from syndrilla.matrix import load_matrices
 from syndrilla.metric import (
+    BatchTracker,
+    MetricState,
     report_metric,
     save_metric,
-    MetricState,
-    BatchTracker,
 )
-from syndrilla.matrix import load_matrices
-from syndrilla.logical_check import create_check
-from syndrilla.interface import create_interface
-from syndrilla.loss import create_loss
+from syndrilla.syndrome import create_syndrome
+from syndrilla.utils import ExtraQueue, bcolors, get_path, parse_device_dtype, read_yaml
 
 
 def parse_commandline_args():
@@ -133,7 +137,7 @@ def main():
     if args.train_checkpoint is not None and not args.train:
         raise ValueError(
             "-tckpt resumes a training run, so it needs -t. To decode from a "
-            "checkpoint, put its path under the decoder yaml's `checkpoint` key."
+            "checkpoint, put its path under the decoder yaml's `config.checkpoint` key."
         )
 
     if args.train and args.checkpoint_yaml is not None:
@@ -150,10 +154,8 @@ def main():
             ("-ls", "loss_yaml") if args.train else ("-c", "logical_yaml"),
         ]
     elif args.train:
-        # the interface supplies the matrix, error model and measurer, but not the
-        # objective: which loss supervises the run is the run's own choice, exactly as
-        # it is on the -m path
         required += [("-ls", "loss_yaml")]
+        
     missing = [flag for flag, name in required if getattr(args, name) is None]
     if missing:
         mode = "Training" if args.train else "Decoding"
@@ -163,10 +165,10 @@ def main():
 
     if args.train:
         trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[-1]
-        metrics = MetricState.from_cfg(
-            trained_cfg.get("train"), args.run_dir, args.decoder_yaml
+        train_cfg = MetricState.validate_train_cfg(
+            trained_cfg.get("train"), args.decoder_yaml
         )
-        torch.manual_seed(metrics.cfg["seed"])
+        torch.manual_seed(train_cfg["seed"])
         yaml_ckpt = trained_cfg.get("checkpoint")
         if args.train_checkpoint is not None and yaml_ckpt:
             raise ValueError(
@@ -177,7 +179,7 @@ def main():
 
     if args.interface_yaml is not None:
         logger.success(
-            f"\n----------------------------------------------\nStep 1: Create interface\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 1: Create interface\n----------------------------------------------"
         )
         interface = create_interface(
             args.interface_yaml,
@@ -187,15 +189,15 @@ def main():
             training=args.train,
         )
         logger.success(
-            f"\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
         )
         error_model = interface.error_model
         logger.success(
-            f"\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
         )
         syndrome_generator = interface.syndrome_generator
         logger.success(
-            f"\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
         )
         # the interface leaves this None when training, which reads its loss straight
         # off the decoder output and never checks a logical error
@@ -207,19 +209,19 @@ def main():
             loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
     else:
         logger.success(
-            f"\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
         )
         matrix_cfg = read_yaml(get_path(args.matrix_yaml))["matrix"]
         bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
         decoders = create_decoder(cfg=decoder_cfg, bundle=bundle, training=args.train)
 
         logger.success(
-            f"\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
         )
         error_model = create_error_model(args.error_yaml, training=args.train)
 
         logger.success(
-            f"\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
         )
         syndrome_generator = create_syndrome(args.syndrome_yaml, training=args.train)
 
@@ -227,7 +229,7 @@ def main():
             loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
 
         logger.success(
-            f"\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
         )
         # training never checks logical errors: it reads its loss straight off the
         # decoder output, so the checker is never built
@@ -267,11 +269,12 @@ def main():
         cap_on = False
 
     logger.success(
-        f"\n----------------------------------------------\nStep 5: Check checkpoint file\n----------------------------------------------"
+        "\n----------------------------------------------\nStep 5: Check checkpoint file\n----------------------------------------------"
     )
 
     if args.train:
         assert_trainable(decoders)
+        metrics = MetricState.for_training(args.run_dir, train_cfg)
         num_batches = metrics.begin_train_run(
             decoders[-1],
             args.batch_size,
@@ -302,7 +305,7 @@ def main():
         num_err <= args.target_error or (cap_on and queue.nonempty)
     ):
         logger.success(
-            f"\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
         )
         bt = BatchTracker(num_decoders, number_channel, shape, dtype, decoder_device)
 
@@ -334,7 +337,7 @@ def main():
             bt.record_error(err)
 
             logger.success(
-                f"\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------"
             )
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
 
@@ -345,7 +348,7 @@ def main():
             io_dict = {"synd": synd, "llr0": llr0, "H_matrix": H_matrix}
 
             logger.success(
-                f"\n----------------------------------------------\nStep 8: Decode\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 8: Decode\n----------------------------------------------"
             )
             for decoder_idx in range(num_decoders):
                 start_time = time.time()
@@ -378,7 +381,7 @@ def main():
                 bt.keep_samples(cap_keep)
 
             logger.success(
-                f"\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------"
             )
 
             has_obs_flips = (
@@ -405,7 +408,7 @@ def main():
 
             # report and accumulate metrics
             logger.success(
-                f"\n----------------------------------------------\nStep 10: Aggregate metrics\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 10: Aggregate metrics\n----------------------------------------------"
             )
             if number_channel == 1:
                 bt.e_v_all = [
@@ -428,7 +431,7 @@ def main():
 
             if num_batches % 100 == 0:
                 logger.success(
-                    f"\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
+                    "\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
                 )
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
                 save_metric(
@@ -455,7 +458,7 @@ def main():
         return
 
     logger.success(
-        f"\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------"
+        "\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------"
     )
     all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
     save_metric(

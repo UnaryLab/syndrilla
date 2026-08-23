@@ -2,7 +2,7 @@ import os
 
 from loguru import logger
 
-from syndrilla.utils import call_func_from_yaml, call_func_from_cfg, get_path, read_yaml
+from syndrilla.utils import call_func_from_cfg, call_func_from_yaml, get_path, read_yaml
 
 
 def create_interface(yaml_path: str = None, cfg: dict = None,
@@ -34,10 +34,10 @@ def create_interface(yaml_path: str = None, cfg: dict = None,
     header = 'interface'
     func_name = 'backend'
     if cfg is not None:
-        logger.info(f'Creating interface from config dict.')
+        logger.info('Creating interface from config dict.')
         output = call_func_from_cfg(cfg, header, func_name, os.path.dirname(__file__), **kwargs)
     else:
         logger.info(f'Creating interface from <{get_path(yaml_path)}>.')
         output = call_func_from_yaml(yaml_path, header, func_name, os.path.dirname(__file__), **kwargs)
-    logger.info(f'Creating interface complete.')
+    logger.info('Creating interface complete.')
     return output

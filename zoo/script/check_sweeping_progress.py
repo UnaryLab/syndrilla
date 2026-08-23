@@ -28,7 +28,7 @@ def main():
             if subfolder.is_dir():
                 total_sim += 1
                 results_files = list(subfolder.glob("result*"))
-                
+
                 if results_files:
                     print(f"{subfolder}: result ready.")
                     total_result += 1
@@ -48,7 +48,7 @@ def main():
                     if subsubfolder.is_dir():
                         total_sim += 1
                         results_files = list(subsubfolder.glob("result*"))
-                        
+
                         if results_files:
                             total_result += 1
 

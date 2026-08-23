@@ -30,12 +30,11 @@ logger.remove()  # silence syndrilla's INFO chatter
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
-from syndrilla.metric import report_metric, save_metric, MetricState, BatchTracker
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.utils import read_yaml, get_path, parse_device_dtype
-
+from syndrilla.metric import BatchTracker, MetricState, report_metric, save_metric
+from syndrilla.syndrome import create_syndrome
+from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 # --------------------------------------------------------------------------
 # (label, decoder_yaml, error_yaml, syndrome_yaml, check_yaml, check_type)
@@ -225,12 +224,12 @@ def run_one_config(
     resume_extra=2,
     progress_every=5,
 ):
-    print(f"\n========================================================================")
+    print("\n========================================================================")
     print(f"CONFIG: {label}")
     print(f"  decoder_yaml = {decoder_yaml}")
     print(f"  error_yaml   = {error_yaml}")
     print(f"  syndrome_yaml= {syndrome_yaml}")
-    print(f"========================================================================")
+    print("========================================================================")
 
     decoders, em, sg, lc, bundle, decoder_cfg = build_pipeline(
         decoder_yaml, error_yaml, syndrome_yaml, check_yaml
@@ -283,10 +282,9 @@ def run_one_config(
 
     pre = snapshot(m, nc)
     pre_ne = ne
-    pre_avg_ler = m.logical_error_rate[0][0] / save_every
 
     # ---------- Phase 2: drop, reload, validate ----------
-    print(f"  Phase 2: drop state, reload ckpt, validate")
+    print("  Phase 2: drop state, reload ckpt, validate")
     del m
     m_loaded, meta = MetricState.from_checkpoint(ckpt_path, nc, dev)
     m_loaded.validate_checkpoint(meta, batch_size, target_error, dtype, em.rate, H_file)
@@ -304,7 +302,7 @@ def run_one_config(
     print(f'    meta.num_err={meta["num_err"]} (expect {pre_ne}: {ne_ok})')
 
     # ---------- Phase 3: every averaged metric round-trips through the YAML ----------
-    print(f"  Phase 3: every averaged metric round-trips")
+    print("  Phase 3: every averaged metric round-trips")
     pre_avg = {f"d{i}": pre_out for i, pre_out in enumerate(out)}
     post_avg = {
         f"d{i}": v
@@ -434,9 +432,9 @@ def main():
             ok = False
         results[label] = ok
 
-    print(f"\n========================================================================")
-    print(f"OVERALL SUMMARY")
-    print(f"========================================================================")
+    print("\n========================================================================")
+    print("OVERALL SUMMARY")
+    print("========================================================================")
     for label, ok in results.items():
         print(f'  {"PASS" if ok else "FAIL"}  {label}')
 

@@ -1,9 +1,11 @@
-import sys, os
-import torch
+import os
+import sys
+
 import numpy as np
-import stim
 import pytest
 import scipy.sparse as sp
+import stim
+import torch
 
 sys.path.append(os.getcwd())
 from syndrilla.interface import create_interface

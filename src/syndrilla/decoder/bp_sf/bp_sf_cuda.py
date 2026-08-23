@@ -41,11 +41,11 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from syndrilla.decoder.bp_sf.bp_sf import create as _BpSfPy
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import (
-    _load_ext,
     _build_vn_adj,
+    _load_ext,
 )
+from syndrilla.decoder.bp_sf.bp_sf import create as _BpSfPy
 
 
 class create(_BpSfPy):
@@ -124,7 +124,7 @@ class create(_BpSfPy):
         replicates the reference: per bit, count how often the hard decision differs
         from the previous iteration, starting from an all-zero prior."""
         dev, dt = self.device, self.dtype
-        N, N_ext, VD = self.N, self.N_ext, self.VD
+        N, N_ext = self.N, self.N_ext
         syndrome = syndrome.to(dev, dt).contiguous()
         B, M = syndrome.shape
         D = int(self.V_c_col.shape[1])

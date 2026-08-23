@@ -22,7 +22,7 @@ class create():
         the outcome stim's own decoders are compared against. Earlier rounds are the
         state on the way there, not competing verdicts to be reconciled.
         """
-        logger.info(f'Measuring stim logical check rate.')
+        logger.info('Measuring stim logical check rate.')
 
         device = e_v_total.device
         e_v = e_v_total.to(device).to(torch.float32)
@@ -35,7 +35,7 @@ class create():
         obs_flips = observable_flips.to(device).to(torch.float32)
         logical_check = self._check_single(predicted_obs, obs_flips, converge)
 
-        logger.info(f'Stim logical check rate measurement complete.')
+        logger.info('Stim logical check rate measurement complete.')
         return logical_check
 
     def _check_single(self, predicted_obs, obs_flips, converge):

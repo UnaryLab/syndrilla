@@ -1,12 +1,14 @@
-import torch
-import sys, os
+import os
+import sys
+
 import numpy as np
+import torch
 
 sys.path.append(os.getcwd())
 
 from syndrilla.error_model import create_error_model
 from syndrilla.matrix import load_matrices
-from syndrilla.utils import read_yaml, get_path, parse_device_dtype
+from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 
 def test_error_model():

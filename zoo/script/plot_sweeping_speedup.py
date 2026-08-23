@@ -1,6 +1,7 @@
-import sys, shutil
-import matplotlib.pyplot as plt
+import sys
 from pathlib import Path
+
+import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 # Get the directory containing the current Python file
@@ -10,7 +11,11 @@ current_path = Path(__file__).resolve().parent.parent.parent
 if str(current_path) not in sys.path:
     sys.path.insert(0, str(current_path))
 
-from zoo.script.plot_utils import load_results_dict, tag_to_str, is_substring, lookup_results_dict
+from zoo.script.plot_utils import (
+    load_results_dict,
+    lookup_results_dict,
+    tag_to_str,
+)
 
 
 def main():
@@ -48,7 +53,7 @@ def main():
 
         for err in x_ticks:
             tags.append(tag_to_str(tag_shared + [str(err)]))
-        
+
         amd_mi210 = []
         for tag in tags:
             amd_mi210.append(lookup_results_dict(results_dict_gpu_amd_mi210,   full_decoding_metric + [tag]))
@@ -91,7 +96,7 @@ def main():
             label_nv_h200   = None
 
         if dtype == 'float16':
-            ax.legend(legend_proxies, legend_labels, 
+            ax.legend(legend_proxies, legend_labels,
                         loc='best',
                         ncol=3,
                         handletextpad=0.1,  # Reduce space between marker and label
@@ -131,7 +136,7 @@ def main():
 
         for err in x_ticks:
             tags.append(tag_to_str(tag_shared + [f'float{err}']))
-        
+
         amd_mi210 = []
         for tag in tags:
             amd_mi210.append(lookup_results_dict(results_dict_gpu_amd_mi210,   full_decoding_metric + [tag]))
@@ -174,7 +179,7 @@ def main():
             label_nv_h200   = None
 
         if error_rate == '0.02':
-            ax.legend(legend_proxies, legend_labels, 
+            ax.legend(legend_proxies, legend_labels,
                         loc='best',
                         ncol=3,
                         handletextpad=0.1,  # Reduce space between marker and label
@@ -214,7 +219,7 @@ def main():
 
         for err in x_ticks:
             tags.append(tag_to_str(tag_shared + [str(err)]))
-        
+
         amd_mi210 = []
         for tag in tags:
             amd_mi210.append(lookup_results_dict(results_dict_gpu_amd_mi210,   full_decoding_metric + [tag]))
@@ -248,7 +253,7 @@ def main():
             colors_here = colors[2]
 
         if distance == '3':
-            ax.legend(legend_proxies, legend_labels, 
+            ax.legend(legend_proxies, legend_labels,
                         ncol=3,
                         loc='best',
                         handletextpad=0.1,  # Reduce space between marker and label
@@ -285,7 +290,7 @@ def main():
 
         for err in x_ticks:
             tags.append(tag_to_str(tag_shared + [str(err)]))
-        
+
         amd_mi210 = []
         for tag in tags:
             cpu_time = lookup_results_dict(results_dict_cpu,   full_decoding_metric + [tag])
@@ -337,7 +342,7 @@ def main():
             colors_here = colors[2]
 
         if distance == '3':
-            ax.legend(legend_proxies, legend_labels, 
+            ax.legend(legend_proxies, legend_labels,
                         ncol=3,
                         loc='best',
                         handletextpad=0.1,  # Reduce space between marker and label
@@ -358,12 +363,12 @@ def main():
         ax.set_xticks(x_ticks)
         ax.set_xticklabels([str(x) for x in x_ticks])
 
-    
+
     def plot_batch_compare(ax):
         # fix gpu and data format and compare different distances
         tag_shared = ['0.5', '11', 'float64', 'hx', 'surface']
         tags = []
-        
+
         # 2^7 ~ 2^20
         start_idx = 7
         end_idx = 20
@@ -419,7 +424,7 @@ def main():
 
         colors_here = 'black'
 
-        ax.legend(legend_proxies, legend_labels, 
+        ax.legend(legend_proxies, legend_labels,
                     loc='best',
                     ncol=3,
                     handletextpad=0.1,  # Reduce space between marker and label
@@ -431,7 +436,7 @@ def main():
         ax.plot(x_ticks, amd_mi210, marker=markers[0], color=colors_here, markersize=4)
         ax.plot(x_ticks, nv_a100, marker=markers[1], color=colors_here, markersize=4)
         ax.plot(x_ticks, nv_h200, marker=markers[2], color=colors_here, markersize=4)
-        
+
         # Axis labels and scale
         ax.set_xlabel("Batch size")
         ax.set_ylabel("Runtime per input (s)")
@@ -447,9 +452,9 @@ def main():
         ax.set_xticklabels(tick_labels)
 
 
-    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
     # plot
-    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
     FIGWIDHT = 3.33
     FIGHEIGHT = 2
@@ -465,7 +470,7 @@ def main():
     plt.savefig(f"{base_dir}/{metric}_gpu.pdf", bbox_inches="tight", dpi=300)
     plt.savefig(f"{base_dir}/{metric}_gpu.png", bbox_inches="tight", dpi=300)
     plt.close(fig)
-    
+
     fig, ax = plt.subplots(figsize=(FIGWIDHT, FIGHEIGHT))
     metric = 'accuracy'
     plot_gpu_compare(ax, 'float64', metric)
@@ -477,7 +482,7 @@ def main():
     plt.savefig(f"{base_dir}/{metric}_gpu.png", bbox_inches="tight", dpi=300)
     plt.close(fig)
 
-    
+
     # Plot data format
     fig, ax = plt.subplots(figsize=(FIGWIDHT, FIGHEIGHT))
     metric = 'time'

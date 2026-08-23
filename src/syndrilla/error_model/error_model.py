@@ -2,7 +2,7 @@ import os
 
 from loguru import logger
 
-from syndrilla.utils import call_func_from_yaml, call_func_from_cfg, get_path
+from syndrilla.utils import call_func_from_cfg, call_func_from_yaml, get_path
 
 
 def create_error_model(yaml_path: str = None, cfg: dict = None, **kwargs):
@@ -17,7 +17,7 @@ def create_error_model(yaml_path: str = None, cfg: dict = None, **kwargs):
     header = "error"
     func_name = "model"
     if cfg is not None:
-        logger.info(f"Creating error model class from config dict.")
+        logger.info("Creating error model class from config dict.")
         output = call_func_from_cfg(
             cfg, header, func_name, os.path.dirname(__file__), **kwargs
         )
@@ -26,5 +26,5 @@ def create_error_model(yaml_path: str = None, cfg: dict = None, **kwargs):
         output = call_func_from_yaml(
             yaml_path, header, func_name, os.path.dirname(__file__), **kwargs
         )
-    logger.info(f"Creating error model class complete.")
+    logger.info("Creating error model class complete.")
     return output

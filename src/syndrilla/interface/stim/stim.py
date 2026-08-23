@@ -1,12 +1,12 @@
 import torch
 from loguru import logger
 
-from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
+from syndrilla.syndrome import create_syndrome
+from syndrilla.utils import parse_device_dtype
 
 
 def get_stim_circuit(circuit_str=None, circuit_cfg=None):
@@ -30,7 +30,7 @@ def get_stim_circuit(circuit_str=None, circuit_cfg=None):
         raise ImportError("stim is required. Install with `pip install stim`.") from e
 
     if circuit_str is not None and not isinstance(circuit_str, dict):
-        logger.info(f"Loading inline stim circuit.")
+        logger.info("Loading inline stim circuit.")
         return stim.Circuit(circuit_str)
     elif circuit_cfg is not None or isinstance(circuit_str, dict):
         cfg = circuit_cfg if circuit_cfg is not None else circuit_str
@@ -176,4 +176,4 @@ class create:
         else:
             self.decoders = None
 
-        logger.info(f"Stim interface fully initialised.")
+        logger.info("Stim interface fully initialised.")

@@ -2,7 +2,7 @@ import numpy as np
 from loguru import logger
 
 from syndrilla.interface.stim.stim import get_stim_circuit
-from syndrilla.matrix.matrix import dense_to_index_format, STIM_CIRCUIT_CACHE
+from syndrilla.matrix.matrix import STIM_CIRCUIT_CACHE, dense_to_index_format
 
 
 def _build_dem_matrices(circuit):

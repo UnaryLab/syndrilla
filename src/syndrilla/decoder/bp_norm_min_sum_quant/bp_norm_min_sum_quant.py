@@ -1,9 +1,8 @@
 import torch
-
 from loguru import logger
 
-from syndrilla.utils import fp2fxp
 from syndrilla.decoder.decoder import RebatchSpeedup
+from syndrilla.utils import fp2fxp
 
 
 class create(torch.nn.Module):
@@ -32,7 +31,7 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f'Creating bp decoder.')
+        logger.info('Creating bp decoder.')
 
         # set up default device
         device_cfg = decoder_cfg.get('device', {})
@@ -45,7 +44,7 @@ class create(torch.nn.Module):
             device_idx = device_cfg.get('device_idx', 0)
             if device_idx >= torch.cuda.device_count():
                 logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device(f'cuda:0')
+                self.device = torch.device('cuda:0')
             else:
                 self.device = torch.device(f'cuda:{device_idx}')
 
@@ -54,10 +53,10 @@ class create(torch.nn.Module):
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
             logger.warning(f'Invalid input maximum iteration <{self.max_iter}>, default to <50>.')
             self.max_iter = 50
-        
+
         # set up default dtype
         self.dtype = decoder_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}: 
+        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
         self.dtype = torch.__dict__[self.dtype]
@@ -65,7 +64,7 @@ class create(torch.nn.Module):
         self.batch_size = 1
 
         self.check_type = decoder_cfg.get('check_type', 'hx')
-        if self.check_type.lower() not in {'hx', 'hz'}: 
+        if self.check_type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
@@ -79,10 +78,10 @@ class create(torch.nn.Module):
         self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
-        
+
         # set iteration
         self.i = 0
-        
+
         # convert to as the parameters in a model
         self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
@@ -100,7 +99,7 @@ class create(torch.nn.Module):
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
 
     def forward(self, io_dict):
@@ -122,19 +121,19 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f'Initializing bp (normailized min sum) decoding.')
+        logger.info('Initializing bp (normailized min sum) decoding.')
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
-        
+
         self.batch_size, _ = syndrome.size()
-        
+
         torch.set_default_dtype(self.dtype)
 
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
-        N_extended = self.H_shape[1] + 1 
+        N_extended = self.H_shape[1] + 1
         l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
         e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
         s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
-        
+
         # add dummy column
         dummy_column = torch.full([self.batch_size,1], float('inf'), dtype=self.dtype, device=self.device)
         u_init = torch.cat((fp2fxp(io_dict['llr0'].to(self.device).to(self.dtype), self.intwidth, self.fracwidth), dummy_column), dim=1)
@@ -143,7 +142,7 @@ class create(torch.nn.Module):
         num_iters = torch.full([self.batch_size], -1, device=self.device)
         converges = torch.full([self.batch_size], 0, device=self.device)
 
-        # set up initialization for all parameters for decoding process 
+        # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
         message = torch.zeros_like(self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
@@ -151,10 +150,10 @@ class create(torch.nn.Module):
         # compute syndrome for multiplication
         self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
         self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
-        
-        logger.info(f'Complete.')
 
-        logger.info(f'Starting decoding iterations.')
+        logger.info('Complete.')
+
+        logger.info('Starting decoding iterations.')
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
@@ -217,7 +216,7 @@ class create(torch.nn.Module):
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
             self.cap.observe(num_iters, self.max_iter, self.batch_size)
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
             'e_v': e_out,
@@ -249,7 +248,7 @@ class create(torch.nn.Module):
 
     def cn_update(self, a_v2c):
         base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype) 
+        exponent = torch.tensor(-(self.i), dtype=self.dtype)
 
         # Compute the power in PyTorch:
         beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
@@ -259,7 +258,7 @@ class create(torch.nn.Module):
         sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=2, keepdim=True)
         Q_sign = self.syndrome_neg * sign_prod
-        
+
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
         sorted, _ = torch.sort(abs_a_v2c, dim=2)
@@ -319,6 +318,5 @@ class create(torch.nn.Module):
         temp_e = e_v
         temp_e[:, -1] = 0.0
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
-        
+
         return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0)
-    

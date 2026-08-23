@@ -22,8 +22,8 @@ YAML algorithm key: bp_norm_min_sum_quant_cuda
 import torch
 from loguru import logger
 
-from syndrilla.utils import fp2fxp
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _BaseCuda
+from syndrilla.utils import fp2fxp
 
 
 class create(_BaseCuda):

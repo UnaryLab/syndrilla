@@ -26,11 +26,11 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from syndrilla.decoder.relay_bp.relay_bp import create as _RelayPy
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import (
-    _load_ext,
     _build_vn_adj,
+    _load_ext,
 )
+from syndrilla.decoder.relay_bp.relay_bp import create as _RelayPy
 
 
 class create(_RelayPy):

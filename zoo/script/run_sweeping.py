@@ -1,14 +1,9 @@
-import yaml
-import subprocess
-import re
-import csv
-import os
-import shutil
-import sys
 import argparse
-from loguru import logger
+import os
+import subprocess
 from pathlib import Path
 
+from loguru import logger
 
 decoder_list = ['bposd', 'bposd_quant', 'lottery_bp', 'lottery_bp_quant', 'lottery_bposd', 'lottery_bposd_quant']
 
@@ -55,7 +50,7 @@ def main(target_error):
         if 'hx' in subdir:
             decoder_yaml = os.path.join(folder_path, f'{decoder}_hx.decoder.yaml')
             check_yaml = os.path.join(folder_path, 'lx.check.yaml')
-        else: 
+        else:
             decoder_yaml = os.path.join(folder_path, f'{decoder}_hz.decoder.yaml')
             check_yaml = os.path.join(folder_path, 'lz.check.yaml')
 
@@ -63,7 +58,7 @@ def main(target_error):
 
         syndrome_yaml = os.path.join(folder_path, f'{syndrome_type}.syndrome.yaml')
         matrix_yaml = os.path.join(folder_path, 'matrix.yaml')
-        
+
         # set command line arguement to load all yaml file from the folder
         cmd = [
             'syndrilla',

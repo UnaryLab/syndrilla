@@ -1,20 +1,13 @@
-import torch
-import re
-import sys, os, time
-import numpy as np
+import os
 import subprocess
-from loguru import logger
+import sys
+
 
 sys.path.append(os.getcwd())
 
-from syndrilla.decoder import create_decoder
-from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
-from syndrilla.metric import report_metric
-from syndrilla.logical_check import create_check
 
 
-def test_batch_alist_hz(batch_size=1000, target_error=1000):    
+def test_batch_alist_hz(batch_size=1000, target_error=1000):
     decoder_yaml = 'examples/alist/lottery_bp_hz.decoder.yaml'
     logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [
@@ -35,7 +28,7 @@ def test_batch_alist_hz(batch_size=1000, target_error=1000):
     print('STDERR:\n', result.stderr)
 
 
-def test_batch_alist_hz_quant(batch_size=1000, target_error=1000):    
+def test_batch_alist_hz_quant(batch_size=1000, target_error=1000):
     decoder_yaml = 'examples/alist/lottery_bp_quant_hz.decoder.yaml'
     logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [

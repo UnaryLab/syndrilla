@@ -384,7 +384,7 @@ class create(nn.Module):
         """
         super(create, self).__init__()
 
-        logger.info(f"Creating saq decoder.")
+        logger.info("Creating saq decoder.")
 
         # Device and dtype come from the same resolver `load_matrices` used, so the
         # decoder cannot land somewhere its own matrices did not: `parse_device_dtype`
@@ -578,7 +578,7 @@ class create(nn.Module):
                 f'saq is single-shot; ignoring max_iter <{decoder_cfg.get("max_iter")}>.'
             )
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
     def _check_code_shape(self, H_matrix):
         """Warn when the loaded matrix does not look like a code saq is validated on.
@@ -733,7 +733,7 @@ class create(nn.Module):
         syndrome alone, and the physical error rate is learned from the training
         distribution rather than supplied per shot.
         """
-        logger.info(f"Initializing saq decoding.")
+        logger.info("Initializing saq decoding.")
 
         syndrome = io_dict["synd"].to(device=self.device, dtype=self.dtype)
         self.batch_size = syndrome.size(0)
@@ -741,8 +741,8 @@ class create(nn.Module):
         # the transformer is trained on the +-1 encoding used by upstream's dataset
         syndrome_pm = bin_to_sign(syndrome)
 
-        logger.info(f"Complete.")
-        logger.info(f"Starting decoding pass.")
+        logger.info("Complete.")
+        logger.info("Starting decoding pass.")
 
         self.i = 1
 
@@ -768,7 +768,7 @@ class create(nn.Module):
         converges = torch.all(s_est == syndrome, dim=1).long()
         num_iters = torch.ones([self.batch_size], device=self.device, dtype=torch.long)
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         logger.info(f"Converged samples: <{int(converges.sum())}>/<{self.batch_size}>.")
         io_dict.update(
             {

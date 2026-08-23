@@ -18,12 +18,11 @@ YAML algorithm key: bp_lottery_quant_cuda
 import torch
 from loguru import logger
 
-from syndrilla.utils import fp2fxp
-from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant_cuda import (
-    create as _QuantCuda,
-)
 from syndrilla.decoder.bp_lottery_quant.bp_lottery_quant import (
     create as _LotteryQuantPy,
+)
+from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant_cuda import (
+    create as _QuantCuda,
 )
 
 

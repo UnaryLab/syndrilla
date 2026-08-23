@@ -1,5 +1,4 @@
 import torch
-
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
@@ -37,7 +36,7 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f'Creating bp decoder.')
+        logger.info('Creating bp decoder.')
 
         # Defaults match the relay-bp crate's gamma_dist_interval = (-0.24, 0.66),
         # expressed here as center = (low + high) / 2 and width = high - low.
@@ -85,7 +84,7 @@ class create(torch.nn.Module):
             device_idx = device_cfg.get('device_idx', 0)
             if device_idx >= torch.cuda.device_count():
                 logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device(f'cuda:0')
+                self.device = torch.device('cuda:0')
             else:
                 self.device = torch.device(f'cuda:{device_idx}')
 
@@ -94,7 +93,7 @@ class create(torch.nn.Module):
         if self.solution <= 0 or not isinstance(self.solution, int):
             logger.warning(f'Invalid input solution number <{self.solution}>, default to <5>.')
             self.solution = 5
-        
+
         #initial iteration count
         self.iteration_initial = decoder_cfg.get('iteration_initial', 80)
         if self.iteration_initial < 0 or not isinstance(self.iteration_initial, int):
@@ -112,10 +111,10 @@ class create(torch.nn.Module):
         if self.legs <= 0 or not isinstance(self.legs, int):
             logger.warning(f'Invalid input R <{self.legs}>, default to <1>.')
             self.legs = 20
-        
+
         # set up default dtype
         self.dtype = decoder_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}: 
+        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
         self.dtype = torch.__dict__[self.dtype]
@@ -123,12 +122,12 @@ class create(torch.nn.Module):
         self.batch_size = 1
 
         self.type = decoder_cfg.get('type', 'hx')
-        if self.type.lower() not in {'hx', 'hz'}: 
+        if self.type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input type <{self.type}>, default to <hx>.')
             self.type = 'hx'
-        
+
         self.check_type = decoder_cfg.get('check_type', 'hx')
-        if self.check_type.lower() not in {'hx', 'hz'}: 
+        if self.check_type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
@@ -158,21 +157,21 @@ class create(torch.nn.Module):
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
 
     def forward(self, io_dict):
-        
-        logger.info(f'Initializing bp-relay decoding.')
+
+        logger.info('Initializing bp-relay decoding.')
 
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
-    
+
         self.batch_size, _ = syndrome.size()
-    
+
         torch.set_default_dtype(self.dtype)
 
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
-        N_extended = self.H_shape[1] + 1 
+        N_extended = self.H_shape[1] + 1
         solutions = torch.zeros([self.batch_size], dtype=self.dtype, device=self.device)
         e_solutions = torch.full([self.batch_size], float('inf'), dtype=self.dtype, device=self.device)
         e_best = torch.zeros([self.batch_size, self.H_shape[1]], dtype=self.dtype, device=self.device)
@@ -180,7 +179,7 @@ class create(torch.nn.Module):
         e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
         s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
         solution_sum = 0
-        
+
         # add dummy column
         dummy_column = torch.full([self.batch_size,1], float('inf'), dtype=self.dtype, device=self.device)
         u_init = torch.cat((io_dict['llr0'].to(self.device).to(self.dtype), dummy_column), dim=1)
@@ -190,7 +189,7 @@ class create(torch.nn.Module):
         num_iters = torch.full([self.batch_size], 1, device=self.device)
         converges = torch.full([self.batch_size], 0, device=self.device)
 
-        # set up initialization for all parameters for decoding process 
+        # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
         message = torch.zeros_like(self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
@@ -199,9 +198,9 @@ class create(torch.nn.Module):
         self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
         self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
-        logger.info(f'Starting decoding iterations.')
+        logger.info('Starting decoding iterations.')
 
         # adaptive cap: once warm-up has chosen a stop fraction, end the leg ensemble as soon
         # as that fraction has converged (unless main asked for an uncapped pass).
@@ -225,7 +224,7 @@ class create(torch.nn.Module):
                 self.max_iter = self.iteration_count
                 memory_strengths = self.create_memory_strengths(self.batch_size, N_extended, self.center, self.width)
                 message = u_init[:, self.V_c_col]
-            
+
             while self.i < self.max_iter:
                 # variable node update update v2c
                 self.i += 1
@@ -264,7 +263,7 @@ class create(torch.nn.Module):
                 # variable node update: produce the variable->check messages for the
                 # next iteration (extrinsic: bias + sum of OTHER incoming c2v messages)
                 message = self.vn_update(c2v, bias)
-            
+
             valid_mask = (converges == 1) & (solutions < self.solution)
 
             # decoding quality = sum of the prior LLRs over the decoded support
@@ -293,7 +292,7 @@ class create(torch.nn.Module):
             obs[converges == 0] = self.num_max_iter
             self.cap.observe(obs, self.num_max_iter, self.batch_size)
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
             'e_v': e_best,
@@ -302,8 +301,8 @@ class create(torch.nn.Module):
             'converge': converges
         })
         return io_dict
-     
-        
+
+
     def sum_func(self, bias, b_c2v):
         data_flat = b_c2v.flatten(start_dim=1)
         partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
@@ -340,7 +339,7 @@ class create(torch.nn.Module):
         sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=2, keepdim=True)
         Q_sign = self.syndrome_neg * sign_prod
-        
+
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
         sorted, _ = torch.sort(abs_a_v2c, dim=2)
@@ -369,9 +368,9 @@ class create(torch.nn.Module):
         temp_e = e_v
         temp_e[:, -1] = 0.0
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
-        
+
         return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0)
-    
+
 
     def bias_update(self, memory_strengths, marginals, u_init):
         marginal_strength = memory_strengths * marginals
@@ -379,7 +378,7 @@ class create(torch.nn.Module):
         bias = (sub * u_init) + marginal_strength
         bias[:, -1] = u_init[:, -1]
         return bias
-    
+
 
     def create_memory_strengths(self, rows, cols, center, width):
         memory_strengths = ((center + width/2) - (center-width/2)) * torch.rand([rows, cols], dtype=self.dtype, device=self.device) + (center - width/2)
