@@ -1,8 +1,11 @@
+# Training-only noise: a swept bit-flip rate rather than a pinned one, so one run
+# covers a stretch of the curve instead of a single point. `rate` is a
+# [lower, upper, points] range split into that many evenly spaced levels, and every
+# shot draws its own, carrying the matching LLR prior.
 error:
   model: bsc
   number_channel: 1
   device:
     device_type: cpu
     device_idx: 0
-  rate: [0.01, 0.20]
-  rate_points: 9
+  rate: [0.01, 0.20, 9]

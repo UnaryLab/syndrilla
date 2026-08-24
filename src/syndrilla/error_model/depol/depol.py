@@ -8,8 +8,8 @@ class create:
     """
     This class creates a depolarizing error model.
 
-    <rate> is a scalar for a decode run. A training run may give it as a [lower, upper]
-    range with <rate_points> instead, exactly as <bsc> does: every shot draws its own
+    <rate> is a scalar for a decode run. A training run may give it as a
+    [lower, upper, points] range instead, exactly as <bsc> does: every shot draws its own
     level and carries the matching Pauli priors, so one run covers a stretch of the
     curve. A range outside training is refused.
     """

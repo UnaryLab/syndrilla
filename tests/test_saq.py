@@ -26,6 +26,9 @@ CKPT_STEM = "saq_hx_d5"
 BEST_PT = f"{CKPT_STEM}.pt"
 LAST_PT = f"{CKPT_STEM}_last.pt"
 HISTORY = f"{CKPT_STEM}_history.json"
+RESULT_YAML = f"{CKPT_STEM}_result.yaml"
+# the per-phase terms the result yaml carries a column of, as its epoch line names them
+TERMS = ("loss", "lc", "lp", "ent", "class error")
 TRAIN_ERROR_YAML = "examples/alist/bsc_train.error.yaml"
 TRAIN_SYNDROME_YAML = "examples/alist/perfect.syndrome.yaml"
 LOSS_YAML = "examples/alist/logical_centric.loss.yaml"
@@ -606,6 +609,192 @@ def test_train_cli_produces_a_loadable_checkpoint(tmp_path):
     )
 
 
+def test_train_cli_writes_a_result_yaml_indexed_by_epoch(tmp_path):
+    """`-t` writes its results as a yaml too, the way a decode run does.
+
+    The curve is stored by column: `epoch` lists the epoch numbers and every other list
+    is index-aligned with it, so entry `i` of each is one epoch, and every number in it
+    is the one the run's epoch line printed.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml", epochs=3, batches_per_epoch=4, val_batches=2
+    )
+    result = _run_cli(
+        tmp_path,
+        "-t",
+        f"-d={decoder_yaml}",
+        f"-m={SURFACE_MATRIX_YAML}",
+        f"-e={TRAIN_ERROR_YAML}",
+        f"-s={TRAIN_SYNDROME_YAML}",
+        f"-ls={LOSS_YAML}",
+        "-bs=32",
+    )
+    assert result.returncode == 0, result.stderr
+
+    written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
+    epochs = written["epoch"]
+    assert epochs["epoch"] == [1, 2, 3]
+    # every column is as long as the epoch list, or the alignment they are read by
+    # would be silently wrong
+    columns = [epochs["learning rate"], epochs["best"]]
+    columns += [epochs[phase][term] for phase in ("train", "val") for term in TERMS]
+    assert all(len(column) == 3 for column in columns)
+
+    summary = written["train_full"]
+    assert summary["epochs"] == 3
+    assert summary["batches per epoch"] == 4 and summary["validation batches"] == 2
+    assert summary["batch size"] == 32
+    assert summary["checkpoint"] == str(tmp_path / BEST_PT)
+    # the summary's best has to be the epoch the columns say is best, not a second
+    # opinion
+    val_class_err = epochs["val"]["class error"]
+    i = val_class_err.index(min(val_class_err))
+    assert summary["best epoch"] == epochs["epoch"][i]
+    assert summary["best val class error"] == pytest.approx(val_class_err[i])
+    assert epochs["best"][i] is True
+
+    # same numbers as the json history, so neither file can drift from the other
+    history = json.loads((tmp_path / HISTORY).read_text())
+    assert [entry["epoch"] for entry in history] == epochs["epoch"]
+    for i, recorded in enumerate(history):
+        assert epochs["learning rate"][i] == pytest.approx(recorded["lr"])
+        assert epochs["train"]["loss"][i] == pytest.approx(recorded["train"]["total"])
+        assert epochs["train"]["lc"][i] == pytest.approx(recorded["train"]["lc"])
+        assert epochs["val"]["loss"][i] == pytest.approx(recorded["val"]["total"])
+        assert epochs["val"]["class error"][i] == pytest.approx(
+            recorded["val"]["class_err"]
+        )
+
+
+def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
+    """The run's timing, in the terms a decode result file reports it.
+
+    The averages have to come from the epoch times rather than the wall clock: the
+    wall clock includes building the decoder and loading the matrices, so on a short
+    run the two differ by more than rounding.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml", epochs=3, batches_per_epoch=4, val_batches=2
+    )
+    result = _run_cli(
+        tmp_path,
+        "-t",
+        f"-d={decoder_yaml}",
+        f"-m={SURFACE_MATRIX_YAML}",
+        f"-e={TRAIN_ERROR_YAML}",
+        f"-s={TRAIN_SYNDROME_YAML}",
+        f"-ls={LOSS_YAML}",
+        "-bs=32",
+    )
+    assert result.returncode == 0, result.stderr
+
+    written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
+    summary = written["train_full"]
+    per_epoch_times = written["epoch"]["time (s)"]
+
+    assert len(per_epoch_times) == 3 and all(t > 0 for t in per_epoch_times)
+    assert summary["total epoch time (s)"] == pytest.approx(sum(per_epoch_times))
+    assert summary["average time per epoch (s)"] == pytest.approx(
+        sum(per_epoch_times) / 3
+    )
+    # a batch is a batch of either phase, so an epoch holds batches_per_epoch + val
+    period = 4 + 2
+    assert summary["average time per batch (s)"] == pytest.approx(
+        summary["average time per epoch (s)"] / period
+    )
+    assert summary["average time per sample (s)"] == pytest.approx(
+        summary["average time per batch (s)"] / 32
+    )
+    # the wall clock covers the epochs and the setup ahead of them
+    assert summary["total time (s)"] > summary["total epoch time (s)"]
+
+    # the json history carries the per-epoch times too, so the two files still agree
+    history = json.loads((tmp_path / HISTORY).read_text())
+    assert [entry["time"] for entry in history] == pytest.approx(per_epoch_times)
+
+
+def test_train_epochs_saved_caps_both_output_files(tmp_path):
+    """`epochs_saved` bounds the two output files, so a long run stays readable.
+
+    What survives is the run's tail plus its best epoch: the summary block names the
+    best epoch and the saved checkpoint holds it, so a file that dropped it would name
+    an epoch it did not carry.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml",
+        epochs=6,
+        batches_per_epoch=4,
+        val_batches=2,
+        epochs_saved=2,
+    )
+    result = _run_cli(
+        tmp_path,
+        "-t",
+        f"-d={decoder_yaml}",
+        f"-m={SURFACE_MATRIX_YAML}",
+        f"-e={TRAIN_ERROR_YAML}",
+        f"-s={TRAIN_SYNDROME_YAML}",
+        f"-ls={LOSS_YAML}",
+        "-bs=32",
+    )
+    assert result.returncode == 0, result.stderr
+
+    written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
+    epochs = written["epoch"]
+    numbers = epochs["epoch"]
+    summary = written["train_full"]
+    # all six ran, and the tail is always the last two of them
+    assert summary["epochs"] == 6 and summary["epochs saved"] == 2
+    assert numbers[-2:] == [5, 6]
+    # the best epoch is kept wherever it fell, so it is the tail alone only when the
+    # best is already in it
+    i = len(numbers) - 1 - epochs["best"][::-1].index(True)
+    assert summary["best epoch"] == numbers[i]
+    assert summary["best val class error"] == pytest.approx(
+        epochs["val"]["class error"][i]
+    )
+    assert len(numbers) == (2 if numbers[i] in (5, 6) else 3)
+    assert numbers == sorted(numbers)
+    # the columns are thinned with the epoch list, not left at their full length
+    assert all(
+        len(epochs[phase][term]) == len(numbers)
+        for phase in ("train", "val")
+        for term in TERMS
+    )
+
+    # the json is the same record in the other format, cap included
+    history = json.loads((tmp_path / HISTORY).read_text())
+    assert [entry["epoch"] for entry in history] == numbers
+
+    # the resume checkpoint keeps the whole curve: the cap is a file concern, and a
+    # run resumed from here has to know every epoch it already ran
+    state = torch.load(tmp_path / LAST_PT, map_location="cpu", weights_only=True)
+    assert [entry["epoch"] for entry in state["history"]] == [1, 2, 3, 4, 5, 6]
+
+
+def test_train_epochs_saved_must_be_a_positive_integer(tmp_path):
+    """A cap of zero saves nothing, so it is rejected the way a zero schedule is."""
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml",
+        epochs=2,
+        batches_per_epoch=4,
+        val_batches=2,
+        epochs_saved=0,
+    )
+    result = _run_cli(
+        tmp_path,
+        "-t",
+        f"-d={decoder_yaml}",
+        f"-m={SURFACE_MATRIX_YAML}",
+        f"-e={TRAIN_ERROR_YAML}",
+        f"-s={TRAIN_SYNDROME_YAML}",
+        f"-ls={LOSS_YAML}",
+        "-bs=32",
+    )
+    assert result.returncode != 0
+    assert "epochs_saved" in result.stderr and "integer >= 1" in result.stderr
+
+
 def _write_decode_yaml(path, checkpoint):
     """The shipped decoder yaml pointed at a checkpoint, for a decode run.
 
@@ -1155,10 +1344,14 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     )
     assert finished.returncode == 0, finished.stderr
 
-    # the resumed run must reach the same place, epoch by epoch and weight by weight
-    assert json.loads((resumed_dir / HISTORY).read_text()) == json.loads(
-        (straight_dir / HISTORY).read_text()
-    )
+    # the resumed run must reach the same place, epoch by epoch and weight by weight.
+    # Every recorded number is reproducible except how long the epoch took, which is
+    # wall clock and is asserted on separately
+    resumed_history = json.loads((resumed_dir / HISTORY).read_text())
+    straight_history = json.loads((straight_dir / HISTORY).read_text())
+    assert all(entry.pop("time") > 0 for entry in resumed_history)
+    assert all(entry.pop("time") > 0 for entry in straight_history)
+    assert resumed_history == straight_history
     expected = torch.load(straight_dir / LAST_PT, map_location="cpu", weights_only=True)
     actual = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
     for key, value in expected["state_dict"].items():

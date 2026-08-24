@@ -10,6 +10,32 @@ from loguru import logger
 from syndrilla.utils import get_path
 
 
+class TrainResultDumper(yaml.SafeDumper):
+    """`SafeDumper` with its representers frozen as they are at import.
+
+    `save_all_metrics_to_yaml` installs fixed-width-float and inline-list representers
+    onto `yaml.SafeDumper` itself, which every later `safe_dump` in the process then
+    inherits. Taking a copy here keeps the training result file's formatting a property
+    of the file rather than of whether a decode run happened first.
+    """
+
+
+TrainResultDumper.yaml_representers = dict(yaml.SafeDumper.yaml_representers)
+
+
+def _flow_list(dumper, data):
+    """Every list inline, wrapped at the dump width rather than one item per line.
+
+    The training result file is columns of per-epoch numbers, so a block sequence would
+    give a hundred-epoch run five hundred lines carrying one float each. Inline, a
+    column reads as the row of numbers it is.
+    """
+    return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
+
+
+TrainResultDumper.add_representer(list, _flow_list)
+
+
 class MetricResult(dict):
     """Dict that also supports tuple unpacking for backward compatibility."""
 
@@ -75,11 +101,22 @@ class BatchTracker:
         return t
 
     def record_error(self, err):
-        """Append the ground-truth error batch. If self.rounds > 1, replicate
-        the error vector across rounds (errors live on data qubits and don't
-        depend on measurement round)."""
+        """Append the ground-truth error batch, on the same axis its decodings are on.
+
+        `record_decoder` flattens a rounds axis into the batch axis, so the error has
+        to arrive the same way or the two cannot be compared. Under a multi-round
+        measurer the error model draws its own error per round and hands back
+        [B, rounds, N] already, which is flattened here; the `rounds > 1` branch below
+        is for the other case, an error that does not vary by round and is replicated
+        across them. Leaving the 3-D error unflattened is what made a `rounds > 1` run
+        fail its logical check with a [B*rounds, N] decoding against a [B, rounds, N]
+        error.
+        """
         err = err.to(self.device)
-        if self.rounds > 1:
+        err_base = 3 if self.number_channel > 1 else 2
+        if err.ndim > err_base:
+            err = self._flatten_rounds(err, err_base)
+        elif self.rounds > 1:
             R = self.rounds
             err = (
                 err.unsqueeze(1)
@@ -153,6 +190,74 @@ class BatchTracker:
             self.converge_all[di] = _maybe_slice(self.converge_all[di])
 
 
+def _add_histogram(total, batch):
+    """Add one batch's iteration histogram to the run's, aligning them by bin.
+
+    A histogram's length is `max(num_max_iter + 1, highest count seen + 1)`, and the
+    second term is not always the first: a decoder's reported iteration count is only
+    bounded by the `num_max_iter` it declares if it declares the right one. `osd_0`
+    declares the column count of `H` while reporting its LU elimination step count,
+    which on a 41-column code reaches 59 and moves batch to batch, so consecutive
+    batches hand back histograms of different lengths.
+
+    Zero-padding the shorter one keeps bin `i` meaning `i + 1` iterations in both,
+    which is what adding two different-length tensors cannot do -- it raised
+    `RuntimeError: The size of tensor a (42) must match the size of tensor b (56)` and
+    took every bp+osd chain on a code with fewer qubits than `max_iter` down with it.
+    The run's histogram therefore grows to the longest batch, which is the length the
+    counts actually need.
+    """
+    # the first batch of a decoder lands on the 0.0 the run starts each histogram at
+    if not torch.is_tensor(total):
+        return batch
+    if total.numel() < batch.numel():
+        total = torch.nn.functional.pad(total, (0, batch.numel() - total.numel()))
+    elif batch.numel() < total.numel():
+        batch = torch.nn.functional.pad(batch, (0, total.numel() - batch.numel()))
+    return total + batch
+
+
+def _yaml_rate(rate):
+    """A physical error rate as a plain yaml scalar, or a list for a swept range.
+
+    A swept rate is reported as the [lower, upper, points] range it was configured as,
+    the point count included: the sweep is one setting, and splitting it across two
+    keys in the result file would leave the file describing the run in a form no
+    config could be written in.
+    """
+    if isinstance(rate, (list, tuple)):
+        values = [float(value) for value in rate]
+        if len(values) == 3:
+            # the first two values are rates, the last is a count of them, and a count
+            # written as 9.0 reads as a rate that lost its decimals
+            values[2] = int(rate[2])
+        return values
+    try:
+        return float(rate)
+    except (TypeError, ValueError):
+        return str(rate)
+
+
+def _yaml_losses(history, phase):
+    """One phase's epoch means over the whole run, named as the epoch line names them.
+
+    A column per term rather than a block per epoch: entry `i` of every list here is
+    the same epoch, the one named by entry `i` of the file's `epoch` list, so a term
+    can be read or plotted straight down the run without walking a hundred blocks to
+    collect it.
+    """
+    return {
+        name: [float(entry[phase][key]) for entry in history]
+        for name, key in (
+            ("loss", "total"),
+            ("lc", "lc"),
+            ("lp", "lp"),
+            ("ent", "ent"),
+            ("class error", "class_err"),
+        )
+    }
+
+
 class MetricState:
     """This run's metrics, in either mode syndrilla runs in.
 
@@ -169,7 +274,7 @@ class MetricState:
     `mode` says which, and the training half's members carry a qualifier wherever the
     two would otherwise collide: `accumulate` and `accumulate_loss`, `begin_run` and
     `begin_train_run`, `validate_checkpoint` and `validate_train_checkpoint`. Build with
-    `MetricState(num_decoders, number_channel, device)` to decode, or with
+    `MetricState(num_decoders, number_channel, device)` to decode, or with `from_cfg` /
     `for_training` to train; calling across the two halves is a bug the mode flag makes
     visible rather than one this class prevents.
 
@@ -249,7 +354,9 @@ class MetricState:
         ):
             getattr(self, field)[i] += batch_metrics[field] * ss
 
-        self.distribution[i] += batch_metrics["distribution"]
+        self.distribution[i] = _add_histogram(
+            self.distribution[i], batch_metrics["distribution"]
+        )
 
         for field in self._channel_fields:
             acc = getattr(self, field)[i]
@@ -497,31 +604,32 @@ class MetricState:
             self.distribution[i] = self.distribution[i].int().to(self.device)
 
     # ------------------------------------------------------------------
-    # Training half (`-t`): per-epoch loss, the phase schedule, the run's
-    # checkpoints and <stem>_history.json. Accumulates each batch's loss terms and logical
+    # Training half (`-t`): per-epoch loss, the phase schedule, the run's checkpoints,
+    # <stem>_history.json and <stem>_result.yaml. Accumulates each batch's loss terms and logical
     # class error under its phase ('train' or 'val'), averages them at the epoch
     # boundary, formats the epoch line, and writes the run out. Live only on a state
-    # built by `for_training`; the fields below do not exist on a decode
+    # built by `from_cfg` / `for_training`; the fields below do not exist on a decode
     # state, which is what keeps the two halves from being mistaken for each other.
     # ------------------------------------------------------------------
 
     KEYS = ("total", "lc", "lp", "ent", "class_err")
     # the schedule the '-tr' yaml must supply under its 'train' key
     TRAIN_KEYS = ("epochs", "batches_per_epoch", "val_batches", "seed")
+    # keys of the same block a run may leave out. `epochs_saved` caps how many epochs
+    # the output files carry; absent, they carry every epoch.
+    OPTIONAL_TRAIN_KEYS = ("epochs_saved",)
 
     @classmethod
-    def validate_train_cfg(cls, cfg, source):
-        """Check a training schedule read off a decoder yaml and hand it back.
+    def from_cfg(cls, cfg, run_dir, source):
+        """Validate a training schedule and build the run's metrics.
 
         Takes the schedule block itself, not the yaml it came from: this class has no
         business reading a decoder config. `source` is only used to name the file in
         error messages. `seed` stays inside `cfg` for the caller: it is the only key
         here that is not a metric concern.
 
-        Split from `for_training` because `main.py` wants the two at different points:
-        the schedule has to be checked, and its seed applied, before the decoders that
-        seed initialises are built, while the state itself is only built once there is
-        a decoder for it to meter.
+        The validation is why this, rather than `for_training`, is what `main.py`
+        calls: a schedule read off a yaml has to be checked before a run is built on it.
         """
         logger.info(f"Reading training schedule from <{get_path(source)}>.")
         if cfg is None:
@@ -536,16 +644,20 @@ class MetricState:
                 f"Decoder yaml {source} is missing under 'decoder.train': "
                 f"{', '.join(missing)}."
             )
-        for key in cls.TRAIN_KEYS:
+        present = list(cls.TRAIN_KEYS) + [
+            key for key in cls.OPTIONAL_TRAIN_KEYS if key in cfg
+        ]
+        for key in present:
             value = cfg[key]
-            # seed 0 is a valid seed; a zero-length schedule is not
+            # seed 0 is a valid seed; a zero-length schedule is not, and neither is a
+            # run that saves no epoch at all
             floor = 0 if key == "seed" else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < floor:
                 raise ValueError(
                     f"Decoder yaml {source} needs <{key}> to be an integer "
                     f">= {floor}, got <{value!r}>."
                 )
-        return cfg
+        return cls.for_training(run_dir, cfg)
 
     @classmethod
     def for_training(cls, run_dir, cfg):
@@ -565,12 +677,20 @@ class MetricState:
         self.run_dir = run_dir
         self.cfg = cfg
         self.epochs = cfg["epochs"]
+        # how many epochs the output files carry, `None` for all of them
+        self.epochs_saved = cfg.get("epochs_saved")
         self.period = cfg["batches_per_epoch"] + cfg["val_batches"]
         self.total_batches = self.epochs * self.period
         self.epoch = 1
         self.history = []
         self.best = float("inf")
         self.start = time.time()
+        # when the epoch now running started, and the batch size it is running at, both
+        # set by `begin_train_run`: an epoch's time is charged from the moment the run
+        # is actually training, and how many samples that time bought is the batch
+        # size the CLI passed
+        self._epoch_start = self.start
+        self.batch_size = None
         self.log = logger.bind(train=True)
         self._sink_id = None
         # the phase the batch now open runs in, 'train' or 'val'. Set by `begin_batch`
@@ -583,6 +703,9 @@ class MetricState:
         self.lr = None
         self._decoder = None
         self._fingerprint = None
+        # what the run is, for the summary block of <stem>_result.yaml. Filled by
+        # `begin_train_run`, which is where the decoder and the error model arrive.
+        self.run_meta = {}
         os.makedirs(run_dir, exist_ok=True)
         self.reset_epoch()
 
@@ -759,6 +882,18 @@ class MetricState:
         decoder.check_train_batch(error_model.rounds, error_model.number_channel)
         decoder.configure_optimizer(self.epochs)
         self.bind_decoder(decoder, self.fingerprint(decoder, batch_size))
+        # the rate is reported in the form it was configured in: a scalar, or the
+        # [lower, upper, points] range whose last value is the point count, so the
+        # summary names the sweep with the same three numbers the yaml set
+        rate = error_model.rate
+        self.run_meta = {
+            "algorithm": decoder.algo,
+            "model parameters": int(sum(p.numel() for p in decoder.parameters())),
+            "device": str(decoder.device),
+            "data type": str(decoder.dtype),
+            "physical error rate": _yaml_rate(rate),
+            "batch size": batch_size,
+        }
         resume_line, start = "fresh run", 0
         if checkpoint is not None:
             resume_line = self.resume_from(checkpoint, batch_size, device)
@@ -768,13 +903,18 @@ class MetricState:
                 f"training <{decoder.algo}>: "
                 f"params={sum(p.numel() for p in decoder.parameters()):,} "
                 f"device={decoder.device} dtype={decoder.dtype}",
-                f"error rate {error_model.rate}, "
+                f"error rate {rate}, "
                 f"{self.cfg['batches_per_epoch']} x {batch_size} per epoch",
                 f"config: {dict(self.cfg)}",
                 resume_line,
             )
         )
         self.lr = decoder.current_lr()
+        self.batch_size = batch_size
+        # the first epoch is timed from here, not from `_init_training`: building the
+        # decoder, loading the matrices and restoring a checkpoint are the run's setup,
+        # and charging them to epoch 1 would make it look slower than the rest
+        self._epoch_start = time.time()
         self.begin_batch(start)
         return start
 
@@ -884,7 +1024,8 @@ class MetricState:
         into `history` and `epoch` has advanced, so the state it is handed describes
         the run to *resume* -- the next epoch to run, not the one just finished. The
         epoch line prints after the callback, so seeing a line means that epoch's
-        checkpoint is already on disk and a run interrupted there is recoverable. And
+        checkpoint and its row in `<stem>_result.yaml` are already on disk and a run
+        interrupted there is recoverable. And
         `lr` is refreshed at the end, after the step: the epoch being recorded ran at
         the rate carried in `self.lr` since the last call, while what the decoder
         reports from here on belongs to the epoch about to start.
@@ -898,31 +1039,180 @@ class MetricState:
         if is_best:
             self.best = va["class_err"]
 
+        now = time.time()
+        elapsed = now - self._epoch_start
+        self._epoch_start = now
+
         lr = self.lr
         line = (
             f"epoch {self.epoch:4d}/{self.epochs}  lr={lr:.2e}  "
             f"loss={tr['total']:.4f} (lc={tr['lc']:.4f} lp={tr['lp']:.4f} ent={tr['ent']:.4f})  "
-            f"val_loss={va['total']:.4f}  val_class_err={va['class_err']:.4f}"
+            f"val_loss={va['total']:.4f}  val_class_err={va['class_err']:.4f}  "
+            f"{elapsed:.1f}s"
             f"{'  <- best' if is_best else ''}"
         )
-        self.history.append({"epoch": self.epoch, "lr": lr, "train": tr, "val": va})
+        self.history.append(
+            {
+                "epoch": self.epoch,
+                "lr": lr,
+                "time": float(elapsed),
+                "train": tr,
+                "val": va,
+                "best": is_best,
+            }
+        )
         self.epoch += 1
         self.reset_epoch()
         self.save_checkpoint(is_best)
+        self.save_result_yaml()
         print(line)
         self.log.info(line)
         self.lr = self._decoder.current_lr()
+
+    def saved_history(self):
+        """The epochs the output files carry: the last `epochs_saved`, plus the best.
+
+        A long run's curve is the one thing here that grows without bound -- a 100k
+        epoch run would write a 1.5M line yaml -- so `epochs_saved` caps it. What it
+        keeps is the tail, the part of the run someone reads to see where training got
+        to, plus the best epoch wherever it fell, because that is the epoch the saved
+        checkpoint holds and the summary block names, and a file that named an epoch it
+        did not carry would be worse than a shorter one.
+
+        Only the files are thinned. `self.history` stays complete, so a resumed run
+        still restores the whole curve and picking the cap up or down between runs
+        costs nothing. Absent the key nothing is dropped, which is what keeps this
+        invisible to a run that does not ask for it.
+        """
+        if self.epochs_saved is None or len(self.history) <= self.epochs_saved:
+            return list(self.history)
+        tail = self.history[-self.epochs_saved :]
+        # the last epoch flagged `best` is the run's best: the flag means 'improved on
+        # everything before it', so later flags supersede earlier ones
+        best = next((e for e in reversed(self.history) if e["best"]), None)
+        if best is not None and best["epoch"] < tail[0]["epoch"]:
+            return [best] + tail
+        return tail
+
+    def result_yaml_path(self):
+        """Where this run's `<stem>_result.yaml` goes."""
+        return os.path.join(
+            self.run_dir, f"{self._decoder.checkpoint_stem()}_result.yaml"
+        )
+
+    def _timing(self):
+        """What the run cost, in the terms a decode run's result file reports.
+
+        A decode file gives a total and then that total per batch, per sample and per
+        iteration, which is what makes two runs comparable when they metered different
+        amounts of work. The training file answers the same question, with the epoch
+        standing where the decoder's iteration stands: how long the run took, and what
+        one epoch, one batch and one sample of it cost.
+
+        The averages come from the recorded epoch times rather than from dividing the
+        wall clock, for two reasons. The wall clock includes building the decoder and
+        loading the matrices, which is setup rather than training and would inflate a
+        short run's per-epoch cost. And it is the time of *this* invocation, so a
+        resumed run's would cover only the epochs since the resume, while the epoch
+        times are restored with the history and so cover the whole run.
+
+        A batch here is a batch of either phase, `batches_per_epoch + val_batches` of
+        them per epoch, since both phases run through the same channel and the epoch
+        time is the two together.
+        """
+        times = [float(entry.get("time", 0.0)) for entry in self.history]
+        per_epoch = sum(times) / len(times) if times else 0.0
+        per_batch = per_epoch / self.period if self.period else 0.0
+        samples = self.period * (self.batch_size or 0)
+        return {
+            "total time (s)": float(time.time() - self.start),
+            "total epoch time (s)": float(sum(times)),
+            "average time per epoch (s)": per_epoch,
+            "average time per batch (s)": per_batch,
+            "average time per sample (s)": (per_epoch / samples if samples else 0.0),
+        }
+
+    def save_result_yaml(self):
+        """Write `<stem>_result.yaml`: what the run is, then the run's curve by column.
+
+        The `-t` counterpart of the decode half's `result_phy_err_*.yaml`, and the same
+        shape: a summary block naming the run, then the results themselves. It carries
+        the same numbers as `<stem>_history.json`, in the form the rest of the
+        toolchain already reads results in, so a training run and a decode run can be
+        loaded the same way.
+
+        The curve is stored a column per term rather than a block per epoch: `epoch` is
+        the list of epoch numbers, and every other list under it is index-aligned with
+        that one, so `train['loss'][i]` and `val['class error'][i]` belong to epoch
+        `epoch[i]`. A term is then one line to read and one list to plot, rather than
+        something to be collected out of a hundred blocks, and the file is about five
+        times shorter. The epoch numbers are carried explicitly rather than implied by
+        position, which is what keeps the columns meaningful when `epochs_saved` has
+        thinned them to a tail, or when a resumed run picks up mid-curve.
+
+        Rewritten at every epoch boundary rather than once at the end, for the reason
+        the checkpoints are: a run stopped part way still leaves behind the epochs it
+        did finish. Floats are dumped plain rather than through the decode file's
+        17-digit representer -- this one is a curve someone reads down.
+        """
+        history = self.saved_history()
+        epochs = {
+            "epoch": [int(entry["epoch"]) for entry in history],
+            "learning rate": [float(entry["lr"]) for entry in history],
+            "time (s)": [float(entry.get("time", 0.0)) for entry in history],
+            "best": [bool(entry.get("best", False)) for entry in history],
+            "train": _yaml_losses(history, "train"),
+            "val": _yaml_losses(history, "val"),
+        }
+        best = min(history, key=lambda e: e["val"]["class_err"], default=None)
+        # named only when it is capping something, so an uncapped run's file keeps the
+        # shape it had before the key existed
+        capped = {"epochs saved": self.epochs_saved} if self.epochs_saved else {}
+        result = {
+            "train_full": {
+                **self.run_meta,
+                "epochs": self.epochs,
+                **capped,
+                "batches per epoch": self.cfg["batches_per_epoch"],
+                "validation batches": self.cfg["val_batches"],
+                "seed": self.cfg["seed"],
+                "best val class error": float(self.best),
+                "best epoch": int(best["epoch"]) if best else None,
+                **self._timing(),
+                "checkpoint": os.path.join(
+                    self.run_dir, f"{self._decoder.checkpoint_stem()}.pt"
+                ),
+            },
+            "epoch": epochs,
+        }
+        with open(self.result_yaml_path(), "w") as fh:
+            yaml.dump(
+                result,
+                fh,
+                Dumper=TrainResultDumper,
+                sort_keys=False,
+                default_flow_style=False,
+            )
 
     def save_history(self):
         """Write <stem>_history.json and report where the run's checkpoints landed.
 
         The name comes from the bound decoder, so the paths printed are the ones
         actually written rather than a fixed pair this class assumed.
+
+        `<stem>_result.yaml` is written once more here rather than left at the last
+        epoch's copy, so its `total time (s)` is the whole run's and not the time up
+        to the final epoch boundary.
+
+        The json carries the same epochs the yaml does, `epochs_saved` included: the
+        two files are the same record in two formats, and a cap one of them honoured
+        and the other did not would make that false.
         """
         stem = self._decoder.checkpoint_stem()
         history_path = os.path.join(self.run_dir, f"{stem}_history.json")
         with open(history_path, "w") as fh:
-            json.dump(self.history, fh, indent=2)
+            json.dump(self.saved_history(), fh, indent=2)
+        self.save_result_yaml()
         best_path = os.path.join(self.run_dir, f"{stem}.pt")
         last_path = os.path.join(self.run_dir, f"{stem}_last.pt")
         print(
@@ -931,6 +1221,7 @@ class MetricState:
         )
         print(f"checkpoints: {best_path}, {last_path}")
         print(f"history: {history_path}")
+        print(f"result: {self.result_yaml_path()}")
         print(f"\nadd to the decoder yaml to use it:\n\n  checkpoint: {best_path}\n")
         print(
             f"to continue this run, add to the same command:\n\n  -tckpt {last_path}\n"

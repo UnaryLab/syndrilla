@@ -27,8 +27,25 @@ def parse_device_dtype(cfg):
 
 
 def is_rate_range(rate) -> bool:
-    """Whether a configured rate is a [lower, upper] range rather than a scalar."""
+    """Whether a configured rate is a [lower, upper, points] range rather than a scalar."""
     return isinstance(rate, (list, tuple))
+
+
+def reject_rate_points_key(
+    cfg: dict, owner: str, key: str = "rate", points_key: str = "rate_points"
+):
+    """Refuse a config still carrying the retired <points_key> sibling key.
+
+    Kept next to <build_rate_sweep> and called by it, so the module that reads a range
+    and the interface that forwards one refuse an out-of-date config the same way,
+    rather than the forwarded copy losing the key and failing later on its length.
+    """
+    if points_key in cfg:
+        raise ValueError(
+            f"<{owner}> sets <{points_key}>, which is no longer a key of its own: the "
+            f"number of points is the last value of the <{key}> range. Write <{key}>: "
+            f"[lower, upper, points] and drop <{points_key}>."
+        )
 
 
 def build_rate_sweep(
@@ -40,7 +57,7 @@ def build_rate_sweep(
     points_key: str = "rate_points",
 ):
     """
-    Split a [lower, upper] <key> range into <points_key> evenly spaced levels.
+    Split a [lower, upper, points] <key> range into <points> evenly spaced levels.
 
     A range is the training-only form of a rate. Training against a single noise level
     gives a decoder that only holds at that level; a range lets every shot draw its own,
@@ -48,34 +65,38 @@ def build_rate_sweep(
     file, so a range is refused here, in the module that reads it, rather than in
     <main.py>: every caller of the module gets the same refusal.
 
+    The point count is the range's own last value rather than a separate <points_key>
+    key: it means nothing without the range, and as a sibling key it could be set with
+    no range to apply it to, or left behind when a range was turned back into a scalar.
+    A config still carrying the old key is rejected with the form to write instead.
+
     Returns the levels as a float64 tensor, left on the CPU for the caller to place.
     """
     if not training:
         raise ValueError(
             f"<{owner}> got <{key}> as the range <{rate}>, which is the training-only form: a decode run records one rate per result file. Train with <-t>, or set a scalar <{key}> to decode."
         )
-    if len(rate) != 2:
+    reject_rate_points_key(cfg, owner, key, points_key)
+    if len(rate) != 3:
         raise ValueError(
-            f"A <{key}> range needs exactly 2 values [lower, upper], got <{rate}>."
+            f"A <{key}> range needs exactly 3 values [lower, upper, points], got <{rate}>."
         )
-    lower, upper = rate
+    lower, upper, points = rate
     if lower > upper:
         raise ValueError(
             f"A <{key}> range needs lower <= upper, got <{lower}> > <{upper}>."
         )
     if not 0 < lower or not upper < 1:
         raise ValueError(
-            f"A <{key}> range needs 0 < lower and upper < 1, got <{rate}>."
+            f"A <{key}> range needs 0 < lower and upper < 1, got <{[lower, upper]}>."
         )
-    if points_key not in cfg:
-        raise ValueError(f"Missing key <{points_key}> in the configuration.")
-    points = cfg[points_key]
     if isinstance(points, bool) or not isinstance(points, int) or points < 1:
         raise ValueError(
-            f"Key <{points_key}> needs a positive integer, got <{points}>."
+            f"A <{key}> range needs a positive integer as its last value, the number "
+            f"of points, got <{points}>."
         )
     logger.info(
-        f"<{owner}> sweeps <{key}> over <{points}> points across <{rate}>, one drawn per shot."
+        f"<{owner}> sweeps <{key}> over <{points}> points across <{[lower, upper]}>, one drawn per shot."
     )
     return torch.linspace(lower, upper, points, dtype=torch.float64)
 

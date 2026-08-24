@@ -1,7 +1,10 @@
-from syndrilla.utils import read_yaml, write_yaml
-from collections import OrderedDict
-import os, shutil, copy, itertools, argparse
+import argparse
+import os
+import shutil
+
 from loguru import logger
+
+from syndrilla.utils import read_yaml, write_yaml
 
 
 def clean_dir(base_path: str):
@@ -28,9 +31,15 @@ def generate_decoder(base_path: str, code, check_type, distance, dtype, decoder)
         config['decoder']['dtype'] = dtype
         config['decoder']['check_type'] = check_type
         if code == 'surface':
-            config['decoder']['max_iter'] = distance*2*(distance-1)+1
+            max_iter = distance*2*(distance-1)+1
         else:
-            config['decoder']['max_iter'] = distance*2*(distance)
+            max_iter = distance*2*(distance)
+        # `max_iter` belongs to the BP stage, which is the first algorithm of the
+        # chain; `config` is a mapping when the template names one algorithm and a
+        # list, one entry per algorithm, when it chains several
+        decoder_config = config['decoder'].setdefault('config', {})
+        stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
+        stage['max_iter'] = max_iter
 
     write_yaml(target_file, config)
 
@@ -164,7 +173,7 @@ def main():
                                 generate_error(base_path, probability)
                                 generate_matrix(base_path, code, distance)
                                 generate_checker(base_path, check_type)
-                                
+
 
 if __name__ == '__main__':
     main()

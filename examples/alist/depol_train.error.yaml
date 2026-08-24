@@ -1,7 +1,10 @@
+# Training-only noise: a swept depolarizing rate rather than a pinned one. `rate` is a
+# [lower, upper, points] range split into that many evenly spaced levels, and every shot
+# draws its own, carrying the matching Pauli priors. This is the same `depol` model a
+# decode run uses; a scalar `rate` decodes at that one level, see depol.error.yaml.
 error:
   model: depol
   device:
     device_type: cpu
     device_idx: 0
-  rate: [0.01, 0.20]
-  rate_points: 9
+  rate: [0.01, 0.20, 9]

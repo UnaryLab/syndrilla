@@ -6,5 +6,5 @@ decoder:
     device_type: cuda
     device_idx: 0
   config:
-    - max_iter: 181  # bp_lottery
-      random_machine: sobol
+    max_iter: 181
+    random_machine: sobol

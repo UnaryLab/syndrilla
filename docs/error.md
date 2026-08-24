@@ -35,7 +35,7 @@ In 2-channel mode, X and Z streams are sampled independently with the same `rate
 The BSC model has no `rounds` field of its own — `error_model.rounds` is set from the syndrome config's `rounds` (see [syndrome.md](syndrome.md) §2). When `rounds > 1`, errors become **cumulative** across rounds rather than i.i.d. per round: each round independently flips qubits at `rate`, and round `t`'s error is the parity-sum of all flips up to `t`, so a flip persists until another flip on the same qubit clears it. The model then emits a per-round tensor `[B, rounds, N]` consumed directly by the phenomenological syndrome measurer. With `rounds == 1` it emits the usual `[B, N]`. This applies to 1-channel mode only: the 2-channel path ignores `rounds` and always emits `[B, 2, N]`.
 
 ## 2. Swept rates for training
-Training a decoder against a single physical error rate gives a decoder that only holds at that rate. Any model's `rate` may instead be given as a `[lower, upper]` range with `rate_points`: the range is split into that many evenly spaced levels at construction, and every shot in the batch draws its own, so each row is flipped at its own rate and carries the matching prior. One training run then covers a stretch of the curve rather than a single point on it.
+Training a decoder against a single physical error rate gives a decoder that only holds at that rate. Any model's `rate` may instead be given as a `[lower, upper, points]` range: the range is split into that many evenly spaced levels at construction, and every shot in the batch draws its own, so each row is flipped at its own rate and carries the matching prior. One training run then covers a stretch of the curve rather than a single point on it.
 
 A range is the **training-only** form. A decode run records one physical error rate per result file, so building any model from a range without training refuses with an error naming the model and the key. Nothing about the scalar form changes: an existing decode configuration keeps sampling exactly the numbers it sampled before, and a model built from a scalar carries no sweep state at all.
 
@@ -50,15 +50,13 @@ error:
   device:
     device_type: cpu
     device_idx: 0
-  rate: [0.01, 0.20]
-  rate_points: 9
+  rate: [0.01, 0.20, 9]
 ```
 
 The following table details the configuration parameters that differ from the scalar form above.
 | Key                         | Description                                                                                          | Example          |
 |-----------------------------|------------------------------------------------------------------------------------------------------|------------------|
-| `error.rate`                | Physical error probability as a `[lower, upper]` range, with `0 < lower <= upper < 1`                | `[0.01, 0.20]`   |
-| `error.rate_points`         | Number of evenly spaced levels in that range, one drawn per shot. Positive integer, required.        | `9`              |
+| `error.rate`                | Physical error probability as a `[lower, upper, points]` range, with `0 < lower <= upper < 1` and `points` a positive integer: the number of evenly spaced levels in the range, one drawn per shot | `[0.01, 0.20, 9]` |
 
 The priors of a swept shot are the scalar ones evaluated at the level that shot drew: `log((1 - r) / r)` for a 1-channel BSC, constant along that shot's qubits, and the same Pauli formulas as the scalar form for a 2-channel model. With `rounds > 1` a shot keeps its level across its own rounds, so the flips stay cumulative in exactly the way §1 describes.
 
@@ -115,4 +113,4 @@ The four noise rates are read by the **interface** when it builds the circuit, n
 
 For each error mechanism `i` in the DEM with probability `p_i`, the LLR prior passed to the decoder is `log((1 - p_i) / p_i)`, and `inject_error` flips mechanism `i` with probability `p_i`. The draw uses torch rather than stim's own DEM sampler so it follows the global torch RNG, which is what a training run's per-phase reseeding drives; the two are equivalent, since a DEM's mechanisms are independent Bernoulli draws either way.
 
-`rate` doubles as the training-only sweep: given as a `[lower, upper]` range with `rate_points`, every shot draws its own noise level and its own priors, so one run covers a stretch of the curve rather than a single point. A range needs the circuit's generation parameters, which `-i` passes through, since each point regenerates the circuit. A decode run against a range is refused, the same way and by the same shared check `bsc` uses. See [interface.md](interface.md) §3.
+`rate` doubles as the training-only sweep: given as a `[lower, upper, points]` range, every shot draws its own noise level and its own priors, so one run covers a stretch of the curve rather than a single point. A range needs the circuit's generation parameters, which `-i` passes through, since each point regenerates the circuit. A decode run against a range is refused, the same way and by the same shared check `bsc` uses. See [interface.md](interface.md) §3.

@@ -91,7 +91,7 @@ def parse_commandline_args():
         "-t",
         "--train",
         action="store_true",
-        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<code>_<size>{.pt,_last.pt,_history.json,_train.log} to --run_dir.",
+        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<code>_<size>{.pt,_last.pt,_history.json,_result.yaml,_train.log} to --run_dir.",
     )
     parser.add_argument(
         "-ls",
@@ -137,7 +137,7 @@ def main():
     if args.train_checkpoint is not None and not args.train:
         raise ValueError(
             "-tckpt resumes a training run, so it needs -t. To decode from a "
-            "checkpoint, put its path under the decoder yaml's `config.checkpoint` key."
+            "checkpoint, put its path under the decoder yaml's `checkpoint` key."
         )
 
     if args.train and args.checkpoint_yaml is not None:
@@ -154,8 +154,10 @@ def main():
             ("-ls", "loss_yaml") if args.train else ("-c", "logical_yaml"),
         ]
     elif args.train:
+        # the interface supplies the matrix, error model and measurer, but not the
+        # objective: which loss supervises the run is the run's own choice, exactly as
+        # it is on the -m path
         required += [("-ls", "loss_yaml")]
-        
     missing = [flag for flag, name in required if getattr(args, name) is None]
     if missing:
         mode = "Training" if args.train else "Decoding"
@@ -165,10 +167,10 @@ def main():
 
     if args.train:
         trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[-1]
-        train_cfg = MetricState.validate_train_cfg(
-            trained_cfg.get("train"), args.decoder_yaml
+        metrics = MetricState.from_cfg(
+            trained_cfg.get("train"), args.run_dir, args.decoder_yaml
         )
-        torch.manual_seed(train_cfg["seed"])
+        torch.manual_seed(metrics.cfg["seed"])
         yaml_ckpt = trained_cfg.get("checkpoint")
         if args.train_checkpoint is not None and yaml_ckpt:
             raise ValueError(
@@ -245,6 +247,21 @@ def main():
     decoder_device = decoders[0].device
 
     number_channel = error_model.number_channel
+    # the first stage is the one handed the raw syndrome, so its channel count is the
+    # one the error model has to agree with; later stages see whatever it produced.
+    # Checked here rather than left to the sampler, where a mismatch surfaced as
+    # `Size does not match at dimension 2 expected index [200, 1, 20, 4]...` from
+    # inside an index op, naming neither the error model nor the decoder
+    expected_channel = 2 if getattr(decoders[0], "_base_synd_ndim", 2) == 3 else 1
+    if number_channel != expected_channel:
+        # the interface path builds the error model itself, so there may be no -e to name
+        source = args.error_yaml or f"<{args.interface_yaml}>'s error model"
+        raise ValueError(
+            f"Error model <{source}> has <{number_channel}> channel(s), but "
+            f"decoder <{decoders[0].algo}> decodes <{expected_channel}>. Pair a "
+            f"2-channel model such as <depol> with a 2-channel decoder such as <bp4>, "
+            f"or a 1-channel model such as <bsc> with a 1-channel decoder."
+        )
     check_type = decoder_cfg.get("check_type", "hx")
     shape, _, _, _ = bundle.Hx_matrix.get_index()
     H_matrix = bundle.select(check_type)[3]
@@ -274,7 +291,6 @@ def main():
 
     if args.train:
         assert_trainable(decoders)
-        metrics = MetricState.for_training(args.run_dir, train_cfg)
         num_batches = metrics.begin_train_run(
             decoders[-1],
             args.batch_size,

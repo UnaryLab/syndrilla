@@ -17,8 +17,7 @@ YAML config::
 A training run may sweep the measurement noise instead of pinning it, the way the
 error models sweep <rate>::
 
-      measurement_error_rate: [0.001, 0.05]   # a range makes this training-only
-      rate_points: 9
+      measurement_error_rate: [0.001, 0.05, 9]   # [lower, upper, points], training-only
 
 Every shot then draws its own measurement error rate, and the prior it folds into
 `adjust_llr0` is that shot's own, so one run covers a stretch of the curve.

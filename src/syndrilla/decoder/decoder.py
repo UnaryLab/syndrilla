@@ -218,10 +218,19 @@ class RoundFlattenWrapper(torch.nn.Module):
         io_dict["synd"] = synd.reshape(Bd, *rest)
 
         llr0 = io_dict["llr0"]
-        llr0_rest = llr0.shape[1:]
-        io_dict["llr0"] = (
-            llr0.unsqueeze(1).expand(B, d, *llr0_rest).reshape(Bd, *llr0_rest)
-        )
+        if llr0.ndim == synd.ndim and llr0.shape[:2] == (B, d):
+            # the error model drew a fresh error per round, so the prior already
+            # carries the rounds dimension and is flattened the way the syndrome is.
+            # Expanding it instead gave the inner decoder a [B*d, d, N] prior against
+            # a [B*d, M] syndrome, which is what took every rounds > 1 run down with
+            # `Tensors must have same number of dimensions: got 3 and 2`
+            io_dict["llr0"] = llr0.reshape(Bd, *llr0.shape[2:])
+        else:
+            # one prior per shot, shared by every round of that shot
+            llr0_rest = llr0.shape[1:]
+            io_dict["llr0"] = (
+                llr0.unsqueeze(1).expand(B, d, *llr0_rest).reshape(Bd, *llr0_rest)
+            )
 
         for key in ("llr", "converge", "iter", "e_v"):
             if key in io_dict and io_dict[key].shape[0] == B and io_dict[key].ndim >= 2:
@@ -246,7 +255,7 @@ class RoundFlattenWrapper(torch.nn.Module):
 # `decoder.config`: the algorithm-specific half of a decoder block.
 #
 # Everything at the top of the block is framework-wide -- `algorithm`, `check_type`,
-# `dtype`, `device`, `force_pytorch` and `rebatch_speedup` are read by
+# `dtype`, `device`, `force_pytorch`, `checkpoint` and `rebatch_speedup` are read by
 # main.py, this loader, or every decoder alike. What only one algorithm understands
 # (`max_iter`, `sf`, relay_bp's schedule, the quantization widths) lives under
 # `config`, one entry per entry of `algorithm`, so a chain can tune each stage
@@ -303,8 +312,14 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     """Return one algorithm-specific config per algorithm, validating placement.
 
     `config` is positional: entry i belongs to `algorithm[i]`, which is what lets the
-    same algorithm appear twice in a chain with different settings. A single-algorithm
-    block may write the mapping directly instead of a one-element list.
+    same algorithm appear twice in a chain with different settings.
+
+    A `config` written as a plain mapping is the settings of the chain's **first**
+    algorithm, and every later stage runs on its defaults. That covers the shipped
+    chains, where only the first stage takes settings (`osd_0` after BP configures
+    nothing), and keeps their yaml a flat block of keys. A chain that has to configure
+    a later stage writes the list form, which is the only one that can say which stage
+    an entry belongs to.
     """
     misplaced = [key for key in MOVED_TO_CONFIG if key in dec_cfg]
     if misplaced:
@@ -319,14 +334,8 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     if blocks is None:
         blocks = [{}] * n
     elif isinstance(blocks, dict):
-        if n != 1:
-            raise ValueError(
-                f"Decoder config {source} chains <{n}> algorithms, so `decoder.config` "
-                f"is matched to them by position and has to be a list. Write "
-                f"`- {{...}}` for the stage these settings belong to; a stage with no "
-                f"settings of its own needs no entry."
-            )
-        blocks = [blocks]
+        # a mapping is the first stage's settings; the rest of the chain defaults
+        blocks = [blocks] + [{}] * (n - 1)
     elif isinstance(blocks, list):
         if len(blocks) > n:
             raise ValueError(

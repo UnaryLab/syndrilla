@@ -6,7 +6,7 @@ from syndrilla.error_model import create_error_model
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
 from syndrilla.syndrome import create_syndrome
-from syndrilla.utils import parse_device_dtype
+from syndrilla.utils import parse_device_dtype, reject_rate_points_key
 
 
 def get_stim_circuit(circuit_str=None, circuit_cfg=None):
@@ -139,10 +139,12 @@ class create:
             "number_channel": number_channel,
             "device": device_cfg,
         }
+        # a swept rate carries its own point count as its last value, so the range
+        # passes through as one key rather than two that could arrive apart; the
+        # retired key is refused here rather than dropped silently on the way through
+        reject_rate_points_key(error_cfg, "stim interface")
         if "rate" in error_cfg:
             em_cfg["rate"] = error_cfg["rate"]
-        if "rate_points" in error_cfg:
-            em_cfg["rate_points"] = error_cfg["rate_points"]
         # a swept <rate> regenerates the circuit per rate point, so the error model
         # needs the parameters it was generated from, not just the finished text
         if circuit_gen_cfg is not None:

@@ -1,5 +1,5 @@
 decoder:
-  algorithm: bp_branch
+  algorithm: bp_branch_assisted
   check_type: hz
   dtype: float64
   device:

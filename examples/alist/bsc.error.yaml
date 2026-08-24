@@ -1,7 +1,7 @@
 error:
+  device:
+    device_idx: 0
+    device_type: cpu
   model: bsc
   number_channel: 1
-  device: 
-    device_type: cpu
-    device_idx: 0
-  rate: 0.1
+  rate: 0.05

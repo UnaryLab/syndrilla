@@ -24,3 +24,8 @@ decoder:
       batches_per_epoch: 200
       val_batches: 20
       seed: 42
+      # optional: cap how many epochs the result yaml and the json history carry,
+      # keeping the most recent this many plus the best epoch. Remove the key and
+      # they carry every epoch, which is one value per epoch in every column
+      # however long the run is.
+      epochs_saved: 10

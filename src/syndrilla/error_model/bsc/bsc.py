@@ -10,10 +10,10 @@ class create:
     """
     This class creates a bsc error model.
 
-    <rate> is a scalar for a decode run. A training run may give it as a [lower, upper]
-    range with <rate_points> instead: the range is split into that many evenly spaced
-    levels and every shot in the batch draws its own, so one run covers a stretch of the
-    curve rather than the single point a scalar pins. A range outside training is
+    <rate> is a scalar for a decode run. A training run may give it as a
+    [lower, upper, points] range instead: the range is split into that many evenly
+    spaced levels and every shot in the batch draws its own, so one run covers a stretch
+    of the curve rather than the single point a scalar pins. A range outside training is
     refused, since a result file records one physical error rate for the whole run.
     """
 

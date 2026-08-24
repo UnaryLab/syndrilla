@@ -173,8 +173,7 @@ class TestRateSweep:
                 cfg={
                     "model": "stim_circuit",
                     "circuit": str(circuit),
-                    "rate": [0.001, 0.01],
-                    "rate_points": 5,
+                    "rate": [0.001, 0.01, 5],
                 },
                 training=True,
             )

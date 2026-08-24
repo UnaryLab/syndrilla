@@ -8,6 +8,6 @@ decoder:
     device_type: cuda
     device_idx: 0
   config:
-    - max_iter: 131  # bp_norm_min_sum_quant
-      int_width: 3
-      frac_width: 4
+    max_iter: 131
+    int_width: 3
+    frac_width: 4

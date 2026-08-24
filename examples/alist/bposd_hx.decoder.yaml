@@ -6,4 +6,4 @@ decoder:
     device_type: cuda
     device_idx: 0
   config:
-    - max_iter: 181  # bp_norm_min_sum
+    max_iter: 181

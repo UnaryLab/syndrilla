@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+
 import yaml
 
 
@@ -34,9 +35,13 @@ def main():
             with open(file, 'r') as f:
                 data = yaml.safe_load(f)
 
-            # Update fields
-            data['decoder']['int_width'] = args.int_width
-            data['decoder']['frac_width'] = args.frac_width
+            # Update fields. The widths belong to the quantized BP stage, which is
+            # the first algorithm of the chain; `config` is a mapping when the yaml
+            # names one algorithm and a list, one entry per algorithm, when it chains.
+            decoder_config = data['decoder'].setdefault('config', {})
+            stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
+            stage['int_width'] = args.int_width
+            stage['frac_width'] = args.frac_width
 
             # Write back
             with open(file, 'w') as f:
@@ -45,7 +50,7 @@ def main():
     sweeping_file = Path('zoo/script/sweeping_configs.yaml')
     with open(sweeping_file, 'r') as f:
         data = yaml.safe_load(f)
-    
+
     print(f'Processing: {sweeping_file}')
     data['decoder'] = [args.decoder]
 

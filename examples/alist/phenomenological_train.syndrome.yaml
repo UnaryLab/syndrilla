@@ -1,5 +1,5 @@
-# Training-only measurement noise: `measurement_error_rate` is a [lower, upper] range
-# split into `rate_points` levels, and every shot draws its own, so one run covers a
+# Training-only measurement noise: `measurement_error_rate` is a [lower, upper, points]
+# range split into that many levels, and every shot draws its own, so one run covers a
 # stretch of the measurement-noise curve. The prior folded into the decoder's llr0 is
 # the level that shot drew. A scalar rate decodes at that one level, see
 # phenomenological.syndrome.yaml.
@@ -8,5 +8,4 @@
 syndrome:
   measure: phenomenological
   rounds: 1
-  measurement_error_rate: [0.001, 0.05]
-  rate_points: 9
+  measurement_error_rate: [0.001, 0.05, 9]

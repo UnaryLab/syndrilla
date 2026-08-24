@@ -24,8 +24,7 @@ YAML config::
 
 Training may sweep the noise instead of pinning it, mirroring `bsc`::
 
-      rate: [0.001, 0.01]   # a range makes this a training-only model
-      rate_points: 9
+      rate: [0.001, 0.01, 9]   # [lower, upper, points], a training-only form
 
 A range needs the circuit's *generation* parameters (``circuit_gen``), which the stim
 interface passes through, since each rate point is a freshly generated circuit whose
@@ -216,7 +215,7 @@ class create:
             table.append(_error_priors(dem))
         self._prior_table = torch.tensor(table, dtype=torch.float64)
         logger.info(
-            f"Stim rate sweep ready: <{rate_points}> points over <{self.rate}>, "
+            f"Stim rate sweep ready: <{rate_points}> points over <{self.rate[:2]}>, "
             f"sharing one H of <{self.num_errors}> columns."
         )
 

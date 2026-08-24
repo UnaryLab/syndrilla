@@ -49,14 +49,13 @@ The noiseless per-round syndrome is stored in `syndrome_actual` for analysis (un
 Because a flipped syndrome bit is statistically indistinguishable from an extra data flip, the measurer also exposes `adjust_llr0(llr0)`, which the pipeline calls to fold the measurement-error rate `q` into the per-data-qubit channel prior before decoding. It inflates the data-error probability `p` (recovered from `llr0 = log((1 - p)/p)`) to the effective `p_eff = p + q − 2·p·q` and rebuilds the prior. This keeps the decoder's prior physically consistent with the noisy syndromes; a zero rate leaves `llr0` untouched.
 
 ### 2.2. Swept measurement noise (training only)
-`measurement_error_rate` takes the same training-only range form the error models take for `rate` (see [error.md](error.md) §2): a `[lower, upper]` pair with `rate_points`, split into that many evenly spaced levels, one drawn per shot. Training against a single measurement-noise level gives a decoder that only holds at that level; sweeping covers a stretch of it in one run.
+`measurement_error_rate` takes the same training-only range form the error models take for `rate` (see [error.md](error.md) §2): a `[lower, upper, points]` triple, split into that many evenly spaced levels, one drawn per shot. Training against a single measurement-noise level gives a decoder that only holds at that level; sweeping covers a stretch of it in one run.
 
 ```
 syndrome:
   measure: phenomenological
   rounds: 1
-  measurement_error_rate: [0.001, 0.05]
-  rate_points: 9
+  measurement_error_rate: [0.001, 0.05, 9]
 ```
 
 The level a shot draws is used for both halves of that shot: its syndrome bits are flipped at that rate, and `adjust_llr0` folds that same rate into its prior, so the prior a decoder sees still matches the noise it was actually given. A shot keeps one level across its rounds. A decode run against a range is refused, since a result file records one rate for the whole run, and `syndrilla -t` is what allows it: the mode is passed to `create_syndrome` rather than read from the YAML. An example is shipped as ```phenomenological_train.syndrome.yaml```, whose `rounds` is `1` because today's trainable decoders take a single round.
