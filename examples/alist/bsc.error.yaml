@@ -4,4 +4,4 @@ error:
     device_type: cpu
   model: bsc
   number_channel: 1
-  rate: 0.05
+  rate: 0.1

@@ -6,4 +6,4 @@ decoder:
     device_type: cpu
     device_idx: 0
   config:
-    max_iter: 100
+    max_iter: 181

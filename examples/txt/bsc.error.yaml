@@ -3,5 +3,5 @@ error:
   device: 
     device_type: cpu
     device_idx: 0
-  rate: 0.01
+  rate: 0.1
   

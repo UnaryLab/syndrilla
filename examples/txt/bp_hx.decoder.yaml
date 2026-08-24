@@ -3,4 +3,4 @@ decoder:
   check_type: hx
   dtype: float64
   config:
-    max_iter: 50
+    max_iter: 181
