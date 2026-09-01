@@ -107,10 +107,6 @@ class create(torch.nn.Module):
         # set iteration
         self.i = 0
 
-        # convert to as the parameters in a model. Move the bundle-derived index/mask/matrix
-        # tensors onto the decoder's device: the bundle is loaded on CPU, but forward() builds
-        # its tensors on self.device and ops like scatter_add_ require the index on the SAME
-        # device as the target (plain [] indexing tolerates a CPU index, scatter_add_ does not).
         self.V_c_row = torch.nn.Parameter(
             self.V_c_row.to(self.device), requires_grad=False
         )
@@ -123,9 +119,6 @@ class create(torch.nn.Module):
         self.algo = "bp_lottery"
         self.num_max_iter = self.max_iter
 
-        # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is
-        # in the config). When active it stops a batch once a learned % has converged
-        # and leaves the rest unconverged for main's extra queue. See decoder.py.
         self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get("rebatch_speedup"))
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied

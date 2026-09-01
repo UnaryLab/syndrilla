@@ -452,9 +452,7 @@ def main():
         ax.set_xticklabels(tick_labels)
 
 
-    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
     # plot
-    # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
     FIGWIDHT = 3.33
     FIGHEIGHT = 2

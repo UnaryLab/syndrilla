@@ -238,7 +238,6 @@ class create(torch.nn.Module):
             # else satisfy C1 or c2
             # C.1 w(ˆsk ⊕ s) ≤ w(b ⊕ s)
             # C.2 Iˆsk
-            # s0_est_comp = torch.sum((zeroth_saver + syndrome) % 2, 1)
             sk_est_comp = (s_est + syndrome) % 2
             c1_results = (torch.sum(sk_est_comp, 1) <= s0_est_comp).int()
             c2_results = torch.sum(((s_est == 1) & (syndrome == 0)).int(),1)

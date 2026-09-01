@@ -1,22 +1,3 @@
-"""
-bp_lottery_policy_cuda.py — CUDA port of bp_lottery_policy.
-
-Same per-iteration BP math as bp_norm_min_sum, plus the configurable lottery
-sign-flip *policy* (one of seven strategies) applied every iteration. Like
-bp_lottery_cuda it reuses bp_norm_min_sum_cuda's compiled per-step kernels for the
-BP steps and runs the sign-flip in PyTorch between iterations (a per-iteration host
-op the fused kernel cannot express).
-
-Implementation reuses BOTH parents directly via multiple inheritance:
-  * bp_norm_min_sum_cuda   — device/dtype/kernels/adjacency setup + the per-step
-    kernel entry points (self._ext.*).
-  * bp_lottery_policy       — the seven sign_flip_* methods and policy validation,
-    which depend only on self.H_matrix / self.r / self.i / self.batch_size and so
-    work unchanged once H_matrix is staged on-device here.
-
-YAML algorithm key: bp_lottery_policy_cuda
-"""
-
 import torch
 from loguru import logger
 

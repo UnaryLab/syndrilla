@@ -1,32 +1,3 @@
-"""
-bp_norm_min_sum_cuda.py — BP Normalized Min-Sum decoder backed by CUDA kernels.
-
-Plug-in replacement for bp_norm_min_sum (pure PyTorch). Two execution paths:
-
-  • FUSED (default): one kernel launch decodes the whole batch. Each thread
-    block runs the full iteration loop for one sample entirely in shared
-    memory, with per-sample early termination — no Python loop, no per-step
-    launches, no GPU→CPU syncs. Used whenever the per-sample working set fits
-    the GPU's shared-memory-per-block limit.
-
-  • PER-STEP (debug / huge-code fallback, `force_per_step: true`): a Python
-    loop dispatching one modular kernel per pipeline step:
-       init_messages      — first-iteration gather from channel LLR
-       vn_update          — extrinsic variable-node message
-       cn_update          — beta-normalized min-sum check-node message
-       llr_update         — per-variable LLR accumulation
-       hard_decision      — threshold decisions
-       syndrome_est       — parity checks
-       convergence_update — per-sample early termination bookkeeping
-
-The class follows the exact same interface as all other syndrilla decoders:
-    create(decoder_cfg, bundle=<MatrixBundle>) → torch.nn.Module
-    forward(io_dict) → io_dict  with keys e_v, iter, llr, converge
-
-YAML algorithm key: bp_norm_min_sum_cuda
-See README.md in this directory for architecture, workflow and tuning notes.
-"""
-
 import math
 import os
 
@@ -36,8 +7,6 @@ import torch.nn as nn
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
-
-# ── Extension loader ───────────────────────────────────────────────────────────
 
 _EXT = None  # module-level cache; compiled once per Python process
 
@@ -81,9 +50,6 @@ def _load_ext():
         return _EXT
     from torch.utils.cpp_extension import load
 
-    # bp_kernel.cu lives in the shared decoder/cuda/ folder (two directories up): it
-    # is reused by every CUDA decoder (the bp_norm_min_sum/lottery/quant/relay/branch
-    # *_cuda ports), so it is not tied to this subpackage.
     decoder_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     kernel_src = os.path.join(decoder_dir, "cuda", "bp_kernel.cu")
     # Compile only for the local GPU's architecture: faster first build and
@@ -119,8 +85,6 @@ def _load_ext():
     logger.info("bp_norm_min_sum_cuda kernels compiled.")
     return _EXT
 
-
-# ── Adjacency helper ───────────────────────────────────────────────────────────
 
 
 def _build_vn_adj(V_c_col_np: np.ndarray, N: int) -> tuple:
@@ -166,9 +130,6 @@ def _build_vn_adj(V_c_col_np: np.ndarray, N: int) -> tuple:
     ptr = np.zeros(N_ext + 1, dtype=np.int64)
     ptr[1:] = np.cumsum(counts)
 
-    # Within-group slot index:
-    #   global position in the sorted array minus the group's start pointer.
-    #   Valid because n_sorted is sorted, so each group is a contiguous run.
     slot = np.arange(len(n_sorted), dtype=np.int64) - ptr[n_sorted]
 
     VN_adj_c = np.full((N_ext, VD), -1, dtype=np.int64)
@@ -178,8 +139,6 @@ def _build_vn_adj(V_c_col_np: np.ndarray, N: int) -> tuple:
 
     return VN_adj_c, VN_adj_k, VD
 
-
-# ── Decoder class ──────────────────────────────────────────────────────────────
 
 
 class create(nn.Module):
@@ -197,12 +156,6 @@ class create(nn.Module):
     """
 
     def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        # Init nn.Module explicitly rather than via super(): in the diamond
-        # MRO of the multi-inheritance CUDA decoders (bp_lottery_policy_cuda,
-        # bp_lottery_quant_cuda) the next class after this one is a pure-Python
-        # base whose __init__ requires decoder_cfg and is meant to be skipped
-        # (it contributes methods only). A bare super().__init__() would leak
-        # into it; nn.Module.__init__(self) stops the cooperative chain here.
         nn.Module.__init__(self)
         logger.info("Creating bp_norm_min_sum_cuda decoder.")
 
@@ -212,7 +165,6 @@ class create(nn.Module):
                 "Use bp_norm_min_sum for CPU execution."
             )
 
-        # ── device ────────────────────────────────────────────────────────────
         device_cfg = decoder_cfg.get("device", {})
         device_type = device_cfg.get("device_type", "cuda")
         if device_type != "cuda":
@@ -228,7 +180,6 @@ class create(nn.Module):
             device_idx = 0
         self.device = torch.device(f"cuda:{device_idx}")
 
-        # ── dtype ─────────────────────────────────────────────────────────────
         dtype_str = decoder_cfg.get("dtype", "float64")
         valid_dtypes = {"float16", "bfloat16", "float32", "float64"}
         if dtype_str not in valid_dtypes:
@@ -236,7 +187,6 @@ class create(nn.Module):
             dtype_str = "float64"
         self.dtype = torch.__dict__[dtype_str]
 
-        # ── hyperparameters ───────────────────────────────────────────────────
         self.max_iter = decoder_cfg.get("max_iter", 50)
         if not isinstance(self.max_iter, int) or self.max_iter <= 0:
             logger.warning(f"Invalid max_iter={self.max_iter}; defaulting to 50.")
@@ -248,7 +198,6 @@ class create(nn.Module):
             logger.warning(f"Invalid check_type='{self.check_type}'; defaulting to hx.")
             self.check_type = "hx"
 
-        # ── matrix bundle ─────────────────────────────────────────────────────
         bundle = kwargs.get("bundle")
         if bundle is None:
             raise ValueError(
@@ -270,7 +219,6 @@ class create(nn.Module):
         self.V_c_col = nn.Parameter(V_c_col.to(self.device), requires_grad=False)
         self.V_c_row = nn.Parameter(V_c_row.to(self.device), requires_grad=False)
 
-        # ── variable→check adjacency (transpose of V_c_col) ───────────────────
         # Precomputed once at init; used every iteration by k_llr_update.
         V_c_col_np = V_c_col.cpu().numpy()
         adj_c, adj_k, self.VD = _build_vn_adj(V_c_col_np, self.N)
@@ -282,38 +230,20 @@ class create(nn.Module):
             torch.from_numpy(adj_k).to(self.device), requires_grad=False
         )
 
-        # ── block size for the fused kernel ──────────────────────────────────
         # Must cover M*D edges (stride-loop handles the rest).
         # Round up to the next multiple of 32 (warp), cap at 512.
         min_threads = M_val * D
         self._block_size = min(max(32 * math.ceil(min_threads / 32), 64), 512)
 
-        # ── metadata expected by the syndrilla framework ───────────────────────
         self.algo = "bp_norm_min_sum"
         self.batch_size = 1  # updated in forward()
 
-        # rebatch_speedup (adaptive cap): honored on-device by the fused kernel via a
-        # grid-wide converged counter + stop_count threshold (see forward()), so a
-        # capped decode keeps the single fused launch with no host syncs. It is a
-        # SOFT cap: if the batch's blocks span multiple scheduling waves, a late
-        # block may see the counter already past stop_count and stop at iter 1,
-        # deferring an otherwise-easy sample — correctness-neutral (main.py
-        # re-decodes the deferred tail uncapped), just a slightly larger tail.
-        # Omit the rebatch_speedup block to leave self.cap None (uncapped). Every
-        # cap-aware subclass forward reads getattr(self, "cap", None), so building
-        # it here enables the cap across the whole *_cuda family.
         self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get("rebatch_speedup"))
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        # ── load/compile the CUDA extension ───────────────────────────────────
         self._ext = _load_ext()
 
-        # ── choose execution path ─────────────────────────────────────────────
-        # The fused kernel keeps all per-sample state in shared memory; use it
-        # whenever the working set fits the device's per-block limit.
-        # `force_per_step: true` in the YAML selects the modular kernels
-        # (useful for debugging individual steps).
         smem_needed = self._ext.fused_smem_bytes(
             M_val, D, self.N_ext, self.VD, self.dtype.itemsize
         )
@@ -327,8 +257,6 @@ class create(nn.Module):
                 f"(fused needs {smem_needed} B shared memory, limit {smem_limit} B)."
             )
         logger.info("bp_norm_min_sum_cuda decoder ready.")
-
-    # ── Forward pass ──────────────────────────────────────────────────────────
 
     def forward(self, io_dict: dict) -> dict:
         """
@@ -376,29 +304,12 @@ class create(nn.Module):
         num_iters = torch.zeros(B, dtype=torch.int64, device=dev)
         converges = torch.zeros(B, dtype=torch.int64, device=dev)
 
-        # adaptive cap: active once warm-up has chosen a stop fraction (and main did
-        # not request a full uncapped pass for the deferred tail). The fused kernel
-        # honors the cap entirely on-device via a grid-wide converged counter
-        # (g_conv_count) + stop_count threshold — no host syncs — so a capped decode
-        # stays on the fused path. The per-step path is only the fallback for codes
-        # whose working set exceeds shared memory (self._use_fused == False).
         self.cap_active_last = bool(
             self.cap is not None and self.cap.done and not self.cap_bypass
         )
         use_fused = self._use_fused
 
         if use_fused:
-            # ── Fused path: one kernel launch decodes the entire batch ────────
-            # The kernel runs the whole iteration loop per sample in shared
-            # memory, terminates each sample as soon as its syndrome matches,
-            # and writes per-sample num_iters / converges directly — identical
-            # semantics to the PyTorch reference, with zero host syncs.
-            #
-            # Capped run: pass a pre-zeroed [1] int32 counter + the stop threshold
-            # (ceil(frac * B)); each block bumps the counter on convergence and any
-            # still-running block stops once the count reaches stop_count, leaving
-            # its sample converge==0 for main.py's deferred-tail queue. Uncapped:
-            # conv_count=None ⇒ the kernel skips every cap branch.
             conv_count, stop_count = None, 0
             if self.cap_active_last:
                 conv_count = torch.zeros(1, dtype=torch.int32, device=dev)
@@ -421,13 +332,6 @@ class create(nn.Module):
                 stop_count,
             )
         else:
-            # ── Per-step path: Python loop over the modular kernels ──────────
-            # Used for the fallback (force_per_step, or codes whose working set
-            # exceeds the GPU's shared-memory limit) AND for every capped decode:
-            # the host loop can stop the batch the moment the learned fraction has
-            # converged, which the fused kernel cannot do reliably. Convergence
-            # bookkeeping runs on-device via the convergence_update kernel; the
-            # host polls the early-exit / cap condition between iterations.
             HOST_CHECK_EVERY = 8
             cap_frac = self.cap.frac if self.cap_active_last else None
             D = int(self.V_c_col.shape[1])
@@ -473,11 +377,6 @@ class create(nn.Module):
                 elif i % HOST_CHECK_EVERY == 0 and not (num_iters == -1).any().item():
                     break
 
-            # Unconverged tail: snapshot final state and stamp the iteration the loop
-            # actually stopped at (`i`) — `max_iter` when it ran to completion, the
-            # early cap-break iteration when the cap fired, so the deferred tail is
-            # not mis-reported as having run to max_iter. main.py defers these
-            # (converge == 0) to the extra queue when the cap is active.
             not_conv = num_iters == -1
             if not_conv.any().item():
                 e_out[not_conv] = e_v[not_conv]

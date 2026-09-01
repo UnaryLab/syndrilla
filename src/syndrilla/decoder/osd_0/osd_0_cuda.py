@@ -1,26 +1,3 @@
-"""
-osd_0_cuda.py — OSD-0 post-decoder backed by bit-packed GF(2) CUDA kernels.
-
-Plug-in replacement for the pure-PyTorch ``osd_0`` decoder. OSD-0 runs after a BP
-stage and re-solves only the samples BP failed to converge: it orders the columns
-by posterior LLR reliability, performs a column-ordered GF(2) Gauss-Jordan
-elimination of the augmented matrix ``[H | s]``, and reads out the error estimate
-(free columns zeroed). See README.md in this directory.
-
-Two execution paths, mirroring bp_norm_min_sum_cuda:
-
-  • FUSED (default): one kernel launch, one thread block per non-converged sample,
-    the whole [H | s] bit-matrix in shared memory. Used whenever the per-sample
-    working set fits the GPU's shared-memory-per-block limit.
-
-  • PER-STEP (fallback / ``force_per_step: true``): a Python loop over the modular
-    kernels (osd_pivot → osd_eliminate, then osd_solve) operating in global
-    memory — for codes too large for shared memory and for debugging single steps.
-
-YAML algorithm key: osd_0_cuda. Chain it after a BP stage, e.g.
-``algorithm: [bp_norm_min_sum_cuda, osd_0_cuda]``.
-"""
-
 import math
 import os
 
@@ -28,8 +5,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from loguru import logger
-
-# ── Extension loader (mirrors bp_norm_min_sum_cuda) ─────────────────────────────
 
 _EXT = None  # module-level cache; compiled once per Python process
 
@@ -67,9 +42,6 @@ def _load_ext():
         return _EXT
     from torch.utils.cpp_extension import load
 
-    # The OSD-0 kernels live in the shared decoder/cuda/ folder (two directories
-    # up), next to bp_kernel.cu / mwpm_kernel.cu — same convention as every
-    # other CUDA decoder loader (see bp_norm_min_sum_cuda.py).
     cuda_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cuda"
     )
@@ -95,9 +67,6 @@ def _load_ext():
     )
     logger.info("osd_0_cuda kernels compiled.")
     return _EXT
-
-
-# ── GF(2) host helpers ──────────────────────────────────────────────────────────
 
 
 def _pack_H(H_np: np.ndarray, N: int, W: int) -> np.ndarray:
@@ -142,8 +111,6 @@ def _gf2_rank(H_np: np.ndarray) -> int:
     return rank
 
 
-# ── Decoder class ────────────────────────────────────────────────────────────────
-
 
 class create(nn.Module):
     """
@@ -168,7 +135,6 @@ class create(nn.Module):
                 "osd_0_cuda requires a CUDA-capable GPU. Use osd_0 for CPU execution."
             )
 
-        # ── device ────────────────────────────────────────────────────────────
         device_cfg = decoder_cfg.get("device", {})
         device_type = device_cfg.get("device_type", "cuda")
         if device_type != "cuda":
@@ -181,7 +147,6 @@ class create(nn.Module):
             device_idx = 0
         self.device = torch.device(f"cuda:{device_idx}")
 
-        # ── dtype ─────────────────────────────────────────────────────────────
         dtype_str = decoder_cfg.get("dtype", "float64")
         if dtype_str not in {"float16", "bfloat16", "float32", "float64"}:
             logger.warning(f"Invalid dtype '{dtype_str}'; defaulting to float64.")
@@ -193,7 +158,6 @@ class create(nn.Module):
             logger.warning(f"Invalid check_type='{self.check_type}'; defaulting to hx.")
             self.check_type = "hx"
 
-        # ── matrix bundle → dense H ───────────────────────────────────────────
         bundle = kwargs.get("bundle")
         if bundle is None:
             raise ValueError(
@@ -201,10 +165,6 @@ class create(nn.Module):
             )
         H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
         self.H_shape = H_shape
-        # V_c_col (parity-row -> qubit-column index map) is read by the perfect syndrome
-        # measurer when this decoder is the syndrome-facing decoders[0]; expose it like
-        # every other decoder. Registered (requires_grad=False, index tensor) so it moves
-        # with the module onto the CUDA device.
         self.V_c_col = nn.Parameter(V_c_col.to(self.device), requires_grad=False)
         self.M, self.N = int(H_shape[0]), int(H_shape[1])
         self.W = ((self.N + 1) + 63) >> 6
@@ -214,12 +174,10 @@ class create(nn.Module):
         H_packed = torch.from_numpy(_pack_H(H_np, self.N, self.W)).contiguous()
         self.H_packed = nn.Parameter(H_packed.to(self.device), requires_grad=False)
 
-        # ── metadata expected by the framework ────────────────────────────────
         self.algo = "osd_0"
         self.num_max_iter = self.N  # matches osd_0.py:122
         self.batch_size = 1
 
-        # ── load extension + choose path ──────────────────────────────────────
         self._ext = _load_ext()
         smem_needed = self._ext.fused_smem_bytes(self.M, self.W)
         smem_limit = self._ext.fused_smem_limit()
@@ -235,8 +193,6 @@ class create(nn.Module):
         # Block size for the fused kernel: cover M rows, round to a warp, cap 512.
         self._block_size = min(max(32 * math.ceil(self.M / 32), 64), 512)
         logger.info("osd_0_cuda decoder ready.")
-
-    # ── Forward pass ──────────────────────────────────────────────────────────
 
     def forward(self, io_dict: dict) -> dict:
         """Re-solve BP's non-converged samples with OSD-0; return the full batch."""

@@ -1,37 +1,3 @@
-"""
-Stim-based error model.
-
-Samples the fault mechanisms of a stim circuit's detector error model (DEM) and
-provides the matching prior LLRs. The DEM's error instructions are the columns of the
-`H` that ``matrix/stim`` hands the decoder, so a sampled mechanism vector `e` is a
-ground-truth error *in the decoder's own coordinates*: ``syndrome/stim`` reads the
-detectors straight off it as ``H @ e``, and a training loss can supervise against it.
-
-Sampling is done with torch rather than stim's own DEM sampler so it runs off the
-global torch RNG. That is what `MetricState`'s per-phase reseeding drives, so a training
-run's error stream stays reproducible and a resumed run replays it. The two are
-equivalent in distribution: a DEM's mechanisms are independent Bernoulli draws, and
-stim's sampler XORs exactly the same supports together.
-
-YAML config::
-
-    error:
-      model: stim_circuit
-      circuit: <inline stim circuit string>
-      number_channel: 1
-      device:
-        device_type: cpu
-
-Training may sweep the noise instead of pinning it, mirroring `bsc`::
-
-      rate: [0.001, 0.01, 9]   # [lower, upper, points], a training-only form
-
-A range needs the circuit's *generation* parameters (``circuit_gen``), which the stim
-interface passes through, since each rate point is a freshly generated circuit whose
-DEM priors are re-extracted. Every configured noise key is scaled together so the
-circuit's noise profile is preserved rather than flattened.
-"""
-
 import torch
 from loguru import logger
 
@@ -139,9 +105,7 @@ class create:
             f"rate <{self.rate}>."
         )
 
-    # ------------------------------------------------------------------
     # rates
-    # ------------------------------------------------------------------
     @property
     def _prior_llr(self):
         """This circuit's per-mechanism prior LLR, at its own noise level.
@@ -181,10 +145,8 @@ class create:
         gen_cfg = error_model_cfg.get("circuit_gen", None)
         if not gen_cfg:
             raise ValueError(
-                "A <rate> range regenerates the circuit at each rate point, so it needs "
-                "the circuit generation parameters (code, distance, rounds, noise), not "
-                "an inline circuit string. Configure the stim interface with <code> and "
-                "<distance> so they are known."
+                "A <rate> range regenerates the circuit at each point, so it needs the "
+                "circuit generation parameters (code, distance, rounds, noise)."
             )
         configured = {k: float(gen_cfg[k]) for k in NOISE_KEYS if k in gen_cfg}
         if not configured:
@@ -207,10 +169,7 @@ class create:
             if _error_supports(dem) != self._supports:
                 raise ValueError(
                     f"Rate point <{rate}> gives a detector error model with a different "
-                    f"set of error mechanisms than the base circuit "
-                    f"(<{len(_error_supports(dem))}> vs <{self.num_errors}> columns, or "
-                    f"a different support), so one H cannot cover the sweep. Narrow the "
-                    f"<rate> range."
+                    f"error-mechanism set than the base circuit; narrow the <rate> range."
                 )
             table.append(_error_priors(dem))
         self._prior_table = torch.tensor(table, dtype=torch.float64)
@@ -219,9 +178,7 @@ class create:
             f"sharing one H of <{self.num_errors}> columns."
         )
 
-    # ------------------------------------------------------------------
     # error model interface
-    # ------------------------------------------------------------------
     def inject_error(self, codeword, batch_size: int = 0):
         """Sample a DEM mechanism vector per shot, as `codeword` XOR the drawn faults.
 
@@ -245,8 +202,7 @@ class create:
         if codeword.size(-1) != self.num_errors:
             raise ValueError(
                 f"Error model <stim_circuit> samples <{self.num_errors}> DEM mechanisms, "
-                f"got a codeword of width <{codeword.size(-1)}>. The matrix and the error "
-                f"model have to come from the same circuit."
+                f"got a codeword of width <{codeword.size(-1)}>."
             )
 
         shots = codeword.size(0)

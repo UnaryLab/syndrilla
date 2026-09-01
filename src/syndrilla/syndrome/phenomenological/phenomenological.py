@@ -1,28 +1,3 @@
-"""
-Phenomenological syndrome measurer.
-
-When the error has a rounds dimension [B, rounds, N] (e.g. from BSC with
-rounds > 1), computes per-round syndrome directly and applies measurement
-noise — no duplication needed.
-
-When the error is 2-D [B, N] (a single round), computes one syndrome and
-applies measurement noise.
-
-YAML config::
-
-    syndrome:
-      measure: phenomenological
-      measurement_error_rate: 0.01
-
-A training run may sweep the measurement noise instead of pinning it, the way the
-error models sweep <rate>::
-
-      measurement_error_rate: [0.001, 0.05, 9]   # [lower, upper, points], training-only
-
-Every shot then draws its own measurement error rate, and the prior it folds into
-`adjust_llr0` is that shot's own, so one run covers a stretch of the curve.
-"""
-
 import torch
 from loguru import logger
 
@@ -61,9 +36,6 @@ class create:
         logger.info("Measuring syndrome.")
 
         if error.ndim == 2:
-            # [B, N] — single round. (rounds > 1 always arrives as a 3-D
-            # [B, rounds, N] error from the BSC model, handled by the branch
-            # below, so no per-round replication is needed here.)
             dummy_column = torch.zeros(
                 [error.shape[0], 1], dtype=error.dtype, device=error.device
             )

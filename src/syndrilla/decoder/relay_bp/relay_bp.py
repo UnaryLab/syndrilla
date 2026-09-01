@@ -52,11 +52,6 @@ class create(torch.nn.Module):
 
         self.init_mem_strength = decoder_cfg.get('init_mem_strength', 0.35)
 
-        # Min-sum normalization factor (alpha). Matches the relay-bp crate semantics:
-        #   alpha == 0.0  -> adaptive schedule 1 - 2^(-i / alpha_scaling) (crate's Some(0.))
-        #   alpha < 0.0   -> falls back to 1.0 (crate behavior)
-        #   otherwise     -> constant alpha (e.g. 1.0 for plain min-sum, the crate default)
-        # Default 0.0 preserves this decoder's original adaptive normalized min-sum.
         self.alpha_const = decoder_cfg.get('alpha', 0.0)
         if not isinstance(self.alpha_const, (int, float)) or isinstance(self.alpha_const, bool):
             logger.warning(f'Invalid input alpha <{self.alpha_const}>, default to <0.0>.')
@@ -149,10 +144,6 @@ class create(torch.nn.Module):
         self.algo = 'bp_relay'
         self.num_max_iter = self.iteration_initial + (self.legs - 1) * self.iteration_count
 
-        # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is in the
-        # config). When active it stops the leg ensemble once a learned % of the batch has
-        # converged and leaves the rest unconverged for main's deferred extra queue. Mirrors
-        # bp_norm_min_sum; here the cap is at the LEG granularity (each leg is a full BP run).
         self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
@@ -313,9 +304,6 @@ class create(torch.nn.Module):
 
 
     def vn_update(self, b_c2v, bias):
-        # extrinsic variable->check message: the variable prior (with memory) plus the
-        # sum of all OTHER incoming check->variable messages on each edge. Called once
-        # per iteration to build the messages consumed by the next check-node update.
         sum_b_c2v = self.sum_func(bias, b_c2v)
         return sum_b_c2v[:, self.V_c_col] - b_c2v
 

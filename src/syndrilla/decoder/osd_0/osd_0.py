@@ -224,7 +224,6 @@ class create(torch.nn.Module):
             # Step 1: For each batch, find the first valid pivot starting from row i,
             # where the pivot condition is B[b, :, cols[b, k]] == 1 and rinv >= i
 
-            # ----------------------------------------------------------------------------
             # curr_cols: [B, N-i]
             curr_cols = cols_batch_out[:, i:N]  # columns from i to N-1
             B, ni = curr_cols.shape
@@ -434,7 +433,6 @@ class create(torch.nn.Module):
             U_batch_sparse.col_idx   = torch.cat([U_batch_sparse.col_idx.to(device), U_c])
             U_batch_sparse.values    = torch.cat([U_batch_sparse.values.to(device), U_v])
 
-            # ----------------------------------------------------------------
             del pivot_row, pivot_col, pivot_col_expand
             del coo_b, coo_r, coo_c, coo_v
             del rinv_r, gt_mask, eq_mask, lt_mask

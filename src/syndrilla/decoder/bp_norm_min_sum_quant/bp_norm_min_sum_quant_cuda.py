@@ -1,24 +1,3 @@
-"""
-bp_norm_min_sum_quant_cuda.py — CUDA port of bp_norm_min_sum_quant (quantized NMS).
-
-The quantized normalized-min-sum is the SAME recursion as bp_norm_min_sum with a
-fixed-point round (``fp2fxp``) inserted at four points. ``fp2fxp`` is a pure-PyTorch
-op, and quantization is idempotent on the per-step kernels' outputs (sums and minima
-of fixed-point values stay fixed-point at float64), so this decoder reuses
-bp_norm_min_sum_cuda's compiled per-step kernels UNCHANGED and applies the rounding
-in PyTorch between kernel calls:
-
-  * u_init quantized once at init,
-  * a_v2c quantized after vn_update (i > 1),
-  * beta pre-quantized and passed to cn_update; b_c2v quantized after cn_update,
-  * l_v is already fixed-point (u_init_q + Σ b_c2v_q), so hard_decision matches.
-
-At float64 this reproduces bp_norm_min_sum_quant bit-for-bit. The per-iteration
-host rounding rules out the fused kernel, so the per-step path is always used.
-
-YAML algorithm key: bp_norm_min_sum_quant_cuda
-"""
-
 import torch
 from loguru import logger
 

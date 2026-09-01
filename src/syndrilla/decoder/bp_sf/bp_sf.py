@@ -136,7 +136,6 @@ class create(torch.nn.Module):
         self.algo = "bp_sf"
         self.num_max_iter = self.max_iter
 
-        # -------- syndrome-flipping (SF) post-processing parameters --------
         sf_cfg = decoder_cfg.get("sf", decoder_cfg)
         self.w_min = int(sf_cfg.get("w_min", 0))
         self.w_max = int(sf_cfg.get("w_max", 0))
@@ -151,10 +150,6 @@ class create(torch.nn.Module):
             logger.warning("SF enabled (w_max>0) but topk<=0; defaulting topk to 20.")
             self.topk = 20
 
-        # When SF is enabled, the BP iteration cap is fixed to the number of data
-        # qubits N (= number of H columns), so a faithful BP-SF run iterates at most
-        # once per data qubit. SF-rescued samples report this pass-1 cap (deviation #4
-        # in repro.md), so the reported max iteration equals N.
         if self.w_max > 0:
             N = self.H_shape[1]
             if self.max_iter != N:
@@ -165,9 +160,6 @@ class create(torch.nn.Module):
             self.max_iter = N
             self.num_max_iter = self.max_iter
 
-        # BP-SF does not use the adaptive iteration cap (the SF retry replaces the
-        # deferred-tail mechanism); keep the attributes so the shared loop in main
-        # and metric stays happy.
         self.cap = RebatchSpeedup.from_cfg(None)
         self.cap_bypass = False
         self.cap_active_last = False
@@ -309,10 +301,6 @@ class create(torch.nn.Module):
         # per-sample candidate bit indices, highest oscillation first: [U, topk]
         cand = torch.argsort(osc[unconv], dim=1, descending=True)[:, :topk]
 
-        # weight-ordered candidate-slot combinations, as a membership mask [C, topk].
-        # `sample_n_choose_k` (the reference's random sampler) is called once per weight,
-        # so the combo set and its ordering are identical to the loop version; each combo
-        # becomes a variable-length row of slot indices.
         combos = [
             torch.tensor(list(slots), dtype=torch.long, device=self.device)
             for w in range(self.w_min, self.w_max + 1)
@@ -360,17 +348,12 @@ class create(torch.nn.Module):
         row_flip.scatter_(1, cand, combo_mask[sel])
         chosen_e = torch.where(row_flip > 0, 1.0 - chosen_e, chosen_e)
 
-        # num_iters keeps the pass-1 BP cost (== max_iter for these samples); the SF
-        # retry is post-processing, so it is not counted as BP iterations (its cost
-        # shows up in wall-clock time, not the iteration histogram).
         g = unconv[has]
         e_out[g] = chosen_e[has]
         l_out[g] = chosen_l[has]
         converges[g] = 1
 
-    # ------------------------------------------------------------------ #
     # BP message-passing primitives (identical to bp_norm_min_sum)
-    # ------------------------------------------------------------------ #
     def v2c(self, l_v):
         return l_v[:, self.V_c_col]
 

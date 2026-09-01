@@ -1,28 +1,3 @@
-"""
-bp_branch_assisted_cuda.py — CUDA port of bp_branch_assisted (BSFBP).
-
-Branch-assisted sign-flipping BP runs normalized min-sum with a per-sample branching
-search: when a sample meets a local condition it branches (snapshots state, decodes
-the syndrome residual for up to max_b_iter steps, then restores). The inner BP math
-is the SAME min-sum as bp_norm_min_sum, so this reuses bp_norm_min_sum_cuda's compiled
-per-step kernels UNCHANGED. The branch-specific pieces stay in PyTorch:
-
-  * per-sample beta: call cn_update with beta=1.0, then scale b_c2v by
-    (1 - 2^(-curr_iters)) per sample (curr_iters is a PER-SAMPLE counter reset on
-    each branch),
-  * per-sample "iteration 1" passthrough: override a_v2c for samples at curr_iters==1
-    with the carried message,
-  * dynamic syndrome: recompute the per-check ±1 signs each iteration from the
-    (branch-mutated) syndrome,
-  * all branch save/restore bookkeeping and the sign-flip.
-
-At float64 this reproduces bp_branch_assisted bit-for-bit. The pure-PyTorch
-bp_branch_assisted has no rebatch_speedup cap; this CUDA port adds one — supply an
-rebatch_speedup block under decoder: to activate it, omit it to run uncapped.
-
-YAML algorithm key: bp_branch_assisted_cuda
-"""
-
 import torch
 import torch.nn as nn
 from loguru import logger
@@ -128,7 +103,6 @@ class create(_BranchPy):
             self.i += 1
             curr_iters = curr_iters + 1
 
-            # ── vn_update with per-sample iteration-1 passthrough ───────────────
             self._ext.vn_update(l_v, message, self.V_c_col, a_v2c, self.N)
             curr1 = curr_iters == 1
             if curr1.any():
@@ -145,7 +119,6 @@ class create(_BranchPy):
             b_c2v = b_c2v * beta_b
             message = b_c2v  # carry for next iteration
 
-            # ── marginal LLR + hard decision + syndrome ─────────────────────────
             self._ext.llr_update(
                 u_init, b_c2v, self.VN_adj_c, self.VN_adj_k, l_v, self.VD
             )
@@ -189,7 +162,6 @@ class create(_BranchPy):
             if cap_frac is not None and int((num_iters != -1).sum()) >= cap_frac * B:
                 break
 
-            # ── branch decision (C1/C2) and save/restore ────────────────────────
             sk_est_comp = (s_est + syndrome) % 2
             c1_results = (torch.sum(sk_est_comp, 1) <= s0_est_comp).int()
             c2_results = torch.sum(((s_est == 1) & (syndrome == 0)).int(), 1)

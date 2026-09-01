@@ -34,9 +34,6 @@ def generate_decoder(base_path: str, code, check_type, distance, dtype, decoder)
             max_iter = distance*2*(distance-1)+1
         else:
             max_iter = distance*2*(distance)
-        # `max_iter` belongs to the BP stage, which is the first algorithm of the
-        # chain; `config` is a mapping when the template names one algorithm and a
-        # list, one entry per algorithm, when it chains several
         decoder_config = config['decoder'].setdefault('config', {})
         stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
         stage['max_iter'] = max_iter

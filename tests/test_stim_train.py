@@ -1,11 +1,3 @@
-"""Training a learned decoder on the stim circuit-level path.
-
-What makes the path trainable is that one draw produces all three things a training step
-needs: an error over the columns of `H`, the detectors it sets off, and the observables
-it flips. These tests pin that consistency, then drive the CLI end to end to check a run
-actually learns from it rather than merely finishing.
-"""
-
 import math
 import os
 import subprocess

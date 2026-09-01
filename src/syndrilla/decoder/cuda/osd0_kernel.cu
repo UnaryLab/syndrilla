@@ -1,21 +1,3 @@
-/*
- * osd0_kernel.cu — OSD-0 GF(2) solve for the osd_0_cuda extension.
- *
- * One file per decoder kernel, matching bp_kernel.cu / mwpm_kernel.cu.
- * Two paths share the same GF(2) math (gf2.cuh) and are wired into one Python
- * module by the PYBIND11_MODULE block at the bottom:
- *
- *   ── Fused path (default) ──
- *     Whole OSD-0 solve per sample in a single launch: one thread block decodes
- *     one sample, staging [H | s] into shared memory and reducing it there.
- *
- *   ── Per-step path (fallback / debug) ──
- *     Modular pivot / eliminate / solve kernels driven by a Python loop, for
- *     large codes that exceed the fused kernel's shared-memory budget.
- *
- * Packed-tensor conventions and host prototypes live in osd0.h; the bit-packed
- * GF(2) device helpers in gf2.cuh.
- */
 #include "gf2.cuh"
 #include "osd0.h"
 
@@ -24,27 +6,6 @@
 #include <climits>
 
 #define THREADS 256
-
-// ════════════════════════════════════════════════════════════════════════════
-// Fused path — single-launch OSD-0 solve (default)
-// ════════════════════════════════════════════════════════════════════════════
-//
-// One thread block decodes one sample. The augmented matrix [H | s] for that
-// sample is staged into shared memory as bit-packed 64-bit words, reduced by a
-// column-ordered GF(2) Gauss-Jordan elimination, and read out — all without
-// touching global memory inside the loop.
-//
-// Algorithm (per sample b), matching the pure-PyTorch osd_0 reference math:
-//   for each column c in the sample's LLR order:
-//       find the lowest-index row that still has no pivot and has bit c set;
-//       if found, record it as c's pivot row and XOR it into every *other* row
-//       that has bit c set (full reduction).
-//   read-out: a pivot row's syndrome bit is the solution bit for its column;
-//   non-pivot (free) columns stay 0 — this is the OSD-0 (order-0) estimate.
-//
-// Because the column order and the greedy independence test are identical to the
-// reference, the set of pivot columns (the information set) is the same, so the
-// resulting e is the unique He=s solution with free columns zeroed.
 
 __global__ void k_osd0_fused(
     const uint64_t* __restrict__ H_packed,   // [M, W]   shared across samples
@@ -66,7 +27,6 @@ __global__ void k_osd0_fused(
     const int      wN    = N >> 6;
     const uint64_t maskN = 1ULL << (N & 63);
 
-    // ── Stage [H | s] into shared memory ────────────────────────────────────
     // First stage all of H. Word wN holds both H bits and the syndrome bit, so
     // the syndrome OR below must wait until every H word (including wN) is
     // written — otherwise a staging write from another thread can clobber the
@@ -80,7 +40,6 @@ __global__ void k_osd0_fused(
     }
     __syncthreads();
 
-    // ── Column-ordered GF(2) Gauss-Jordan elimination ───────────────────────
     for (int ci = 0; ci < N; ci++) {
         if (s_found >= A_rank) break;            // full rank reached (uniform)
 
@@ -111,7 +70,6 @@ __global__ void k_osd0_fused(
         __syncthreads();                          // single barrier, block-uniform
     }
 
-    // ── Read out the OSD-0 estimate ─────────────────────────────────────────
     for (int c = tid; c < N; c += bsz) e_out[b * N + c] = 0;
     __syncthreads();
     for (int r = tid; r < M; r += bsz) {
@@ -157,11 +115,6 @@ int64_t fused_smem_limit() {
     return (int64_t)v;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Per-step path — modular kernels driven by a Python loop (fallback / debug)
-// ════════════════════════════════════════════════════════════════════════════
-
-// ── Pivot selection ─────────────────────────────────────────────────────────
 // For the current column step, each sample picks the lowest-index row that has
 // no pivot yet and has the step's column bit set. One thread per sample (the
 // per-step path is the large-code / debugging fallback, so simplicity beats
@@ -208,7 +161,6 @@ void osd_pivot_cuda(
         B, M, W, (int)N, (int)step);
 }
 
-// ── Row elimination ─────────────────────────────────────────────────────────
 // For the current column step, XOR each sample's pivot row into every other row
 // that has the step's column bit set. One thread per (sample, row) pair so the
 // heaviest step still parallelises across the batch and the rows.
@@ -254,7 +206,6 @@ void osd_eliminate_cuda(
         B, M, W, (int)N, (int)step);
 }
 
-// ── Read-out ────────────────────────────────────────────────────────────────
 // After elimination, every pivot row's syndrome bit is the solution bit for its
 // pivot column. Free (non-pivot) columns stay 0. e_out must be pre-zeroed by the
 // caller. One thread per (sample, row) pair.
@@ -295,10 +246,6 @@ void osd_solve_cuda(
         e_out.data_ptr<uint8_t>(),
         B, M, W, (int)N);
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// Python bindings
-// ════════════════════════════════════════════════════════════════════════════
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("osd0_fused", &osd0_fused_cuda,

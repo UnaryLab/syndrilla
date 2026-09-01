@@ -217,14 +217,6 @@ class RoundFlattenWrapper(torch.nn.Module):
         return io_dict
 
 
-# --------------------------------------------------------------------------- #
-# `decoder.config`: the algorithm-specific half of a decoder block. The top of the
-# block is framework-wide (`algorithm`, `check_type`, `dtype`, `device`,
-# `force_pytorch`, `checkpoint`, `rebatch_speedup`); what only one algorithm
-# understands lives under `config`, one entry per entry of `algorithm`, so a chain
-# can tune each stage separately.
-# --------------------------------------------------------------------------- #
-
 # Keys that belong under `config`, not at the top of the block. Rejected there rather
 # than ignored: a silent fallback to a default still produces numbers.
 MOVED_TO_CONFIG = (
@@ -290,10 +282,8 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     elif isinstance(blocks, list):
         if len(blocks) > n:
             raise ValueError(
-                f"Decoder config {source} has <{len(blocks)}> entries under "
-                f"`decoder.config` but only <{n}> under `decoder.algorithm`; they are "
-                f"matched by position, so there is no algorithm for the last "
-                f"<{len(blocks) - n}>."
+                f"Decoder config {source} has <{len(blocks)}> entries under `decoder.config` "
+                f"but only <{n}> under `decoder.algorithm`; they match by position."
             )
         # `- ` with nothing after it parses as None; read it as "no settings". A
         # short list leaves the stages past its end on their defaults, but only
@@ -315,9 +305,8 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
         shared = [key for key in SHARED_KEYS if key in block]
         if shared:
             raise ValueError(
-                f'Decoder config {source} has <{", ".join(shared)}> under '
-                f"`decoder.config` for <{algo}>; those are read by the framework for "
-                f"the whole block and belong at the top of `decoder`."
+                f'Decoder config {source} has <{", ".join(shared)}> under `decoder.config` '
+                f"for <{algo}>; those belong at the top of `decoder`."
             )
     return blocks
 
@@ -345,8 +334,7 @@ def assert_trainable(decoders):
     missing = [stage for stage in TRAINABLE_STAGES if not hasattr(inner, stage)]
     raise ValueError(
         f'Decoder <{getattr(tail, "algo", type(inner).__name__)}> cannot train: it '
-        f'implements none of <{", ".join(missing)}>. `-t` trains the last entry of '
-        f"`decoder.algorithm`, so that entry has to be a trainable decoder."
+        f'implements none of <{", ".join(missing)}>. `-t` trains the last algorithm.'
     )
 
 

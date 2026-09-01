@@ -11,9 +11,6 @@ sys.path.append(os.getcwd())
 from syndrilla.interface import create_interface
 
 
-# ----------------------------------------------------------------------------
-# build interface
-# ----------------------------------------------------------------------------
 def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
     return create_interface(
         cfg={
@@ -42,9 +39,6 @@ def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
     )
 
 
-# ----------------------------------------------------------------------------
-# syndrilla decode (through interface pipeline)
-# ----------------------------------------------------------------------------
 def decode_syndrilla(iface, n_shots, batch_size=500):
     error_model = iface.error_model
     syndrome_generator = iface.syndrome_generator
@@ -88,9 +82,6 @@ def decode_syndrilla(iface, n_shots, batch_size=500):
     return syndromes, obs_flips, predictions
 
 
-# ----------------------------------------------------------------------------
-# reference ldpc decode
-# ----------------------------------------------------------------------------
 def decode_reference(H, priors, det_data, max_iter=100):
     bp_osd = BpOsdDecoder(
         H,
@@ -110,9 +101,6 @@ def decode_reference(H, priors, det_data, max_iter=100):
     return out
 
 
-# ----------------------------------------------------------------------------
-# main test
-# ----------------------------------------------------------------------------
 def test_stim_bposd(distance=3, rounds=1, p=0.05,
                     n_shots=100000, max_iter=100):
     print('\n=== Stim BPOSD comparison ===')

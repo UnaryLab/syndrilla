@@ -42,9 +42,8 @@ def reject_rate_points_key(
     """
     if points_key in cfg:
         raise ValueError(
-            f"<{owner}> sets <{points_key}>, which is no longer a key of its own: the "
-            f"number of points is the last value of the <{key}> range. Write <{key}>: "
-            f"[lower, upper, points] and drop <{points_key}>."
+            f"<{owner}> sets <{points_key}>, which is no longer a key of its own. "
+            f"Write <{key}>: [lower, upper, points] and drop <{points_key}>."
         )
 
 
@@ -281,9 +280,6 @@ def check_repeated_key(full_dict: OrderedDict, key: str, val: OrderedDict):
 
 
 # The following interpolate_oneD_linear and interpolate_oneD_quadratic are adapted from accelergy
-# ===============================================================
-# useful helper functions that are commonly used in estimators
-# ===============================================================
 def interpolate_oneD_linear(desired_x, known):
     """
     utility function that performs 1D linear interpolation with a known energy value
@@ -472,10 +468,6 @@ def compute_lz(hx, hz):
     return log_ops
 
 
-# The following functions are from https://github.com/quantumgizmos/ldpc/blob/main/src/ldpc/mod2.py
-# row_echelon
-# nullspace
-# row_basis
 from scipy import sparse
 
 

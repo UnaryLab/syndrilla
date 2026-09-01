@@ -1,20 +1,3 @@
-"""
-bp_lottery_quant_cuda.py — CUDA port of bp_lottery_quant (quantized NMS + sign-flip).
-
-Combines the quantized per-step decode of bp_norm_min_sum_quant_cuda with the simple
-lottery sign-flip applied every iteration (on a quantized Sobol stream). Reuses
-bp_norm_min_sum_cuda's compiled kernels UNCHANGED — quantization (fp2fxp) and the
-sign-flip both run in PyTorch between kernel calls — so at float64 it reproduces
-bp_lottery_quant bit-for-bit.
-
-Implementation reuses both parents via multiple inheritance:
-  * bp_norm_min_sum_quant_cuda — quantized per-step kernel machinery and ``_q``.
-  * bp_lottery_quant            — the simple ``sign_flip`` (depends only on
-    self.H_matrix / self.r / self.i / self.batch_size).
-
-YAML algorithm key: bp_lottery_quant_cuda
-"""
-
 import torch
 from loguru import logger
 

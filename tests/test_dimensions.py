@@ -37,7 +37,6 @@ def _circuit_and_constants(rounds):
 _CIRCUIT_STR_1CH, NUM_DETECTORS, NUM_ERRORS, NUM_OBSERVABLES = _circuit_and_constants(1)
 
 
-# ── helpers ──────────────────────────────────────────────────────────
 def make_interface(rounds=1, measurement_error_rate=0.0):
     return create_interface(
         cfg={
@@ -137,7 +136,6 @@ def make_2ch_components():
     return decoders, error_model, syndrome_gen, logical_chk, bundle
 
 
-# ── syndrome dimension tests ────────────────────────────────────────
 class TestSyndromeDimensions:
 
     def test_stim_d1(self):
@@ -177,7 +175,6 @@ class TestSyndromeDimensions:
         assert synd.shape == (BATCH_SIZE, NUM_DETECTORS)
 
 
-# ── decoder wrapper dimension tests ─────────────────────────────────
 class TestDecoderWrapperDimensions:
 
     def test_2d_passthrough(self):
@@ -209,7 +206,6 @@ class TestDecoderWrapperDimensions:
         assert hasattr(d, "num_max_iter")
 
 
-# ── logical check dimension tests ───────────────────────────────────
 class TestLogicalCheckDimensions:
 
     def test_single_round(self):
@@ -243,7 +239,6 @@ class TestLogicalCheckDimensions:
         assert torch.equal(lc.check(e_v, obs, l_mat), torch.ones(BATCH_SIZE).long())
 
 
-# ── matrix bundle dimension tests ───────────────────────────────────
 class TestMatrixBundleDimensions:
 
     def test_l_matrix_1ch_hx(self):
@@ -265,7 +260,6 @@ class TestMatrixBundleDimensions:
         assert H.shape == (NUM_DETECTORS, NUM_ERRORS)
 
 
-# ── end-to-end pipeline dimension tests ─────────────────────────────
 class TestPipelineDimensions:
 
     def _run_pipeline(self, rounds, measurement_error_rate=0.0):
@@ -318,9 +312,6 @@ class TestPipelineDimensions:
         assert s["check"] == [BATCH_SIZE]
 
     def test_d3(self):
-        # a stim circuit's detectors already span its rounds, so the syndrome has no
-        # separate rounds axis to collapse: this was the same shape at every old vote
-        # stage, and the three cases that only differed by stage are now one.
         _, nd3, ne3, _ = _circuit_and_constants(3)
         s = self._run_pipeline(rounds=3)
         assert s["synd_raw"] == [BATCH_SIZE, nd3]
@@ -344,7 +335,6 @@ class TestPipelineDimensions:
         assert s["check"] == [BATCH_SIZE]
 
 
-# ── 2-channel dimension tests ───────────────────────────────────────
 class TestTwoChannelDimensions:
 
     def _run_2ch_pipeline(self, rounds=1):
@@ -381,11 +371,6 @@ class TestTwoChannelDimensions:
                 io_dict = decoders[decoder_idx](io_dict)
                 shapes[f"e_v_after_decoder_{decoder_idx}"] = list(io_dict["e_v"].shape)
 
-            # The logical check compares e_v against the ground-truth error, so it
-            # needs the two to agree on rank. With nothing collapsing rounds any more,
-            # a multi-round decoder output is [B, d, C, N] against an error of
-            # [B, C, N]; main.py reconciles that in BatchTracker, which flattens
-            # rounds into the batch, not here.
             if io_dict["e_v"].ndim == err.ndim:
                 check = logical_chk.check(io_dict["e_v"], err, l_matrix)
                 shapes["check"] = list(check.shape)

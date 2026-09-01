@@ -1,25 +1,3 @@
-"""
-Realistic checkpoint round-trip test, mirroring main.py's per-100-batch save.
-
-Runs the same flow under several (error model, channels, rounds) combinations
-to verify save/load works for every dimension layout the framework supports:
-
-  - 1-channel BSC + perfect-syndrome (baseline)
-  - 1-channel BSC + phenomenological-syndrome (rounds > 1)
-  - 2-channel depolarizing + perfect-syndrome (bp4 decoder)
-
-For each config:
-  Phase 1 — run N batches with per-batch progress, save at end (done=0)
-  Phase 2 — drop in-memory state, reload from disk, validate
-  Phase 3 — confirm averaged LER survives the round-trip
-  Phase 4 — resume + run a few more batches on top of loaded state
-
-Run either way -- as a pytest module, one test per config:
-    pytest tests/test_checkpoint.py
-or as a script, which prints every compared field and a summary table:
-    python tests/test_checkpoint.py
-"""
-
 import os
 import sys
 import time
@@ -38,9 +16,7 @@ from syndrilla.metric import BatchTracker, MetricState
 from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
-# --------------------------------------------------------------------------
 # (label, decoder_yaml, error_yaml, syndrome_yaml, check_yaml, check_type)
-# --------------------------------------------------------------------------
 CONFIGS = [
     (
         "1ch BSC + perfect",
@@ -109,10 +85,6 @@ def run_one_batch(
     l_mat = bundle.get_l_matrix(check_type, number_channel)
     nmi = [getattr(d, "num_max_iter", 0) for d in decoders]
 
-    # no `rounds=`, exactly as main.py builds it: a multi-round measurer hands the
-    # decoder a rounds axis but the decoder collapses it, so the ground-truth error is
-    # recorded once per sample. Replicating it per round would leave `e_all` R times
-    # taller than the decodings it is checked against.
     bt = BatchTracker(nd, number_channel, shape, dtype, dev)
     zq = torch.zeros([batch_size, shape[1]], dtype=dtype)
     _, dl = em.inject_error(zq, batch_size)
@@ -251,7 +223,6 @@ def run_one_config(
         f"algo={algo}  H_file={H_file}"
     )
 
-    # ---------- Phase 1: run save_every batches with per-batch progress ----------
     print(f"\n  Phase 1: run {save_every} batches and save (done=0)")
     torch.manual_seed(0)
     m = MetricState(nd, nc, dev)
@@ -288,7 +259,6 @@ def run_one_config(
     pre = snapshot(m, nc)
     pre_ne = ne
 
-    # ---------- Phase 2: drop, reload, validate ----------
     print("  Phase 2: drop state, reload ckpt, validate")
     del m
     m_loaded, meta = MetricState.load_checkpoint(ckpt_path, nc, dev)
@@ -306,7 +276,6 @@ def run_one_config(
     print(f'    meta.batch_count={meta["batch_count"]} (expect {save_every}: {nb_ok})')
     print(f'    meta.num_err={meta["num_err"]} (expect {pre_ne}: {ne_ok})')
 
-    # ---------- Phase 3: every averaged metric round-trips through the YAML ----------
     print("  Phase 3: every averaged metric round-trips")
     pre_avg = {f"d{i}": pre_out for i, pre_out in enumerate(out)}
     post_avg = {
@@ -401,7 +370,6 @@ def run_one_config(
     if avg_issues:
         print(f"    BROKEN — {len(avg_issues)} averaged field(s) mismatched")
 
-    # ---------- Phase 4: resume ----------
     print(f"  Phase 4: resume + {resume_extra} more batches")
     nb = meta["batch_count"]
     ne = meta["num_err"]

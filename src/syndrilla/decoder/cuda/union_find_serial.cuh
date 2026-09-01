@@ -1,21 +1,3 @@
-/*
- * union_find_serial.cuh -- self-contained C/CUDA port of the reference-faithful
- * serial Union-Find decoder (union_find.py: _RobinTable, build_lattice_from_parity,
- * decode_shot). NOTHING here depends on Python or PyTorch.
- *
- * The whole point of this decoder is bit-exactness to the C++ chaeyeunpark reference,
- * which comes entirely from the tsl::robin_map *iteration order*. So that order is
- * reproduced here on flat int arrays (RSet below), exactly as _RobinTable does.
- *
- * Layering:
- *   * uf_build_lattice(...)  -- HOST-only (uses std::vector); builds the detector graph
- *     in tsl bucket order into flat CSR arrays. Runs once per parity matrix.
- *   * uf_decode_shot(...)    -- __host__ __device__; the serial grow/fuse/peel over one
- *     shot, using only caller-provided int scratch (no allocation, no std::vector), so
- *     the identical source is the CUDA per-shot kernel body AND a host-testable function.
- *
- * The decode is a line-for-line transliteration of union_find.py:decode_shot.
- */
 #ifndef UNION_FIND_SERIAL_CUH
 #define UNION_FIND_SERIAL_CUH
 
@@ -39,7 +21,6 @@ UF_HD inline int uf_round_up_pow2(int value) {
 // stay under that. +4 is slack against off-by-one growth.
 UF_HD inline int uf_maxcap(int V) { return uf_round_up_pow2(4 * V + 4); }
 
-// ── RSet: array replica of _RobinTable (identity hash on int vertex keys) ─────────
 //
 // buckets stored as two parallel arrays: rd[i] = distance-from-ideal (-1 == empty),
 // rk[i] = key. `cap` is a power of two (0 == empty table), `mask == cap-1`, `size` the
@@ -173,7 +154,6 @@ UF_HD inline int rs_keys(const RSet* s, int* out) {
     return n;
 }
 
-// ── Union-Find find_root with path compression (union_find.py._find_root) ─────────
 UF_HD inline int uf_find_root(int* root_of, int v, int* path) {
     int tmp = root_of[v];
     if (tmp == v) return v;
@@ -186,7 +166,6 @@ UF_HD inline int uf_find_root(int* root_of, int v, int* path) {
     return root;
 }
 
-// ── Flat per-shot scratch layout ─────────────────────────────────────────────────
 //
 // One struct of raw pointers the caller carves out of a single buffer (host malloc or
 // device global scratch). uf_scratch_ints(V,N) returns the total int count needed.
@@ -272,7 +251,6 @@ UF_HD inline void uf_border_store(const RSet* b, UFScratch* s, int r) {
     s->bcap[r] = b->cap; s->bmask[r] = b->mask; s->bsize[r] = b->size;
 }
 
-// ── The serial decode (union_find.py:decode_shot), line-for-line ─────────────────
 //
 // Lattice inputs (from uf_build_lattice): V, N, M (real checks), B (boundary vertex or
 // -1), CSR adjacency conn_off[V+1] / conn_nbr[E2] / conn_q[E2] (neighbour + its qubit
@@ -412,7 +390,6 @@ UF_HD inline void uf_decode_shot(
     }
 }
 
-// ── Host-only lattice build (union_find.py:build_lattice_from_parity) ────────────
 //
 // Runs once per parity matrix on the CPU (inside the extension); never called from a
 // device kernel, so it may use std::vector. It is implicitly __host__ (no UF_HD), so

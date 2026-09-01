@@ -101,10 +101,6 @@ class create(torch.nn.Module):
         # set iteration
         self.i = 0
 
-        # convert to as the parameters in a model. Move the bundle-derived index/mask/matrix
-        # tensors onto the decoder's device: the bundle is loaded on CPU, but forward() builds
-        # its tensors on self.device and ops like scatter_add_ require the index on the SAME
-        # device as the target (plain [] indexing tolerates a CPU index, scatter_add_ does not).
         self.V_c_row = torch.nn.Parameter(
             self.V_c_row.to(self.device), requires_grad=False
         )

@@ -247,8 +247,7 @@ def _yaml_train_setup(path):
     if not isinstance(full, dict):
         raise ValueError(
             f"<{path}> carries no `train_full` block, so it is not a training run's "
-            f"result yaml. `-ckpt` takes the `<stem>_result.yaml` the run being resumed "
-            f"wrote; a decode run's `decoder_full` yaml is not one."
+            f"result yaml. `-ckpt` takes the `<stem>_result.yaml` of the resumed run."
         )
     return {key: full[name] for name, key in _TRAIN_YAML_SETUP.items() if name in full}
 
@@ -911,9 +910,8 @@ class MetricState:
         logger.info(f"Reading training schedule from <{get_path(source)}>.")
         if cfg is None:
             raise ValueError(
-                f"Decoder yaml {source} has no 'train' block, so there is no schedule "
-                f"to train on. Add one under `decoder` with "
-                f"{', '.join(cls.TRAIN_KEYS)}."
+                f"Decoder yaml {source} has no 'train' block. Add one under `decoder` "
+                f"with {', '.join(cls.TRAIN_KEYS)}."
             )
         missing = [key for key in cls.TRAIN_KEYS if key not in cfg]
         if missing:
@@ -963,8 +961,7 @@ class MetricState:
         if clashes or len(set(names)) != len(names):
             raise ValueError(
                 f"Loss <{type(loss).__module__}> declares term names that cannot be "
-                f"metered: <{', '.join(names)}>. They must be distinct and none may be "
-                f"one of the run's own <{', '.join(self.KEYS)}>."
+                f"metered: <{', '.join(names)}>. They must be distinct and not run keys."
             )
         self.term_names = names
         self.keys = (self.KEYS[0], *names, *self.KEYS[1:])
@@ -1070,9 +1067,8 @@ class MetricState:
         """Validate a checkpoint's fingerprint matches this run's settings."""
         if saved is None:
             raise ValueError(
-                f"<{path}> carries no training fingerprint, so it cannot be resumed "
-                f"from. It holds weights only; point the decoder yaml's `checkpoint` "
-                f"key at it to decode, or start a fresh run."
+                f"<{path}> carries no training fingerprint, so it cannot be resumed from. "
+                f"It holds weights only; use it as the decoder yaml's `checkpoint`."
             )
         fields = self._fingerprint
         if keys is not None:
@@ -1116,10 +1112,8 @@ class MetricState:
         expected = len(self.keys) - 1
         if len(terms) != expected:
             raise ValueError(
-                f"The loss handed back <{len(terms)}> value(s) where the run is metered "
-                f"on <{expected}>: the total plus <{', '.join(self.term_names) or 'no'}> "
-                f"term(s). `terms()` must return one value per name in `term_names`, in "
-                f"that order."
+                f"The loss handed back <{len(terms)}> value(s) where the run is metered on "
+                f"<{expected}>: `terms()` returns one value per name in `term_names`."
             )
         values = [float(v.detach() if torch.is_tensor(v) else v) for v in terms]
         phase = self.acc[self.phase]

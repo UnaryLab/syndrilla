@@ -35,11 +35,6 @@ class create:
         self.num_detectors = self.circuit.num_detectors
         self.num_observables = self.circuit.num_observables
 
-        # qec_rounds: number of QEC rounds baked into the stim circuit. The
-        # circuit's detectors already cover all rounds, so the syndrome output
-        # has no separate rounds dimension. Exposed under a different name so
-        # main.py's getattr(syndrome_generator, 'rounds', 1) returns 1 and
-        # nothing downstream looks for a rounds axis that isn't there.
         self.qec_rounds = int(syndrome_cfg.get("rounds", 1))
         self.number_channel = int(syndrome_cfg.get("number_channel", 1))
 
@@ -68,14 +63,12 @@ class create:
         if error.ndim != 2:
             raise ValueError(
                 f"Stim syndromes are measured on a [batch, mechanisms] error, got shape "
-                f"<{tuple(error.shape)}>. A stim circuit's detectors already cover every "
-                f"QEC round, so there is no rounds axis to fold in."
+                f"<{tuple(error.shape)}>; a circuit's detectors already cover every round."
             )
         if error.shape[1] != self._H.shape[1]:
             raise ValueError(
                 f"This circuit has <{self._H.shape[1]}> error mechanisms, got an error of "
-                f"width <{error.shape[1]}>. The matrix, error model and syndrome measurer "
-                f"have to come from the same circuit."
+                f"width <{error.shape[1]}>; both must come from the same circuit."
             )
 
         # float rather than int: CUDA has no integer matmul. The parity is still exact,

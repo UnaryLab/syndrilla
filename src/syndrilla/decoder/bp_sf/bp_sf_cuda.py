@@ -1,40 +1,3 @@
-"""
-bp_sf_cuda.py — CUDA port of bp_sf (normalized min-sum BP + syndrome flipping).
-
-BP-SF's belief-propagation core is the SAME normalized min-sum as bp_norm_min_sum,
-so this reuses bp_norm_min_sum_cuda's compiled kernels UNCHANGED — no new .cu code.
-Only the BP loop (`_bp_core`) is moved onto the GPU kernels; the syndrome-flipping
-post-processing (`_sf_postprocess`) is already batched PyTorch and runs on-device as
-inherited, so the whole decoder follows the convention used by the other *_cuda ports
-(bp_branch_assisted_cuda, bp_lottery_cuda, …): subclass the pure-PyTorch decoder and
-swap the message passing for kernels.
-
-Two BP execution paths, picked per call:
-
-  • PER-STEP (main pass, `track_osc=True`): the seven modular kernels
-    (init_messages, vn_update, cn_update, llr_update, hard_decision, syndrome_est,
-    convergence_update) driven by a host loop. Oscillation tracking — the per-bit
-    hard-decision flip count BP-SF needs to rank flip candidates — is a cheap
-    elementwise compare in PyTorch between kernel steps, so it stays on the GPU
-    without touching the .cu code. This path is mandatory for the main pass because
-    the fused kernel does not emit oscillation counts.
-
-  • FUSED (SF retries, `track_osc=False`): one kernel launch (bp_nms_fused) decodes
-    a whole retry batch in shared memory with per-sample early termination. The SF
-    retries re-run BP many times and never need oscillation counts, so they take the
-    fast single-launch path whenever the working set fits shared memory. Disable with
-    `force_per_step: true` (also forces the modular kernels for retries).
-
-At float64 the BP core is numerically identical to bp_norm_min_sum_cuda's (which is
-validated bit-for-bit against the PyTorch reference), so bp_sf_cuda reproduces bp_sf's
-per-sample decoding outcomes. The SF logic itself is inherited verbatim.
-
-BP-SF uses no rebatch_speedup cap (the SF retry replaces the deferred-tail mechanism), so
-— unlike the other *_cuda ports — this decoder builds no adaptive cap.
-
-YAML algorithm key: bp_sf  (with device.device_type: cuda → this file is dispatched)
-"""
-
 import math
 
 import torch
@@ -65,7 +28,6 @@ class create(_BpSfPy):
 
         self._ext = _load_ext()
 
-        # ── kernel scaffolding (mirrors bp_norm_min_sum_cuda.__init__) ──────────
         self.N = self.H_shape[1]
         self.N_ext = self.N + 1
         # V_c_col as int64 on device — every kernel indexes it as the check→var map.
@@ -80,7 +42,6 @@ class create(_BpSfPy):
             torch.from_numpy(adj_k).to(self.device), requires_grad=False
         )
 
-        # ── fused-kernel block size + availability (used by the SF retries) ─────
         M_val, D = self.V_c_col.shape
         min_threads = M_val * D
         self._block_size = min(max(32 * math.ceil(min_threads / 32), 64), 512)

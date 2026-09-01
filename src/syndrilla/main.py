@@ -176,8 +176,7 @@ def main():
         if args.train_checkpoint is not None and yaml_ckpt:
             raise ValueError(
                 f"-tckpt <{args.train_checkpoint}> and the decoder yaml's "
-                f"`config.checkpoint` <{yaml_ckpt}> both supply weights. "
-                f"Resuming reads them from -tckpt; remove the yaml key."
+                f"`config.checkpoint` <{yaml_ckpt}> both supply weights; drop the yaml key."
             )
 
     if args.interface_yaml is not None:
@@ -209,7 +208,7 @@ def main():
         decoders = interface.decoders
 
         if args.train:
-            loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
+            loss = create_loss(args.loss_yaml, decoder=decoders[-1])
     else:
         logger.success(
             "\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
@@ -229,13 +228,12 @@ def main():
         syndrome_generator = create_syndrome(args.syndrome_yaml, training=args.train)
 
         if args.train:
-            loss_fn = create_loss(args.loss_yaml, decoder=decoders[-1])
+            loss = create_loss(args.loss_yaml, decoder=decoders[-1])
 
         logger.success(
             "\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
         )
-        # training never checks logical errors: it reads its loss straight off the
-        # decoder output, so the checker is never built
+        # training never checks logical errors: it reads its loss straight off the decoder output, so the checker is never built
         logical_check = None if args.train else create_check(args.logical_yaml)
 
     error_model.rounds = getattr(syndrome_generator, "rounds", 1)
@@ -289,7 +287,7 @@ def main():
             args.checkpoint_yaml,
             decoder_device,
             error_model,
-            loss_fn,
+            loss,
             H_file_name,
         )
     else:
@@ -374,8 +372,8 @@ def main():
                 io_dict = decoders[decoder_idx](io_dict)
 
                 if args.train and decoder_idx == num_decoders - 1:
-                    terms = loss_fn.terms(io_dict, err)
-                    total = loss_fn.combine(*terms)
+                    terms = loss.terms(io_dict, err)
+                    total = loss.combine(*terms)
                     if decoders[decoder_idx].training:
                         total.backward()
                         decoders[decoder_idx].optimizer.step()
@@ -383,7 +381,7 @@ def main():
                     metrics.train_update_metric(
                         num_batches,
                         (total, *terms),
-                        loss_fn.class_error(io_dict, err),
+                        loss.class_error(io_dict, err),
                     )
                     break
                 elapsed = time.time() - start_time

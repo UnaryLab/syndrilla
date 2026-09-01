@@ -16,8 +16,7 @@ def _require_number(value, key):
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(
             f"saq requires a numeric <{key}> in the decoder config, got <{value!r}>. "
-            f"Write exponent floats as 5.0e-4, not 5e-4: yaml reads the short form "
-            f"as a string."
+            f"Write exponent floats as 5.0e-4, not 5e-4: yaml reads 5e-4 as a string."
         )
     return float(value)
 
@@ -60,9 +59,8 @@ def _right_inverse(H_hat):
     rows, cols = np.shape(H_hat)
     if pivots.size != rows:
         raise ValueError(
-            f"CPND needs [H; L] to have full row rank, but its rank is "
-            f"<{pivots.size}> over <{rows}> rows. The logical operators must be "
-            f"independent of the stabilizer rows."
+            f"CPND needs [H; L] to have full row rank, but its rank is <{pivots.size}> "
+            f"over <{rows}> rows; the logical operators must be independent."
         )
     B = np.zeros((cols, rows), dtype=np.uint8)
     B[pivots] = t
@@ -258,8 +256,7 @@ class create(nn.Module):
             if legacy in decoder_cfg:
                 raise ValueError(
                     f"Decoder <saq>: <{legacy}> moved to the loss yaml as "
-                    f"<{legacy.replace('lambda_loss_', 'lambda_')}>. Remove it from the "
-                    f"decoder yaml and pass the loss yaml with -ls."
+                    f"<{legacy.replace('lambda_loss_', 'lambda_')}>; pass it with -ls."
                 )
 
         cpnd_cfg = decoder_cfg.get("cpnd", {})
@@ -425,8 +422,7 @@ class create(nn.Module):
         if path is None:
             logger.warning(
                 "saq has no `checkpoint`; weights are randomly initialized. That is "
-                "expected when training; to decode, train the model first and point "
-                "`checkpoint` at the resulting state_dict."
+                "expected when training; to decode, train the model first."
             )
             return
         state = torch.load(path, map_location=self.device, weights_only=True)
@@ -435,9 +431,8 @@ class create(nn.Module):
         missing, unexpected = self.load_state_dict(state, strict=False)
         if missing:
             raise ValueError(
-                f"saq checkpoint <{path}> has no weights for <{missing}>. It was saved "
-                f"from a different architecture; retrain, or point `checkpoint` at a "
-                f"checkpoint matching this decoder yaml."
+                f"saq checkpoint <{path}> has no weights for <{missing}>. Retrain, or "
+                f"point `checkpoint` at a checkpoint matching this decoder yaml."
             )
         if unexpected:
             logger.warning(f"saq checkpoint <{path}>: unexpected keys <{unexpected}>.")
@@ -614,10 +609,8 @@ class create(nn.Module):
         missing = [key for key in self.TRAIN_STATE_KEYS if key not in state]
         if missing:
             raise ValueError(
-                f"saq training checkpoint is missing <{', '.join(missing)}>. It was "
-                f"written by an older version that saved weights only; that file can "
-                f"still be decoded from via the decoder yaml's `checkpoint` key, but a "
-                f"run cannot be resumed from it."
+                f"saq training checkpoint is missing <{', '.join(missing)}>. It saved "
+                f"weights only: it can be decoded from, but a run cannot be resumed."
             )
         self.load_state_dict(state["state_dict"])
         self.optimizer.load_state_dict(state["optimizer"])

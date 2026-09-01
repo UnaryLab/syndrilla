@@ -1,51 +1,3 @@
-/*
- * bp_kernel.cu — shared CUDA kernels for the BP decoders.
- *
- * Lives in decoder/ (not under any one decoder) because every CUDA decoder reuses
- * it: bp_norm_min_sum_cuda plus the lottery / quant / relay / branch *_cuda ports.
- *
- * Two execution paths share this file:
- *
- *  A. FUSED PATH (default, fastest) — k_bp_nms_fused runs the entire decoding
- *     loop for one batch sample inside a single thread block, with all working
- *     state in shared memory and per-block early termination. One kernel launch
- *     decodes the whole batch.
- *
- *  B. PER-STEP PATH (debug / fallback) — seven modular kernels, one per logical
- *     step of the decoding pipeline, driven by a Python loop:
- *
- *      1. k_init_messages      — first-iteration gather: a_v2c ← u_init[V_c_col]
- *      2. k_vn_update          — variable-node update:   a_v2c ← l_v[V_c_col] − b_c2v
- *      3. k_cn_update          — check-node update:      b_c2v ← β · sign_out · 2-min
- *      4. k_llr_update         — LLR accumulation:       l_v   ← u_init + Σ b_c2v
- *      5. k_hard_decision      — threshold:              e_v   ← (l_v ≤ 0)
- *      6. k_syndrome_est       — parity check:           s_est ← (Σ e_v[V_c_col]) mod 2
- *      7. k_convergence_update — per-sample convergence snapshot
- *
- * Tensor layout conventions
- * ─────────────────────────
- *   B   = batch size
- *   M   = number of check nodes (rows of H)
- *   N   = number of variable nodes (cols of H, excluding dummy)
- *   N_ext = N + 1  (the "+1" is the dummy column used to pad irregular H rows)
- *   D   = maximum check-node degree (columns in the padded V_c_col / V_c_row tables)
- *   VD  = maximum variable-node degree (columns in the precomputed VN_adj tables)
- *
- *   V_c_col[c, k]  — column (variable) index of the k-th edge of check node c.
- *                    Padding entries store the value N (the dummy variable index).
- *   VN_adj_c[n,vd] — check-node index of the vd-th edge of variable n. -1 = pad.
- *   VN_adj_k[n,vd] — degree slot k of that same edge, for indexing into b_c2v.
- *
- * Precision note
- * ──────────────
- *   All arithmetic is performed in scalar_t (the tensor dtype). Earlier
- *   revisions tracked the two minima in `double`, which forced fp64
- *   instructions into the float32 path — on consumer GPUs (fp64 at 1/32–1/64
- *   throughput) that single detail made the float32 kernels as slow as the
- *   float64 ones. Keeping everything in scalar_t also matches the PyTorch
- *   reference bit-for-bit, which compares/sorts in the tensor dtype.
- */
-
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>   // at::cuda::getCurrentCUDAStream()
 #include <cuda.h>
@@ -53,8 +5,6 @@
 #include <math.h>
 
 #define THREADS 256
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
 
 static inline int grid1d(int n) {
     return (n + THREADS - 1) / THREADS;
@@ -67,17 +17,6 @@ static inline int grid1d(int n) {
     TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor");            \
     TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 1 — init_messages
-//
-// On the first iteration only. Gathers the initial channel LLR (u_init) into
-// the edge message buffer.
-//
-//   a_v2c[b, c, k] = u_init[b, V_c_col[c, k]]   if V_c_col[c,k] < N  (real edge)
-//                  = 0                            if V_c_col[c,k] == N (dummy edge)
-//
-// Thread assignment: one thread per (b, c, k) edge — flat index over B·M·D.
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_init_messages(
     const scalar_t* __restrict__ u_init,   // [B, N_ext]
@@ -99,17 +38,6 @@ __global__ void k_init_messages(
         (n < N) ? u_init[b * N_ext + n] : (scalar_t)0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 2 — vn_update
-//
-// Iterations 2, 3, …  Computes the extrinsic VN→CN message by subtracting
-// the previous incoming CN→VN message from the updated LLR.
-//
-//   a_v2c[b, c, k] = l_v[b, V_c_col[c,k]] − b_c2v[b, c, k]   (real edge)
-//                  = 0                                          (dummy edge)
-//
-// Thread assignment: one thread per (b, c, k).
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_vn_update(
     const scalar_t* __restrict__ l_v,      // [B, N_ext]  — updated LLR
@@ -135,26 +63,6 @@ __global__ void k_vn_update(
         l_v[b * N_ext + n] - b_c2v[b * M * D + c * D + k];
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 3 — cn_update
-//
-// Normalized Min-Sum check-node update. One thread per (b, c) pair.
-// Two sequential passes over the D edges of check node c:
-//
-//   Pass 1 — accumulate sign product and track the two smallest |a_v2c| values.
-//   Pass 2 — write outgoing message for each edge:
-//               b_c2v[b,c,k] = β · (s_neg[b,c] · sign_prod · sign(a[k])) · min_result[k]
-//
-//   where:
-//     sign_prod   = product of sign(a[b,c,j]) for all real j
-//     s_neg[b,c]  = +1 if syndrome[b,c]==0, else −1
-//     sign(a)·sign_prod·sign(a) = sign_prod/sign(a) = product excluding k's own sign
-//     min_result  = second-smallest |a| if |a[k]|==smallest, else smallest
-//
-//   β = 1 − 2^{−iter}  (schedule-based normalization, passed from Python)
-//
-// Thread assignment: one thread per (b, c) — flat index over B·M.
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_cn_update(
     const scalar_t* __restrict__ a_v2c,           // [B, M, D]
@@ -171,7 +79,6 @@ __global__ void k_cn_update(
     int b    = idx / M;
     int base = b * M * D + c * D;
 
-    // ── Pass 1: sign product + 2-minimum over real edges ─────────────────────
     // Minima are tracked in scalar_t, NOT double — see precision note above.
     scalar_t sign_prod = (scalar_t)1;
     scalar_t min0      = (scalar_t)INFINITY;   // smallest |a|
@@ -193,7 +100,6 @@ __global__ void k_cn_update(
     scalar_t s_neg       = syndrome_neg_bc[b * M + c];
     scalar_t scaled_beta = (scalar_t)beta;
 
-    // ── Pass 2: write normalized min-sum messages ─────────────────────────────
     for (int k = 0; k < D; k++) {
         int n = (int)V_c_col[c * D + k];
         if (n >= N) { b_c2v[base + k] = (scalar_t)0; continue; }
@@ -212,20 +118,6 @@ __global__ void k_cn_update(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 4 — llr_update
-//
-// Accumulates CN→VN messages into the per-variable LLR estimate.
-//
-//   l_v[b, n] = u_init[b, n]  +  Σ_{vd} b_c2v[b, VN_adj_c[n,vd], VN_adj_k[n,vd]]
-//
-// VN_adj_c and VN_adj_k are the precomputed transpose of V_c_col: for each
-// variable node n, they list the (check index c, degree slot k) pairs of all
-// edges incident on n. Entries with VN_adj_c[n,vd] == -1 are padding (no more
-// edges for that variable).
-//
-// Thread assignment: one thread per (b, n) — flat index over B·N_ext.
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_llr_update(
     const scalar_t* __restrict__ u_init,    // [B, N_ext]
@@ -257,14 +149,6 @@ __global__ void k_llr_update(
     l_v[b * N_ext + n] = acc;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 5 — hard_decision
-//
-//   e_v[b, n] = 1  if l_v[b, n] <= 0
-//             = 0  otherwise
-//
-// Thread assignment: one thread per element — flat index over B·N_ext.
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_hard_decision(
     const scalar_t* __restrict__ l_v,  // [B, N_ext]
@@ -276,15 +160,6 @@ __global__ void k_hard_decision(
     e_v[idx] = (l_v[idx] <= (scalar_t)0) ? (scalar_t)1 : (scalar_t)0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 6 — syndrome_est
-//
-// Computes the estimated syndrome by XOR-ing hard decisions over check edges.
-//
-//   s_est[b, c] = ( Σ_k e_v[b, V_c_col[c,k]] ) mod 2
-//
-// Thread assignment: one thread per (b, c) — flat index over B·M.
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_syndrome_est(
     const scalar_t* __restrict__ e_v,      // [B, N_ext]
@@ -308,20 +183,6 @@ __global__ void k_syndrome_est(
     s_est[b * M + c] = (scalar_t)parity;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 7 — convergence_update
-//
-// For each batch sample b that has not yet converged (num_iters[b] == -1):
-//   — Check whether s_est[b, c] == syndrome[b, c] for ALL check nodes c.
-//   — If so: record num_iters[b] = iter, mark converges[b] = 1, and snapshot
-//     e_v[b] → e_out[b], l_v[b] → l_out[b].
-//
-// Because the copy of N_ext scalars is done inside the thread, this kernel is
-// efficient for small N_ext (typical QEC codes) and avoids a separate scatter
-// kernel plus host-side bookkeeping.
-//
-// Thread assignment: one thread per b — flat index over B.
-// ═══════════════════════════════════════════════════════════════════════════════
 template <typename scalar_t>
 __global__ void k_convergence_update(
     const scalar_t* __restrict__ s_est,     // [B, M]
@@ -354,41 +215,6 @@ __global__ void k_convergence_update(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Kernel 8 — k_bp_nms_fused
-//
-// Runs the ENTIRE BP Normalized Min-Sum decoding loop for one batch sample
-// inside one thread block. Eliminates the three overheads that dominate the
-// per-step path:
-//   1. Python-level iteration loop      (O(max_iter) Python frames)
-//   2. Per-iteration GPU→CPU syncs      (early-termination .item() checks)
-//   3. Per-step kernel-launch latency   (7 launches × max_iter)
-//
-// Design
-// ──────
-//  • One block per sample (grid.x = B); stride-loops cover M·D edges,
-//    N_ext variables, and M checks regardless of block size.
-//  • ALL state lives in shared memory: the int64 adjacency tables are copied
-//    once per block as int32 (halving on-chip footprint), the channel LLR
-//    u_init is staged once, and the message/LLR buffers never touch global
-//    memory inside the loop.
-//  • The CN update is split into two phases so it parallelises over edges,
-//    not just checks: phase A computes per-check sign products and the two
-//    minima (M threads), phase B writes all M·D outgoing messages.
-//  • Early termination: after each iteration the block computes the syndrome
-//    of the current hard decision in shared memory and AND-reduces a match
-//    flag. All threads see the same flag after __syncthreads(), so the break
-//    is uniform and race-free. Converged samples exit immediately — the block
-//    retires and frees the SM for the remaining samples.
-//  • num_iters / converges are written by thread 0 at the end, giving the
-//    exact same per-sample semantics as the PyTorch reference.
-//
-// Shared-memory layout (int32 region first, padded to 16 B, then scalar_t):
-//   int32 : V_c_col[M·D] | VN_adj_c[N_ext·VD] | VN_adj_k[N_ext·VD] | synd[M] | flag[1]
-//   scalar: a_v2c[M·D] | b_c2v[M·D] | l_v[N_ext] | e_v[N_ext] | u_init[N_ext]
-//           | s_neg[M] | sign_prod[M] | min0[M] | min1[M]
-// ═══════════════════════════════════════════════════════════════════════════════
-
 // Shared-memory size of the int32 region, padded so the scalar_t region that
 // follows is 16-byte aligned. Must match the host-side computation exactly.
 __host__ __device__ static inline size_t fused_int_bytes(int E, int A, int M) {
@@ -416,7 +242,6 @@ __global__ void k_bp_nms_fused(
     const int E   = M * D;        // padded edge count
     const int A   = N_ext * VD;   // padded var-adjacency count
 
-    // ── Shared-memory carve-up (must mirror fused_int_bytes) ─────────────────
     extern __shared__ char _smem[];
     int32_t* vcol_s = (int32_t*)_smem;          // [E]
     int32_t* adjc_s = vcol_s + E;               // [A]
@@ -434,7 +259,6 @@ __global__ void k_bp_nms_fused(
     scalar_t* mn0_s  = sp_s   + M;              // per-check smallest |a|
     scalar_t* mn1_s  = mn0_s  + M;              // per-check 2nd smallest |a|
 
-    // ── Stage adjacency (as int32), syndrome and channel LLR into shared ─────
     const int bM  = b * M;
     const int bNe = b * N_ext;
     for (int i = tid; i < E; i += bsz) vcol_s[i] = (int32_t)V_c_col[i];
@@ -450,7 +274,6 @@ __global__ void k_bp_nms_fused(
     for (int n = tid; n < N_ext; n += bsz) u_s[n] = u_init_g[bNe + n];
     __syncthreads();
 
-    // ── Decoding loop with per-block early termination ───────────────────────
     int conv_iter = 0;   // 0 = not converged; else the convergence iteration
     int stop_iter = max_iter;  // iterations this block actually ran (cap may stop it early)
     for (int iter = 1; iter <= max_iter; iter++) {
@@ -554,7 +377,6 @@ __global__ void k_bp_nms_fused(
         }
     }
 
-    // ── Write results to global memory ────────────────────────────────────────
     for (int n = tid; n < N_ext; n += bsz) {
         e_out_g[bNe + n] = e_v[n];
         l_out_g[bNe + n] = l_v[n];
@@ -564,12 +386,6 @@ __global__ void k_bp_nms_fused(
         converges_g[b] = (conv_iter > 0) ? 1 : 0;
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Host dispatch functions — called from Python via pybind11
-// Each function is a thin wrapper that performs type dispatch and launches the
-// appropriate kernel template instance.
-// ═══════════════════════════════════════════════════════════════════════════════
 
 void init_messages_cuda(
     torch::Tensor u_init,   // [B, N_ext]
@@ -756,8 +572,6 @@ void convergence_update_cuda(
     });
 }
 
-// ── Fused-kernel dispatch ─────────────────────────────────────────────────────
-
 // Full BP-NMS decode in one fused kernel. The capped and uncapped paths are the SAME
 // kernel (k_bp_nms_fused), so this is ONE entry point: pass conv_count (a pre-zeroed
 // int32 [1] device tensor) + stop_count to activate the iter_speedup cap — each block
@@ -848,9 +662,6 @@ int64_t fused_smem_limit() {
     return (int64_t)v;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// pybind11 module registration
-// ═══════════════════════════════════════════════════════════════════════════════
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("init_messages",
           &init_messages_cuda,

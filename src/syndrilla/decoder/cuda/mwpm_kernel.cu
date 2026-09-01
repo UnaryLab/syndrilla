@@ -1,37 +1,3 @@
-// mwpm_kernel.cu -- bit-exact CUDA port of the native sparse-blossom MWPM decoder in mwpm.py.
-//
-// GOAL: produce, for every syndrome shot, the SAME correction bits as
-// decoder/mwpm/mwpm.py (which is itself a bit-exact transcription of PyMatching v2).
-// This is NOT an independent optimal blossom -- it faithfully reproduces mwpm.py's
-// deterministic event ordering (radix-heap LIFO-within-bucket, QueuedEventTracker,
-// boundary-first-then-column-sorted neighbor order, tie-breaks), so e-diff == 0.
-//
-// PARALLELISM: one CUDA thread decodes one shot. The
-// blossom is inherently sequential per shot; the batch is the parallel axis.
-//
-// STRUCTURE: mirrors mwpm.py 1:1. Python objects/pointers become fixed-capacity
-// per-thread SoA arenas indexed by int32 handles (-1 == None/SIZE_MAX). Python lists
-// become arrays+counts or intrusive linked lists. Python recursion becomes explicit
-// stacks. Cross-references to mwpm.py line ranges are given at each block.
-//
-// SCOPE: the flood + matching runs on the GPU for all N <= 64*OBSW (OBSW=4 -> N<=256,
-// covering surface d<=11); above that the host falls back to the CPU decoder and this kernel
-// sets err=2. CORRECTION EXTRACTION mirrors mwpm.py's own branch on N (mwpm.py:1642):
-//   * N <= 64  -- the flood-accumulated obs_mask IS the correction (out_mask). Fast, exact.
-//   * N  > 64  -- the obs_mask picks a DIFFERENT (equal-weight) degenerate representative than
-//                 PyMatching, so mwpm.py instead reconstructs each matched pair's explicit
-//                 shortest qubit path with the SearchFlooder. To stay bit-exact there, this
-//                 kernel emits the same MATCH EDGES (out_mef/out_met: loc_from/loc_to detector
-//                 node ids, -1 = boundary) at the identical base cases, and the host runs
-//                 mwpm.py's SearchFlooder over them (mwpm_cuda._corr_from_match_edges). Both
-//                 outputs are always produced; the host selects by N. The observable payload
-//                 is opaque (XOR-only), so OBSW just widens the word count -- no algorithm
-//                 change to the matching.
-//
-// STATUS: authored without a local GPU; validate on hardware with tests/test_mwpm_cuda*
-// (assert e-diff == 0 vs mwpm.py). Capacity constants below are generous but bounded by
-// M; on overflow a thread sets err (see ERR_*) instead of corrupting memory.
-
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
@@ -42,7 +8,6 @@ namespace py = pybind11;
 #define THREADS 128
 static inline int grid1d(int64_t n) { return (int)((n + THREADS - 1) / THREADS); }
 
-// ------------------------------------------------------------------ constants
 #define SIZE_MAX32 (-1)
 #define INF64 ((int64_t)1 << 62)
 #define WEIGHT 2            // uniform edge weight W (mwpm.py: W = 2)
@@ -66,14 +31,6 @@ static inline int grid1d(int64_t n) { return (int)((n + THREADS - 1) / THREADS);
                           // hang from a latent structural bug; the host redoes the shot on
                           // the exact CPU blossom (bit-exact), so results stay correct.
 
-// ---------------------------------------------------------- observable mask
-// The observable/correction payload is OPAQUE to the matcher: everywhere below it is only
-// zero-initialized, XOR-combined (^ / ^=), copied, or written to the output. It NEVER feeds
-// a branch, comparison, weight, ordering, or tie-break. So widening it from a single uint64
-// to OBSW 64-bit words lifts the old N<=64 cap WITHOUT changing any algorithm logic -- every
-// expression body in this file is byte-for-byte unchanged; only the *type* changes.
-// OBSW words -> supports N (qubits == H columns) up to 64*OBSW. 4 -> 256 (surface d<=11).
-// MUST match _OBSW in decoder/mwpm/mwpm_cuda.py (the CSR obs packer + output expander).
 #ifndef OBSW
 #define OBSW 4
 #endif
@@ -98,10 +55,6 @@ __device__ __forceinline__ Obs& operator^=(Obs& a, const Obs& b) {
     return a;
 }
 
-// ============================================================================
-// Per-thread arena. All pointers below are ALREADY offset to thread b's slice,
-// so field access is e.g. S.nd_region[i]. Capacities are passed in.
-// ============================================================================
 struct St {
     // --- static graph (shared, NOT per-thread) ---
     const int* g_off;     // [M+1] CSR offsets into g_nbr/g_obs
@@ -185,20 +138,10 @@ __device__ __forceinline__ void set_err(St& S, int code) {
     if (ERRF == ERR_OK) ERRF = code;
 }
 
-// ============================================================================
-// std::bit_width (mwpm.py RadixHeapQueue.cur_bit_bucket_for, line 71-72)
-// bit_width(x) = number of bits, bit_width(0)=0. x = time ^ cur_time >= 0.
-// ============================================================================
 __device__ __forceinline__ int bit_width(uint64_t x) {
     return x == 0 ? 0 : (64 - __clzll((unsigned long long)x));
 }
 
-// ============================================================================
-// Radix-heap queue (mwpm.py RadixHeapQueue, lines 59-106).
-// Buckets are doubly linked lists preserving Python list semantics:
-//   enqueue = append at tail; dequeue pop = remove tail (back()); redistribution
-//   iterates head->tail and appends to targets. cur_bit_bucket_for uses cur_time.
-// ============================================================================
 __device__ __forceinline__ int q_alloc_slot(St& S) {
     int s = QFREE;
     if (s < 0) { set_err(S, ERR_OVERFLOW); return -1; }
@@ -265,9 +208,6 @@ __device__ __forceinline__ int q_dequeue(St& S) {
     return s;
 }
 
-// ============================================================================
-// QueuedEventTracker (mwpm.py lines 112-149). Generic over the 4 tracker fields.
-// ============================================================================
 __device__ __forceinline__ void trk_set_desired(
         St& S, int64_t* td, int64_t* tq, uint8_t* thd, uint8_t* thq,
         int64_t time, int kind, int target) {
@@ -300,10 +240,6 @@ __device__ __forceinline__ bool trk_dequeue_decision(
 #define NODE_TRK(i) &S.nd_td[i], &S.nd_tq[i], &S.nd_thd[i], &S.nd_thq[i]
 #define RG_STRK(r)  &S.rg_std[r], &S.rg_stq[r], &S.rg_sthd[r], &S.rg_sthq[r]
 
-// ============================================================================
-// Varying: distance(t) = slope*t + yint, slope in {-1,0,+1} (mwpm.py 443-489).
-// Stored per region as (rg_slope, rg_yint). Helpers are pure functions.
-// ============================================================================
 __device__ __forceinline__ int64_t vary_at(int slope, int64_t yint, int64_t t) {
     return (int64_t)slope * t + yint;
 }
@@ -318,9 +254,6 @@ __device__ __forceinline__ void vary_then_shrinking(int* slope, int64_t* yint, i
     int64_t d = vary_at(*slope, *yint, t); *slope = -1; *yint = d + t;
 }
 
-// local_radius of a detector node (mwpm.py DetectorNode.local_radius, 567-572):
-// top = region_that_arrived_top; if None -> ZERO_FROZEN (slope 0, yint 0);
-// else region.radius.plus_const(wrapped_radius_cached).
 __device__ __forceinline__ void node_local_radius(
         St& S, int i, int* slope, int64_t* yint) {
     int top = S.nd_region_top[i];
@@ -328,9 +261,6 @@ __device__ __forceinline__ void node_local_radius(
     else { *slope = S.rg_slope[top]; *yint = S.rg_yint[top] + S.nd_wrapped[i]; }
 }
 
-// ============================================================================
-// Region pool / alt pool allocation (bump; no reuse -- see file header).
-// ============================================================================
 __device__ __forceinline__ int new_region(St& S) {
     int r = REGN++;
     if (r >= S.REGCAP) { set_err(S, ERR_OVERFLOW); return 0; }
@@ -385,12 +315,6 @@ __device__ __forceinline__ void alt_erase_child(St& S, int parent, int child) {
     S.at_nchild[parent] = n;
 }
 
-// ============================================================================
-// Intrusive shell-area stack (mwpm.py GraphFillRegion.shell_area list).
-// A node belongs to exactly one region's shell at a time. append pushes to head
-// (most-recent); pop removes head; iterate head->... == reversed(shell_area), which
-// is exactly what do_op_for_each_node_in_total_area wants (sa[len-1-i]).
-// ============================================================================
 __device__ __forceinline__ void shell_push(St& S, int r, int node) {
     S.nd_shell_next[node] = S.rg_shell_head[r];
     S.rg_shell_head[r] = node;
@@ -404,9 +328,6 @@ __device__ __forceinline__ int shell_pop(St& S, int r) {
     return node;
 }
 
-// ============================================================================
-// node reset (mwpm.py DetectorNode.reset, 601-608)
-// ============================================================================
 __device__ __forceinline__ void node_reset(St& S, int i) {
     S.nd_obs[i] = 0; S.nd_reached[i] = -1; S.nd_arrival[i] = 0;
     S.nd_region[i] = -1; S.nd_region_top[i] = -1; S.nd_wrapped[i] = 0;
@@ -441,10 +362,6 @@ __device__ __forceinline__ int index_of_neighbor(St& S, int node, int target) {
     return SIZE_MAX32;   // mwpm.py raises; caller never expects miss
 }
 
-// ============================================================================
-// GraphFlooder region-growth primitives (mwpm.py GraphFlooder, 823-1080).
-// Forward declarations for the de-recursed "op over total area" helpers.
-// ============================================================================
 __device__ void reschedule_events_at_detector_node(St& S, int node);
 
 // do_region_created_at_empty_detector_node (mwpm.py 830-837)
@@ -587,11 +504,6 @@ struct MwpmEvt {
 };
 
 __device__ void do_region_shrinking(St& S, int region, MwpmEvt* ev);
-
-// ============================================================================
-// The full flooder / matcher live below; because of heavy mutual recursion we
-// forward declare the Mwpm-level handlers and implement everything after St setup.
-// ============================================================================
 
 // set_region_growing / frozen / shrinking (mwpm.py 1026-1047)
 __device__ void set_region_growing(St& S, int region) {
@@ -738,9 +650,6 @@ __device__ int create_blossom(St& S, int bc_start, int bc_count) {
     return blossom;
 }
 
-// ============================================================================
-// GraphFlooder main loop (mwpm.py 1009-1080)
-// ============================================================================
 __device__ void process_tentative_event(St& S, int kind, int target, MwpmEvt* ev) {
     if (kind == LOOK_AT_NODE) { do_look_at_node_event(S, target, ev); return; }
     if (kind == LOOK_AT_SHRINKING_REGION) { do_region_shrinking(S, target, ev); return; }
@@ -769,10 +678,6 @@ __device__ void run_until_next_notification(St& S, MwpmEvt* ev) {
         if (ev->etype != NO_EVENT) return;
     }
 }
-
-// ============================================================================
-// AltTreeNode operations (become_root, MRCA, prune) -- mwpm.py 730-817
-// ============================================================================
 
 // most_recent_common_ancestor (mwpm.py 745-777). Returns alt id or -1.
 __device__ int alt_mrca(St& S, int a, int b) {
@@ -815,21 +720,6 @@ __device__ void alt_become_root(St& S, int self) {
     int sp = 0;
     int cur = self;
     while (cur >= 0) { S.stk[sp++] = cur; if (sp >= S.STKCAP) { set_err(S, ERR_OVERFLOW); return; } cur = S.at_par[cur]; }
-    // Python: become_root() recurses parent first, THEN rewires. Equivalent to
-    // processing nodes from root's child down to self. For node X with old parent P
-    // (=path[i+1]): P.become_root already done; then:
-    //   P.inner_region = X.inner_region; P.inner_to_outer_edge = X.parent.edge
-    //   X.inner_region = None
-    //   erase X from P.children
-    //   X.parent = empty
-    //   X.add_child(AltTreeEdge(P, X.inner_to_outer_edge.reversed()))
-    //   X.inner_to_outer_edge = empty
-    // We must iterate X from the deepest recursion return upward == path[len-2]..path[0]?
-    // Python recursion: self.become_root() calls parent.become_root() first, so the
-    // parent is fully rooted before self's body runs; self's body runs LAST. The body
-    // uses self and old_parent=self.parent (pre-mutation). Since each node's body only
-    // touches itself and its (original) parent, and parents are processed before
-    // children, we run bodies in order root-child ... self  == path[len-2] down to 0.
     for (int i = sp - 2; i >= 0; i--) {
         int X = S.stk[i];
         int P = S.stk[i + 1];             // X's original parent (== path[i+1])
@@ -901,10 +791,6 @@ __device__ void alt_prune_upward(St& S, int self, int prune_parent, bool back,
     }
     *n_orphan = no; *n_pruned = np;
 }
-
-// ============================================================================
-// Mwpm matcher (mwpm.py 1101-1315)
-// ============================================================================
 
 // create_detection_event (mwpm.py 1107-1112)
 __device__ void create_detection_event(St& S, int node) {
@@ -1149,11 +1035,6 @@ __device__ void process_event(St& S, MwpmEvt* ev) {
     else if (ev->etype == BLOSSOM_SHATTER) handle_blossom_shattering(S, ev);
 }
 
-// ============================================================================
-// Extraction, obs_mask path (mwpm.py 1318-1360). Recursive; linearized with an
-// explicit work stack that accumulates obs_mask (XOR) and weight (sum).
-// ============================================================================
-
 // cleanup_shell_area (mwpm.py 640-642): reset each node in region's shell.
 __device__ void cleanup_shell_area(St& S, int region) {
     int node = S.rg_shell_head[region];
@@ -1175,32 +1056,6 @@ __device__ void clear_bparent_ignore_wrapped(St& S, int region) {
     }
 }
 
-// pair_and_shatter_extract_matches (mwpm.py 1318-1337). Modifies region matches, adds
-// the odd-cycle pair matches, recursively extracting each; returns the `subblossom`
-// region to continue with. Accumulates into *mask,*weight.
-// Because shatter_blossom_and_extract_matches is recursive and calls this, we implement
-// the whole extraction as one iterative routine using an explicit region work stack.
-//
-// We follow mwpm.py's control flow precisely (1339-1360):
-//   shatter(region):
-//     region.cleanup_shell_area()
-//     if region.match.region is not None:
-//         region.match.region.cleanup_shell_area()
-//         if not region.blossom_children and not match.region.blossom_children:
-//             return MatchingResult(match.edge.obs, region.rad.yint + match.region.rad.yint)
-//     elif not region.blossom_children:
-//         return MatchingResult(match.edge.obs, region.rad.yint)
-//     res = 0
-//     if region.blossom_children: region = pair_and_shatter(region, res)   # may recurse
-//     if region.match.region and region.match.region.blossom_children:
-//         pair_and_shatter(region.match.region, res)                        # may recurse
-//     res += shatter(region)
-//     return res
-//
-// We implement recursion with an explicit stack of "frames". Each frame tracks the
-// region and which sub-calls remain. Sub-calls generated by pair_and_shatter (the
-// odd-cycle pair matches) are pushed as independent shatter() tasks whose results XOR
-// into the shared accumulator.
 struct Frame { int region; int stage; int cont_region; int idx; int num; int index0; };
 
 // Record a match edge (loc_from node id, loc_to node id or -1 for boundary) at each base
@@ -1219,16 +1074,6 @@ __device__ __forceinline__ void me_push(St& S, int region, int* me_from, int* me
 
 __device__ void shatter_extract(St& S, int start_region, Obs* mask, int64_t* weight,
                                 int* me_from, int* me_to, int* me_n) {
-    // explicit recursion stack over shatter() invocations
-    // We push tasks; each task is a region to shatter whose result XORs into mask/weight.
-    // pair_and_shatter enumerates pairs and pushes their regions as tasks too.
-    // Use S.stk as a task stack of region ids (results all fold into the same mask/weight,
-    // which is valid because MatchingResult composition is XOR/sum and order-independent
-    // for the accumulator -- but the STRUCTURAL mutations must follow program order).
-    //
-    // Order matters for the mutations inside pair_and_shatter (add_match etc.). We must
-    // execute exactly as mwpm.py: process region fully (its pairing + its own tail
-    // shatter) before returning. We therefore do a manual recursion.
     int sp = 0;
     Frame* fr = (Frame*)S.stk;   // reuse stk memory as Frame array (sizeof(Frame)=24 -> need 6 ints)
     // Guard capacity: each Frame uses 6 ints.
@@ -1290,22 +1135,6 @@ __device__ void shatter_extract(St& S, int start_region, Obs* mask, int64_t* wei
                     f = &fr[ (sp-1) ]; (void)f;
                 }
                 newregion = subblossom;
-                // Re-fetch frame pointer (array may have grown); update the ORIGINAL frame.
-                // The original frame is at some index < sp; find it: it's the one with stage==1
-                // we were operating on. We stored pushes above it. Its index is (sp-1-#pushes).
-                // Simpler: we tracked it as the frame before pushes. Recompute by storing region.
-                // To keep correctness we locate it: it is the deepest stage==1 frame with region==region.
-                // Given single-threaded per-lane execution, easier approach: store cont in a side slot.
-                // We set f->region=newregion and f->stage=2 on the ORIGINAL frame:
-                // find original frame index:
-                // (Pushes were added at top; original is right below them.)
-                // Count pushes:
-                // -- handled by scanning: the original frame is the first stage==1 below top pushes.
-                // For robustness we mark via cont_region.
-                // Locate original: it's at index (sp-1) minus number_of_pushed. We know pushes = pairs.
-                // Recompute pairs count:
-                // (index arithmetic) -- see below fixups.
-                // We'll instead set a sentinel by searching downward for stage==1.
                 int oi = sp - 1;
                 while (oi >= 0 && !(fr[oi].stage == 1 && fr[oi].region == region)) oi--;
                 if (oi >= 0) { fr[oi].region = newregion; fr[oi].stage = 2; }
@@ -1339,11 +1168,6 @@ __device__ void shatter_extract(St& S, int start_region, Obs* mask, int64_t* wei
                     if (sp >= frame_cap) { set_err(S, ERR_OVERFLOW); return; }
                     fr[sp].region = reA; fr[sp].stage = 0; sp++;
                 }
-                // Note: pair_and_shatter returns subblossom but mwpm.py discards it here
-                // (region stays region2 for the final tail shatter). Actually mwpm.py:
-                //   self.pair_and_shatter_extract_matches(region.match.region, res)  (no reassign)
-                // then res += shatter(region)  -- region unchanged.
-                // Re-find original frame and set stage 3.
                 int oi = sp - 1;
                 while (oi >= 0 && !(fr[oi].stage == 2 && fr[oi].region == region2)) oi--;
                 if (oi >= 0) fr[oi].stage = 3;
@@ -1362,9 +1186,6 @@ __device__ void shatter_extract(St& S, int start_region, Obs* mask, int64_t* wei
     }
 }
 
-// ============================================================================
-// Kernel: one thread per shot.
-// ============================================================================
 __global__ void k_mwpm_decode(
         // static graph
         const int* g_off, const int* g_nbr, const Obs* g_obs, int M, int N,
@@ -1481,9 +1302,6 @@ __global__ void k_mwpm_decode(
     out_err[b] = ERRF;
 }
 
-// ============================================================================
-// Host launcher + pybind
-// ============================================================================
 std::vector<torch::Tensor> mwpm_decode_cuda(
         torch::Tensor g_off, torch::Tensor g_nbr, torch::Tensor g_obs,
         int64_t M, int64_t N, torch::Tensor synd) {

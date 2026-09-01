@@ -25,11 +25,6 @@ BEST_PT = f"{CKPT_STEM}_best.pt"
 LAST_PT = f"{CKPT_STEM}_last.pt"
 RESULT_YAML = f"{CKPT_STEM}_result.yaml"
 TRAIN_LOG = f"{CKPT_STEM}_train.log"
-# the result yaml's two phase blocks and the columns each carries: the objective and the
-# class error, which any trained decoder reports, each named for the phase it belongs to.
-# The split of the total into lc/lp/ent is the logical-centric loss's own, so it stays in
-# the epoch line and so in the train log. Keyed by the yaml's spelling, not the internal
-# `train`/`val` the in-memory history keeps
 TERMS = {
     "training": ("training loss", "training error"),
     "validation": ("validation loss", "validation error"),
@@ -234,16 +229,16 @@ def test_loss_terms_and_gradient_flow():
     e, synd, H = _random_shots(saq)
     out = decoder(_io_dict(saq, synd, H))
 
-    loss_fn = _make_loss(saq)
-    loss_lc, loss_lp, loss_ent = loss_fn.terms(out, e)
+    loss = _make_loss(saq)
+    loss_lc, loss_lp, loss_ent = loss.terms(out, e)
     for term in (loss_lc, loss_lp, loss_ent):
         assert torch.isfinite(term) and term.item() >= 0.0
 
-    total = loss_fn.combine(loss_lc, loss_lp, loss_ent)
+    total = loss.combine(loss_lc, loss_lp, loss_ent)
     expected = (
-        loss_fn.lambda_lc * loss_lc
-        + loss_fn.lambda_lp * loss_lp
-        + loss_fn.lambda_ent * loss_ent
+        loss.lambda_lc * loss_lc
+        + loss.lambda_lp * loss_lp
+        + loss.lambda_ent * loss_ent
     )
     assert torch.allclose(total, expected)
 
@@ -300,7 +295,7 @@ def test_entropy_loss_polarity(matrix_yaml):
     zeros = torch.zeros(
         e.size(0), saq.logical_classes, dtype=saq.dtype, device=saq.device
     )
-    loss_fn = _make_loss(saq)
+    loss = _make_loss(saq)
 
     def ent(pred):
         io = {
@@ -308,7 +303,7 @@ def test_entropy_loss_polarity(matrix_yaml):
             "logical_logits": zeros,
             "logical_prior": zeros,
         }
-        return loss_fn.terms(io, e)[2]
+        return loss.terms(io, e)[2]
 
     ent_right = ent(e)
     ent_wrong = ent(e_wrong)
@@ -323,7 +318,7 @@ def test_overfits_a_fixed_batch():
     """The decoder's own training stages must drive the loss down on a fixed batch."""
     decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
     saq.train()
-    loss_fn = _make_loss(saq)
+    loss = _make_loss(saq)
     e, synd, H = _random_shots(saq)
 
     saq.configure_optimizer(epochs=40)
@@ -333,16 +328,15 @@ def test_overfits_a_fixed_batch():
     losses = []
     for _ in range(40):
         out = decoder(_io_dict(saq, synd, H))
-        loss = loss_fn(out, e)
-        loss.backward()
+        total = loss(out, e)
+        total.backward()
         saq.optimizer.step()
         saq.optimizer.zero_grad(set_to_none=True)
-        losses.append(loss.item())
+        losses.append(total.item())
 
     assert losses[-1] < losses[0]
 
 
-# ── CPND (stage 4) ───────────────────────────────────────────────────
 CPND_CODES = [
     (SURFACE_MATRIX_YAML, 0),
     (TORIC_MATRIX_YAML, 1),
@@ -985,8 +979,6 @@ def test_train_cli_requires_the_loss_yaml(tmp_path):
     assert not (tmp_path / BEST_PT).exists()
 
 
-# ── loss module ──────────────────────────────────────────────────────
-
 
 def _make_loss(saq, **overrides):
     """Build the logical_centric loss bound to `saq`, from the shipped loss yaml."""
@@ -1001,9 +993,9 @@ def test_create_loss_reads_the_shipped_yaml():
     from syndrilla.loss import create_loss
 
     decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
-    loss_fn = create_loss(LOSS_YAML, decoder=saq)
+    loss = create_loss(LOSS_YAML, decoder=saq)
 
-    assert (loss_fn.lambda_lc, loss_fn.lambda_lp, loss_fn.lambda_ent) == (1.0, 0.2, 1.0)
+    assert (loss.lambda_lc, loss.lambda_lp, loss.lambda_ent) == (1.0, 0.2, 1.0)
 
     # the lambdas must actually be applied, not just stored: zeroing two of them must
     # leave exactly the third, doubled
@@ -1017,16 +1009,16 @@ def test_create_loss_reads_the_shipped_yaml():
 def test_loss_combine_matches_call_and_class_error_is_a_fraction():
     """`combine(*terms(...))` is what `__call__` returns, computed once instead of twice."""
     decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
-    loss_fn = _make_loss(saq)
+    loss = _make_loss(saq)
     e, synd, H = _random_shots(saq)
     out = decoder(_io_dict(saq, synd, H))
 
-    lc, lp, ent = loss_fn.terms(out, e)
+    lc, lp, ent = loss.terms(out, e)
     for term in (lc, lp, ent):
         assert torch.isfinite(term) and term.item() >= 0.0
-    assert torch.allclose(loss_fn.combine(lc, lp, ent), loss_fn(out, e))
+    assert torch.allclose(loss.combine(lc, lp, ent), loss(out, e))
 
-    err = loss_fn.class_error(out, e)
+    err = loss.class_error(out, e)
     assert isinstance(err, float) and 0.0 <= err <= 1.0
 
 
@@ -1036,15 +1028,6 @@ def test_decoder_rejects_the_old_lambda_keys():
         _make_decoder(SURFACE_MATRIX_YAML, lambda_loss_lc=1.0)
 
 
-# --------------------------------------------------------------------------- #
-# Resumable training
-#
-# Weights alone do not describe a run in progress: Adam's moments, the cosine
-# schedule's position, the epoch counter, the best-so-far score and the error-stream
-# RNG all decide what the next step does. These tests pin that `last.pt` carries
-# them and that reloading it continues the run rather than warm-starting a new one.
-# --------------------------------------------------------------------------- #
-
 
 def _training_setup(**overrides):
     """A decoder and its loss, both built from the shipped yamls."""
@@ -1052,11 +1035,11 @@ def _training_setup(**overrides):
     return decoder, saq, _make_loss(saq)
 
 
-def _train_step(decoder, saq, loss_fn, seed):
+def _train_step(decoder, saq, loss, seed):
     """One batch -> forward -> loss -> backward -> update, on a seeded batch."""
     e, synd, H = _random_shots(saq, batch_size=8, seed=seed)
     out = decoder(_io_dict(saq, synd, H))
-    loss_fn.combine(*loss_fn.terms(out, e)).backward()
+    loss.combine(*loss.terms(out, e)).backward()
     saq.optimizer.step()
     saq.optimizer.zero_grad(set_to_none=True)
 
@@ -1064,11 +1047,11 @@ def _train_step(decoder, saq, loss_fn, seed):
 def _fresh_run(epochs, seed=0):
     """A decoder seeded identically to every other `_fresh_run`, ready to train."""
     torch.manual_seed(seed)
-    decoder, saq, loss_fn = _training_setup()
+    decoder, saq, loss = _training_setup()
     saq.configure_optimizer(epochs)
     saq.train(True)
     torch.set_grad_enabled(True)
-    return decoder, saq, loss_fn
+    return decoder, saq, loss
 
 
 def test_resume_continues_optimizer_and_schedule(tmp_path):
@@ -1157,6 +1140,161 @@ def test_train_metrics_take_back_epoch_best_and_history(tmp_path):
     assert metrics.history == [{"epoch": 1}, {"epoch": 2}]
     # two epochs of (2 train + 1 val) batches are behind us
     assert (metrics.epoch - 1) * metrics.period == 6
+
+
+class _EpochDecoder:
+    """The least a decoder has to be for `MetricState` to close an epoch on it.
+
+    `mark` is what its weights say, so a test can read `<stem>_best.pt` back and tell
+    which epoch the run decided to keep.
+    """
+
+    algo, check_type, n, m, from_circuit_dem = "fake", "hx", 4, 2, False
+
+    class _Scheduler:
+        def step(self):
+            pass
+
+        def get_last_lr(self):
+            return [1e-3]
+
+    def __init__(self, score=None, score_name=None):
+        # a decoder that declares neither is the one the metric half falls back for
+        if score is not None:
+            self.train_score = score
+        if score_name is not None:
+            self.TRAIN_SCORE_NAME = score_name
+        self.scheduler = self._Scheduler()
+        self.mark = 0
+
+    def train(self, training):
+        pass
+
+    def state_dict(self):
+        return {"w": torch.tensor([float(self.mark)])}
+
+    def train_state(self):
+        return {"state_dict": self.state_dict()}
+
+
+def _run_epochs(tmp_path, decoder, epochs):
+    """Drive `MetricState` through `epochs`, each one train batch then one val batch.
+
+    `epochs` is a list of `(val_total, val_class_err)`, the numbers the validation batch
+    of that epoch reports. The training batch reports the same total, since nothing
+    selects on it.
+    """
+    metrics = _metrics_under(
+        tmp_path, (), epochs=len(epochs), test_batches=1, validation_batches=1
+    )
+    metrics._decoder = decoder
+    metrics._fingerprint = {"epochs": len(epochs)}
+    metrics.batch_size = 8
+    metrics.lr = 1e-3
+    metrics.train_set_hyperparameter(0)
+    batch = 0
+    for index, (total, class_err) in enumerate(epochs, start=1):
+        decoder.mark = index
+        for _ in range(metrics.period):
+            batch += 1
+            metrics.train_update_metric(batch, (total,), class_err)
+    return metrics
+
+
+def test_the_decoder_decides_which_epoch_the_best_checkpoint_comes_from(tmp_path):
+    """A decoder's own `train_score` picks the kept epoch, not the metric half's default.
+
+    Validation loss and validation logical error disagree here on purpose: epoch 2 is
+    the best total and epoch 3 the best `class_err`. A decoder that scores on the total
+    has to keep epoch 2's weights, which is the whole point of the hook.
+    """
+    decoder = _EpochDecoder(
+        score=lambda tr, va: va["total"], score_name="val_total"
+    )
+    metrics = _run_epochs(
+        tmp_path, decoder, [(1.0, 0.1), (0.5, 0.4), (0.8, 0.05)]
+    )
+
+    kept = torch.load(
+        tmp_path / f"{_run_stem(decoder)}_best.pt", weights_only=True
+    )
+    assert kept["w"].item() == 2, "the run kept the epoch its decoder did not choose"
+    assert metrics.best == pytest.approx(0.5)
+
+    summary = yaml.safe_load(
+        (tmp_path / f"{_run_stem(decoder)}_result.yaml").read_text()
+    )["train_full"]
+    # what it selected on, and the score it selected at
+    assert summary["selection metric"] == "val_total"
+    assert summary["best selection score"] == pytest.approx(0.5)
+    assert summary["best epoch index"] == 2
+    # and the validation error is still reported, still meaning what it always did
+    assert summary["best validation error"] == pytest.approx(0.05)
+
+
+def test_a_decoder_declaring_no_policy_selects_on_validation_error(tmp_path):
+    """The fallback is what every run did before there was a hook: lowest `class_err`."""
+    decoder = _EpochDecoder()
+    metrics = _run_epochs(
+        tmp_path, decoder, [(1.0, 0.1), (0.5, 0.4), (0.8, 0.05)]
+    )
+
+    kept = torch.load(
+        tmp_path / f"{_run_stem(decoder)}_best.pt", weights_only=True
+    )
+    assert kept["w"].item() == 3
+    assert metrics.best == pytest.approx(0.05)
+
+    summary = yaml.safe_load(
+        (tmp_path / f"{_run_stem(decoder)}_result.yaml").read_text()
+    )["train_full"]
+    assert summary["selection metric"] == "val_class_err"
+    assert summary["best selection score"] == pytest.approx(0.05)
+    assert summary["best epoch index"] == 3
+
+
+def test_resuming_under_a_different_selection_metric_is_refused(tmp_path):
+    """`best` is a number in one metric, so a run cannot pick a different one up.
+
+    Resuming a `val_total` run on a decoder scoring `val_class_err` would compare the
+    old record against new scores and keep or discard epochs on a meaningless test.
+    """
+    from syndrilla.metric import MetricState
+
+    cfg = {
+        "epochs": 4,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 0,
+    }
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
+    metrics._decoder = _EpochDecoder()  # scores `val_class_err`
+    metrics._fingerprint = {"epochs": 4}
+
+    path = tmp_path / "other_metric_last.pt"
+    torch.save(
+        {
+            "epoch": 3,
+            "best": 0.25,
+            "history": [],
+            "fingerprint": {"epochs": 4},
+            "score_name": "val_total",
+        },
+        path,
+    )
+
+    with pytest.raises(ValueError, match="val_total.*val_class_err"):
+        metrics.train_load_checkpoint(str(path), "cpu")
+
+
+def test_saq_selects_on_validation_logical_error():
+    """saq's own policy, stated on saq rather than assumed by the metric half."""
+    _, saq = _make_decoder(SURFACE_MATRIX_YAML)
+
+    assert saq.TRAIN_SCORE_NAME == "val_class_err"
+    assert saq.train_score(
+        {"total": 1.0, "class_err": 0.9}, {"total": 2.0, "class_err": 0.25}
+    ) == pytest.approx(0.25)
 
 
 def _metrics_under(tmp_path, term_names, **overrides):
@@ -1248,11 +1386,11 @@ def test_logical_centric_declares_every_term_it_returns():
     decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
     saq.train()
     e, synd, H = _random_shots(saq)
-    loss_fn = _make_loss(saq)
+    loss = _make_loss(saq)
 
     assert logical_centric.create.term_names == ("lc", "lp", "ent")
-    assert len(loss_fn.terms(decoder(_io_dict(saq, synd, H)), e)) == len(
-        loss_fn.term_names
+    assert len(loss.terms(decoder(_io_dict(saq, synd, H)), e)) == len(
+        loss.term_names
     )
 
 
@@ -1528,10 +1666,6 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     )
     assert finished.returncode == 0, finished.stderr
 
-    # the resumed run must reach the same place, epoch by epoch and weight by weight.
-    # The checkpoint's history is the whole curve, the epochs before the interrupt
-    # included. Every recorded number is reproducible except how long the epoch took,
-    # which is wall clock and is asserted on separately
     expected = torch.load(straight_dir / LAST_PT, map_location="cpu", weights_only=True)
     actual = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
     resumed_history = actual["history"]
@@ -1768,16 +1902,6 @@ def test_best_pt_stays_bare_weights_and_last_pt_still_decodes(tmp_path):
         create_decoder(cfg=cfg, bundle=bundle)
 
 
-# --------------------------------------------------------------------------- #
-# Batch-shape constraints
-#
-# `logical_logits` / `logical_prior` are written per forward row and are not unfolded
-# by RoundFlattenWrapper, so a multi-round batch reaches the loss with the llr at
-# [B, d, n] and the logical head at [B*d, 2^k]. A second channel is read as a second
-# round for the same reason. Nothing checks the shape up front, so what stops such a
-# run is the mismatch itself, raised by the loss.
-# --------------------------------------------------------------------------- #
-
 
 def test_train_cli_does_not_train_on_a_batch_shape_saq_cannot_learn_from(tmp_path):
     """`-t` on a multi-round measurer must fail rather than train on paired-up shapes.
@@ -1855,14 +1979,6 @@ def test_decoder_describes_itself_in_the_resume_fingerprint():
     assert merged["loss_lambda_lp"] == loss.lambda_lp
 
 
-# --------------------------------------------------------------------------- #
-# Config layout
-#
-# The decoder yaml is grouped so each block has exactly one reader: `model` and
-# `cpnd` and `optimizer` are the decoder's, `train` is the metrics'. Nothing
-# reaches across, which is what these tests pin.
-# --------------------------------------------------------------------------- #
-
 
 def test_decoder_reads_its_settings_from_their_own_blocks():
     """Architecture, CPND and optimizer settings each come from their own block."""
@@ -1920,9 +2036,6 @@ def test_train_state_carries_the_random_state():
     rng = cpu_saq.train_state()["rng"]
 
     assert torch.is_tensor(rng["cpu"])
-    # a cpu decoder has no cuda generators to save, whatever the host happens to have.
-    # The device is pinned here rather than taken from the shipped yaml, which asks for
-    # cuda: otherwise this asserts something about the test host, not about the decoder.
     assert "cuda" not in rng
 
     # the mirror image: a cuda decoder does save them, because its stream is the one a

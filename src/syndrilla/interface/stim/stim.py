@@ -61,9 +61,6 @@ class create:
         error_cfg = kwargs.get("error_cfg", {})
         syndrome_cfg = kwargs.get("syndrome_cfg", {})
         decoder_cfg = kwargs.get("decoder_cfg", {})
-        # a build-time mode, passed on the way `main.py` passes it to create_decoder:
-        # a training run supervises against the sampled error and never checks a
-        # logical error, so the checker is not built
         training = kwargs.get("training", False)
 
         if decoder_cfg:
@@ -108,11 +105,8 @@ class create:
                     # on this path the measurement noise is a circuit generation
                     # parameter, and the sweep regenerates the circuit from <error.rate>
                     raise ValueError(
-                        f"syndrome.measurement_error_rate=<{syn_meas_rate}> is a range, "
-                        f"but on the stim path it sets the circuit's "
-                        f"<before_measure_flip_probability>, which a swept <error.rate> "
-                        f"already scales. Sweep <error.rate> instead and give this a "
-                        f"scalar, or drop it."
+                        f"syndrome.measurement_error_rate=<{syn_meas_rate}> is a range, but "
+                        f"it sets the circuit's noise; sweep <error.rate> instead."
                     )
                 if "before_measure_flip_probability" in circuit_gen_cfg:
                     logger.warning(
@@ -139,9 +133,6 @@ class create:
             "number_channel": number_channel,
             "device": device_cfg,
         }
-        # a swept rate carries its own point count as its last value, so the range
-        # passes through as one key rather than two that could arrive apart; the
-        # retired key is refused here rather than dropped silently on the way through
         reject_rate_points_key(error_cfg, "stim interface")
         if "rate" in error_cfg:
             em_cfg["rate"] = error_cfg["rate"]
