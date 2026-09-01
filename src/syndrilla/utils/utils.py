@@ -711,12 +711,16 @@ def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_d
     The phase-2 threshold is capped at batch_size (never wait for more than one batch).
     Plus an endgame flush once the error budget is passed.
 
+    A -tb run has no target_error (None); its queue simply flushes once it holds a batch.
+
     Returns (flush, flushing): whether to run an extra batch now, and whether this is the
     endgame drain (used only for logging).
     """
     flushing = num_err >= batch_size  # endgame: error budget passed
     if n_extra <= 0:
         return False, flushing
+    if target_error is None:
+        return (n_extra >= batch_size or flushing), flushing
     remaining = max(1, target_error - num_err)
     if extra_density is None:  # no first extra batch yet
         trigger = n_extra >= remaining

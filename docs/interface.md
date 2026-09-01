@@ -41,7 +41,8 @@ Following is a table for detailed explaination on each command line arguments:
 | `-e`     | Path to error model YAML file                | `-e=examples/stim/stim_generated.error.yaml`      |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/stim/stim_generated.syndrome.yaml`   |
 | `-bs`    | Number of samples in each batch              | `-bs=1000`                                        |
-| `-te`    | Total number of errors to stop decoding      | `-te=100`                                         |
+| `-te`    | Total number of errors to stop decoding, default `100` | `-te=100`                                         |
+| `-tb`    | Total number of batches to stop decoding, instead of an error target; not given with `-te` | `-tb=500`                                         |
 | `-l`     | Level of logger, default `INFO`              | `-l=SUCCESS`                                      |
 | `-ckpt`  | Path to a checkpoint YAML file to resume a decode run. With `-t` it is the training run's `<stem>_result.yaml` and is given together with that run's `-tckpt`; either of the two alone is rejected rather than ignored. The stim path derives its physical error rate from the circuit's DEM, so the filename reflects that value rather than a rate you set | `-ckpt=<run dir>/result_phy_err_<rate>.yaml` |
 

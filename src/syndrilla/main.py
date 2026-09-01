@@ -68,8 +68,15 @@ def parse_commandline_args():
         "-te",
         "--target_error",
         type=int,
-        default=100,
-        help="Total number of errors to stop decoding.",
+        default=None,
+        help="Total number of errors to stop decoding, default 100 (unless -tb is given; ignored with -t).",
+    )
+    parser.add_argument(
+        "-tb",
+        "--total_batch",
+        type=int,
+        default=None,
+        help="Total number of batches to stop decoding, instead of an error target. Not with -te; ignored with -t.",
     )
     parser.add_argument(
         "-m", "--matrix_yaml", type=str, default=None, help="Path to matrix yaml."
@@ -148,6 +155,17 @@ def main():
             f"Resuming a training run takes both of its checkpoints, but {given} was "
             f"given without {missing}. Both were printed by the run that wrote them."
         )
+
+    # a training run's batch budget comes from the decoder yaml's `train` block, so
+    # both decode stop conditions are left unset and ignored
+    if not args.train:
+        if args.total_batch is not None and args.target_error is not None:
+            raise ValueError(
+                f"-te <{args.target_error}> and -tb <{args.total_batch}> are two "
+                "different stop conditions; give one, not both."
+            )
+        if args.total_batch is None and args.target_error is None:
+            args.target_error = 100  # the stop condition when neither flag is given
 
     required = [("-d", "decoder_yaml")]
     if args.interface_yaml is None:
@@ -301,17 +319,26 @@ def main():
             dtype,
             error_model.rate,
             H_file_name,
+            args.total_batch,
         )
 
     queue = ExtraQueue(
         args.batch_size, args.target_error, decoder_device
     )  # deferred (hard) samples
 
-    max_batches = metrics.total_batches if args.train else float("inf")
+    if args.train:
+        max_batches = metrics.total_batches
+    else:
+        max_batches = args.total_batch if args.total_batch is not None else float("inf")
+    # a -tb run has no error target, so only max_batches ends it
+    error_budget = float("inf") if args.target_error is None else args.target_error
 
-    while num_batches < max_batches and (
-        num_err <= args.target_error or (cap_on and queue.nonempty)
-    ):
+    def budget_left():
+        """Is there room to generate a fresh batch under this run's stop condition?"""
+        return num_batches < max_batches and num_err <= error_budget
+
+    # once the budget is spent, the loop keeps running to drain deferred samples
+    while budget_left() or (cap_on and queue.nonempty):
         logger.success(
             "\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
         )
@@ -327,7 +354,7 @@ def main():
 
         # predict_pct offload scheduler: decide WHEN to re-decode the deferred queue
         do_flush, flushing = queue.should_flush(num_err)
-        use_extra = cap_on and do_flush
+        use_extra = cap_on and (do_flush or not budget_left())
         if cap_on:
             inner0.cap_bypass = use_extra
         if use_extra:
@@ -421,7 +448,9 @@ def main():
                 )
             num_err += int(torch.sum(check[num_decoders - 1]))
             logger.info(
-                f"number of errors at the current batch {num_err}/{args.target_error}"
+                f"batch count {num_batches}/{args.total_batch}"
+                if args.total_batch is not None
+                else f"number of errors at the current batch {num_err}/{args.target_error}"
             )
 
             # report and accumulate metrics
@@ -463,6 +492,7 @@ def main():
                     num_err,
                     H_file_name,
                     check_num,
+                    total_batch=args.total_batch,
                 )
                 logger.success(f"Saved log to <{output_log}>.")
                 logger.success(f"Saved metric results to <{args.run_dir}>.")
@@ -490,6 +520,7 @@ def main():
         H_file_name,
         check_num,
         1,
+        total_batch=args.total_batch,
     )
     logger.success(f"Saved log to <{output_log}>.")
     logger.success(f"Saved metric results to <{args.run_dir}>.")

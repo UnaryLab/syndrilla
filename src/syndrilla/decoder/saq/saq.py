@@ -68,8 +68,7 @@ def _right_inverse(H_hat):
 
 
 def _kernel_basis(H_hat):
-    """Basis of `ker(H_hat)`, one basis vector per column of the returned [n, g] matrix.
-    """
+    """Basis of `ker(H_hat)`, one basis vector per column of the returned [n, g] matrix."""
     r_mat, _, pivots = _rref_gf2(H_hat)
     n = np.shape(H_hat)[1]
     free = np.setdiff1d(np.arange(n), pivots)
@@ -164,6 +163,8 @@ class create(nn.Module):
 
     # what `train_state` writes and `load_train_state` requires back
     TRAIN_STATE_KEYS = ("state_dict", "optimizer", "scheduler")
+    # what `train_score` returns, under the name the run records it by
+    TRAIN_SCORE_NAME = "val_class_err"
 
     def __init__(self, decoder_cfg, **kwargs) -> None:
         """Initialization for saq decoder.
@@ -568,6 +569,15 @@ class create(nn.Module):
         )
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
         self.optimizer.zero_grad(set_to_none=True)
+
+    def train_score(self, train, val):
+        """Score an epoch by the validation logical error: what the decoder is for.
+
+        Validation loss is the surrogate the run descends, so the epoch with the lowest
+        one is not necessarily the epoch that decodes best. The kept checkpoint is the
+        one that decodes best.
+        """
+        return val["class_err"]
 
     def train_fingerprint(self):
         """The model half of a resume fingerprint. `MetricState` owns the schedule half."""

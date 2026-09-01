@@ -84,8 +84,7 @@ class BatchTracker:
         return t
 
     def record_error(self, err):
-        """Append the ground-truth error batch, on the same axis its decodings are on.
-        """
+        """Append the ground-truth error batch, on the same axis its decodings are on."""
         err = err.to(self.device)
         err_base = 3 if self.number_channel > 1 else 2
         if err.ndim > err_base:
@@ -164,6 +163,11 @@ def _add_histogram(total, batch):
     return total + batch
 
 
+def _opt_int(value):
+    """A checkpoint field that is an int, or None when the run had no such stop condition."""
+    return None if value is None else int(value)
+
+
 def _yaml_rate(rate):
     """A physical error rate as a yaml scalar, or a [lower, upper, points] list."""
     if isinstance(rate, (list, tuple)):
@@ -183,6 +187,10 @@ PHASE_YAML_NAMES = {
     "val": ("validation", "validation loss", "validation error"),
 }
 
+# what a decoder declaring no policy of its own is selected on: the validation logical
+# error every run selected on before the hook existed
+DEFAULT_TRAIN_SCORE_NAME = "val_class_err"
+
 
 def _yaml_losses(history, phase):
     """One phase's epoch means over the whole run, a column per term."""
@@ -196,6 +204,11 @@ def _yaml_losses(history, phase):
     }
 
 
+def _train_score_name(decoder):
+    """What a decoder calls the number it selects epochs on, or the run's own default."""
+    return getattr(decoder, "TRAIN_SCORE_NAME", DEFAULT_TRAIN_SCORE_NAME)
+
+
 def _train_stem(decoder):
     """What every file a training run writes is named after: algo, check type, size."""
     size = (
@@ -205,8 +218,7 @@ def _train_stem(decoder):
 
 
 def _train_fingerprint(cfg, decoder, batch_size, error_rate, H_file_name, loss):
-    """The settings a resumed training run must still agree with: model, data, schedule.
-    """
+    """The settings a resumed training run must still agree with: model, data, schedule."""
     # the objective's own settings, straight from the block that configured it
     loss_cfg = getattr(loss, "cfg", {"function": type(loss).__module__})
     return {
@@ -324,7 +336,9 @@ class MetricState:
             distribution = torch.zeros(num_max_iter + 1).to(e_estimated.device)
         else:
             distribution = (
-                torch.bincount((iteration - 1).int().flatten(), minlength=num_max_iter + 1)
+                torch.bincount(
+                    (iteration - 1).int().flatten(), minlength=num_max_iter + 1
+                )
                 .int()
                 .to(e_estimated.device)
             )
@@ -375,7 +389,9 @@ class MetricState:
             if int(comp_i.shape[0]) == 1:
                 data_qubit_acc[i] = 1.0
             else:
-                data_qubit_acc[i] = float(comp_i[1]) / (float(comp_i[1]) + float(comp_i[0]))
+                data_qubit_acc[i] = float(comp_i[1]) / (
+                    float(comp_i[1]) + float(comp_i[0])
+                )
 
             num_error = torch.sum(e_estimated_channel != e_actual_channel)
 
@@ -422,7 +438,9 @@ class MetricState:
             if int(torch.sum(converge_fail)) == 0:
                 converge_fail_rate[i] = 0
             else:
-                converge_fail_rate[i] = int(torch.sum(converge_fail)) / (check.size()[0])
+                converge_fail_rate[i] = int(torch.sum(converge_fail)) / (
+                    check.size()[0]
+                )
 
             converge_succ = torch.where(
                 (check_channel == 0) & (converge_next == 1),
@@ -447,8 +465,12 @@ class MetricState:
                     f"  Syndrome frame error rate: {synd_frame_error_rate[channel]:.6f}"
                 )
                 logger.info(f"  Logical error rate: {logical_error_rate[channel]:.6f}")
-                logger.info(f"  Converge failure rate: {converge_fail_rate[channel]:.6f}")
-                logger.info(f"  Converge success rate: {converge_succ_rate[channel]:.6f}")
+                logger.info(
+                    f"  Converge failure rate: {converge_fail_rate[channel]:.6f}"
+                )
+                logger.info(
+                    f"  Converge success rate: {converge_succ_rate[channel]:.6f}"
+                )
 
         return MetricResult(
             {
@@ -588,6 +610,7 @@ class MetricState:
         file_name,
         check_num,
         done=0,
+        total_batch=None,
     ):
         """
         Saves decoding metrics for all decoders into a single YAML file.
@@ -604,7 +627,9 @@ class MetricState:
             return dumper.represent_scalar("tag:yaml.org,2002:float", f"{value:.17e}")
 
         def list_representer(dumper, data):
-            return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
+            return dumper.represent_sequence(
+                "tag:yaml.org,2002:seq", data, flow_style=True
+            )
 
         def format_time(value):
             return f"{float(value):.17e}"
@@ -641,12 +666,16 @@ class MetricState:
                     {
                         "data qubit accuracy": float(
                             decoder_metrics["data_qubit_acc"][idx]
-                            if isinstance(decoder_metrics["data_qubit_acc"], (list, tuple))
+                            if isinstance(
+                                decoder_metrics["data_qubit_acc"], (list, tuple)
+                            )
                             else decoder_metrics["data_qubit_acc"]
                         ),
                         "data qubit correction accuracy": float(
                             decoder_metrics["correction_acc"][idx]
-                            if isinstance(decoder_metrics["correction_acc"], (list, tuple))
+                            if isinstance(
+                                decoder_metrics["correction_acc"], (list, tuple)
+                            )
                             else decoder_metrics["correction_acc"]
                         ),
                         "data frame error rate": float(
@@ -705,7 +734,9 @@ class MetricState:
                 "algorithm": decoder_metrics["algorithm"],
                 "decoder invoke rate": float(decoder_metrics["invoke_rate"]),
                 "average iteration": float(decoder_metrics["average_iter"]),
-                "sample count": int(round(float(decoder_metrics.get("sample_count", 0)))),
+                "sample count": int(
+                    round(float(decoder_metrics.get("sample_count", 0)))
+                ),
                 "iteration distribution": distribution,
                 "iteration count": iteration_count,
             }
@@ -735,6 +766,7 @@ class MetricState:
             "batch size": batch_size,
             "batch count": num_batches,
             "target error": target_error,
+            "total batch": total_batch,
             "target error reached": error_reach,
             "data type": dtype,
             "physical error rate": physical_error_rate,
@@ -745,7 +777,9 @@ class MetricState:
             all_metrics_results["decoder_full"][f"{check_name}"] = final_list[idx]
 
         os.makedirs(curr_dir, exist_ok=True)
-        output_path = os.path.join(curr_dir, f"result_phy_err_{physical_error_rate}.yaml")
+        output_path = os.path.join(
+            curr_dir, f"result_phy_err_{physical_error_rate}.yaml"
+        )
 
         # Add custom representers for proper formatting
         yaml.SafeDumper.add_representer(float, float_representer)
@@ -768,9 +802,9 @@ class MetricState:
         dtype,
         error_rate,
         H_file_name,
+        total_batch=None,
     ):
-        """Build this run's decode state, resuming from `checkpoint` if one was given.
-        """
+        """Build this run's decode state, resuming from `checkpoint` if one was given."""
         if checkpoint is None:
             logger.info("No input Checkpoint file.")
             return cls(num_decoders, number_channel, device), 0, 0
@@ -778,7 +812,13 @@ class MetricState:
             raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
         metrics, ckpt_meta = cls.load_checkpoint(checkpoint, number_channel, device)
         metrics.validate_checkpoint(
-            ckpt_meta, batch_size, target_error, dtype, error_rate, H_file_name
+            ckpt_meta,
+            batch_size,
+            target_error,
+            dtype,
+            error_rate,
+            H_file_name,
+            total_batch,
         )
         return metrics, ckpt_meta["num_err"], ckpt_meta["batch_count"]
 
@@ -796,7 +836,8 @@ class MetricState:
             "H_file_name": full.get("H matrix", 0),
             "batch_size": int(full.get("batch size", 0)),
             "batch_count": int(full.get("batch count", 0)),
-            "target_error": int(full.get("target error", 0)),
+            "target_error": _opt_int(full.get("target error", 0)),
+            "total_batch": _opt_int(full.get("total batch")),
             "num_err": int(full.get("target error reached", 0)),
             "dtype": full.get("data type", 0),
             "physical_error_rate": float(full.get("physical error rate", 0.0)),
@@ -877,11 +918,13 @@ class MetricState:
         dtype,
         physical_error_rate,
         H_file_name,
+        total_batch=None,
     ):
         """Validate checkpoint metadata matches current run parameters."""
         checks = [
             ("batch_size", ckpt_meta["batch_size"], batch_size),
             ("target_error", ckpt_meta["target_error"], target_error),
+            ("total_batch", ckpt_meta["total_batch"], total_batch),
             ("dtype", ckpt_meta["dtype"], str(dtype)),
             (
                 "physical_error_rate",
@@ -905,8 +948,7 @@ class MetricState:
 
     @classmethod
     def train_initial(cls, cfg, run_dir, source):
-        """Validate a training schedule and build a state whose training half is live.
-        """
+        """Validate a training schedule and build a state whose training half is live."""
         logger.info(f"Reading training schedule from <{get_path(source)}>.")
         if cfg is None:
             raise ValueError(
@@ -1049,6 +1091,15 @@ class MetricState:
                 f"Training checkpoint is missing the run position "
                 f"<{', '.join(missing)}>; it cannot be resumed from."
             )
+        # before anything is loaded onto the decoder: `best` is a record in one metric,
+        # and scoring new epochs against it in another decides nothing
+        score_name = _train_score_name(self._decoder)
+        saved_name = state.get("score_name", DEFAULT_TRAIN_SCORE_NAME)
+        if saved_name != score_name:
+            raise ValueError(
+                f"Cannot resume <{path}>: its best score is a <{saved_name}> and this "
+                f"run selects on <{score_name}>."
+            )
         self._decoder.load_train_state(state)
         self.epoch = state["epoch"]
         self.best = state["best"]
@@ -1060,7 +1111,7 @@ class MetricState:
             )
         return (
             f"resumed <{path}> at epoch {self.epoch}, "
-            f"best validation error {self.best:.4f}"
+            f"best {score_name} {self.best:.4f}"
         )
 
     def train_validate_checkpoint(self, saved, path, keys=None):
@@ -1154,9 +1205,13 @@ class MetricState:
         tr = mean("train", self.cfg["test_batches"])
         va = mean("val", self.cfg["validation_batches"])
 
-        is_best = va["class_err"] < self.best
+        # which epoch is worth keeping is the decoder's call, not the metric half's:
+        # a decoder declaring no `train_score` is selected on its validation error
+        score = getattr(self._decoder, "train_score", None)
+        score = float(va["class_err"] if score is None else score(tr, va))
+        is_best = score < self.best
         if is_best:
-            self.best = va["class_err"]
+            self.best = score
 
         now = time.time()
         elapsed = now - self._epoch_start
@@ -1165,10 +1220,18 @@ class MetricState:
         lr = self.lr
         # a loss that declares no terms leaves the line reporting the total alone
         breakdown = " ".join(f"{name}={tr[name]:.4f}" for name in self.term_names)
+        score_name = _train_score_name(self._decoder)
+        # the line already reports the validation error, so only a decoder selecting on
+        # something else has a number left to spell out
+        selected = (
+            ""
+            if score_name == DEFAULT_TRAIN_SCORE_NAME
+            else f"  {score_name}={score:.4f}"
+        )
         line = (
             f"epoch {self.epoch:4d}/{self.epochs}  lr={lr:.2e}  "
             f"train_loss={tr['total']:.4f}{f' ({breakdown})' if breakdown else ''}  "
-            f"val_loss={va['total']:.4f}  val_err={va['class_err']:.4f}  "
+            f"val_loss={va['total']:.4f}  val_err={va['class_err']:.4f}{selected}  "
             f"{elapsed:.1f}s"
             f"{'  <- best' if is_best else ''}"
         )
@@ -1179,6 +1242,7 @@ class MetricState:
                 "time": float(elapsed),
                 "train": tr,
                 "val": va,
+                "score": score,
                 "best": is_best,
             }
         )
@@ -1200,6 +1264,8 @@ class MetricState:
                 "best": self.best,
                 "history": self.history,
                 "fingerprint": self._fingerprint,
+                # `best` is a number in this metric and comparable in no other
+                "score_name": score_name,
             },
             os.path.join(self.run_dir, f"{stem}_last.pt"),
         )
@@ -1211,8 +1277,7 @@ class MetricState:
         self.lr = self._decoder.scheduler.get_last_lr()[0]
 
     def train_save_output_yaml(self):
-        """Write `<stem>_result.yaml`: what the run is, then the run's curve by column.
-        """
+        """Write `<stem>_result.yaml`: what the run is, then the run's curve by column."""
         history = list(self.history)
         tail = history[-1:]
         # the last epoch flagged `best` is the run's best: later flags supersede earlier
@@ -1231,8 +1296,9 @@ class MetricState:
                 for phase, (block, *_) in PHASE_YAML_NAMES.items()
             },
         }
-        # over the whole run, not the thinned file: the epochs it drops were still run
-        best = min(self.history, key=lambda e: e["val"]["class_err"], default=None)
+        # over the whole run, not the thinned file: the epochs it drops were still run.
+        # the kept epoch is the one the selection metric picked.
+        val_errors = [float(entry["val"]["class_err"]) for entry in self.history]
         times = [float(entry.get("time", 0.0)) for entry in self.history]
         per_epoch = sum(times) / len(times) if times else 0.0
         samples = self.period * (self.batch_size or 0)
@@ -1244,8 +1310,12 @@ class MetricState:
                 "training batches count": self.cfg["test_batches"],
                 "validation batches count": self.cfg["validation_batches"],
                 "error random seed": self.cfg["error_random_seed"],
-                "best validation error": float(self.best),
-                "best epoch index": int(best["epoch"]) if best else None,
+                "selection metric": _train_score_name(self._decoder),
+                "best selection score": float(self.best),
+                "best validation error": min(val_errors, default=float(self.best)),
+                "best epoch index": (
+                    int(best_epoch["epoch"]) if best_epoch is not None else None
+                ),
                 "total time (s)": float(time.time() - self.start),
                 "total epoch time (s)": float(sum(times)),
                 "average time per epoch (s)": per_epoch,
@@ -1283,7 +1353,7 @@ class MetricState:
         result_path = os.path.join(self.run_dir, f"{stem}_result.yaml")
         print(
             f"\ndone in {time.time() - self.start:.1f}s. "
-            f"best validation error {self.best:.4f}"
+            f"best {_train_score_name(self._decoder)} {self.best:.4f}"
         )
         print(f"checkpoints: {best_path}, {last_path}")
         print(f"result: {result_path}")

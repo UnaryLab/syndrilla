@@ -102,7 +102,8 @@ Following is a table for detailed explaination on each command line arguments:
 | `-i`     | Path to interface YAML file, replacing `-m`/`-e`/`-s`/`-c` | `-i=examples/stim/stim_generated.interface.yaml` |
 | `-ckpt`  | Path to checkpoint YAML file to resume; with `-t`, the training run's `*_result.yaml`, given alongside its `-tckpt` | `-ckpt=tests/test_outputs/result_phy_err_0.1.yaml` |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
-| `-te`    | Total number of errors to stop decoding      | `-te=1000`                                         |
+| `-te`    | Total number of errors to stop decoding, default `100` | `-te=1000`                                         |
+| `-tb`    | Total number of batches to stop decoding, instead of an error target; not given with `-te` | `-tb=500`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-ls`    | Path to loss YAML file                       | `-ls=examples/alist/logical_centric.loss.yaml`    |
