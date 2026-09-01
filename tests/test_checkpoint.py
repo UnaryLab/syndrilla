@@ -34,7 +34,7 @@ from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.metric import BatchTracker, MetricState, report_metric, save_metric
+from syndrilla.metric import BatchTracker, MetricState
 from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
@@ -123,7 +123,7 @@ def run_one_batch(
         for i, d in enumerate(decoders):
             t0 = time.time()
             io = d(io)
-            bt.record_decoder(i, io, time.time() - t0)
+            bt.record_metric(i, io, time.time() - t0)
         check = [
             lc.check(bt.e_v_all[i], bt.e_all, l_mat, bt.converge_all[i + 1])
             for i in range(nd)
@@ -133,7 +133,7 @@ def run_one_batch(
             bt.e_v_all = [t.unsqueeze(1) for t in bt.e_v_all]
             check = [t.unsqueeze(1) for t in check]
         for i in range(nd):
-            br = report_metric(
+            br = metrics.report_metric(
                 nmi[i],
                 bt.e_all,
                 bt.e_v_all[i],
@@ -270,7 +270,7 @@ def run_one_config(
             )
 
     out = m.get_all_metrics(save_every, algo)
-    save_metric(
+    m.save_metric(
         out,
         tmp_dir + "/",
         batch_size,

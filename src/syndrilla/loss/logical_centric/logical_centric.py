@@ -25,16 +25,6 @@ def _logical_flipped(L, x):
 
 def _diff_GF2_mul(H, x):
     """Differentiable GF(2) matrix-vector product, in the probability domain.
-
-    The XOR over each column's support becomes a product of +-1 Bernoulli means: with
-    `x_i = P(bit_i == 1)`, each factor `1 - 2*x_i` is `E[(-1)^bit_i]`, and their product
-    is `E[(-1)^parity]`, so `sign_to_bin` of it is `P(parity == 1)`.
-
-    Exact, and unusable as written on a support of any size: every factor has magnitude
-    below 1, so the product decays geometrically in the number of bits and takes its own
-    gradient down with it. `_parity_llr` computes the same quantity in the log domain
-    and is what the loss uses; this is kept because it is the plainest statement of what
-    that one approximates, and the tests check the two against each other.
     """
     tmp = bin_to_sign(H.unsqueeze(0) * x.unsqueeze(-1))
     return sign_to_bin(torch.prod(tmp, 1))
@@ -87,14 +77,6 @@ class create:
             io_dict: the decoder's output dict, needing 'llr', 'logical_logits' and
                 'logical_prior'
             e: ground-truth error, [batch, n] in {0, 1}
-
-            L_LC   cross-entropy on the transformer's logical class output
-            L_LP   cross-entropy on the shallow prior, same target
-            L_Ent  differentiable GF(2) logical entropy: pushes the *logical* syndrome of
-                   the residual `e XOR prediction` towards zero rather than matching the
-                   error bitwise, so degenerate solutions are not penalised
-
-        Use `combine` to weight them with the configured lambdas.
         """
         e, target_idx = self._prepare(e)
 
@@ -110,11 +92,7 @@ class create:
         return loss_lc, loss_lp, loss_ent
 
     def combine(self, loss_lc, loss_lp, loss_ent):
-        """The three terms weighted by the configured lambdas, as one scalar.
-
-        Split from __call__ so a training loop that also logs the individual terms
-        computes them once instead of twice.
-        """
+        """The three terms weighted by the configured lambdas, as one scalar."""
         return (
             self.lambda_lc * loss_lc
             + self.lambda_lp * loss_lp
@@ -126,11 +104,7 @@ class create:
         return self.combine(*self.terms(io_dict, e))
 
     def class_error(self, io_dict, e):
-        """Fraction of the batch whose predicted logical class is wrong.
-
-        Uses the same target packing `terms` trains against, which is why it lives here
-        rather than in metric/.
-        """
+        """Fraction of the batch whose predicted logical class is wrong."""
         _, target_idx = self._prepare(e)
         predicted = io_dict["logical_logits"].argmax(dim=1)
         return (predicted != target_idx).float().mean().item()

@@ -8,27 +8,7 @@ from loguru import logger
 
 from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, read_yaml
 
-# --------------------------------------------------------------------------- #
-# Adaptive iteration speedup for iterative BP decoders (`rebatch_speedup`, KL-paced).
-#
-# How it works
-#   1. The first batches run UNCAPPED (warm-up). After each one the decoder hands
-#      its per-sample stop-iteration histogram to RebatchSpeedup.observe.
-#   2. Warm-up ends when the pooled iteration-count distribution stops moving:
-#      KL(p_k || p_{k-1}) < kl_eps for kl_window consecutive batches (and at least
-#      kl_min batches seen). This decides k automatically.
-#   3. From the warm-up batches it picks the converged-fraction stop P that
-#      maximizes the projected iteration-count speedup, and exposes frac = P/100.
-#
-# Afterwards the decode loop stops a batch as soon as >= P% of its samples have
-# converged; the unconverged remainder is left with converge == 0 so main can
-# offload it to the extra queue and decode all the hard cases together later.
-# --------------------------------------------------------------------------- #
-
-# converged-fraction stops to try when picking the cap (percent of the batch).
-# The cap is chosen once from warm-up histograms, so sweeping every integer
-# percentile is cheap and finds a finer optimum than a sparse hand-picked set.
-DEFAULT_CANDIDATES = tuple(range(100))  # 0..99
+DEFAULT_CANDIDATES = tuple(range(100))  
 
 
 def _projected_speedup(hists, pct, batch_size):
@@ -54,10 +34,9 @@ def _projected_speedup(hists, pct, batch_size):
     return np.mean(bases) / denom if denom else float("nan")
 
 
-# Shared cross-decoder CUDA kernels (decoder/cuda/decoder.cu), JIT-compiled on first use.
-# RebatchSpeedup.observe uses its `iter_histogram` to bin warm-up stop-iteration counts
-# on-device for any CUDA decoder. Cached per process; `False` marks a failed build so
-# we fall back to torch.bincount (CPU decoders / no nvcc) without retrying the compile.
+# Shared cross-decoder CUDA kernels (decoder/cuda/decoder.cu), JIT-compiled on first
+# use and cached per process; `False` marks a failed build, so we fall back to
+# torch.bincount without retrying the compile.
 _DECODER_EXT = None
 
 
@@ -127,10 +106,7 @@ class RebatchSpeedup:
     def observe(self, iter_tensor, max_iter, batch_size):
         """Record one warm-up batch's stop-iteration histogram and, once the pooled
         distribution has settled (KL test), choose the cap. Call only during warm-up.
-
-        For CUDA tensors the histogram is binned by the shared decoder kernel
-        (``iter_histogram`` in decoder/decoder.cu); CPU decoders -- and any case where
-        the kernel can't build -- fall back to ``torch.bincount``."""
+        """
         t = iter_tensor.detach()
         ext = _load_decoder_ext() if t.is_cuda else None
         if ext is not None:
@@ -181,15 +157,7 @@ class RebatchSpeedup:
 
 
 class RoundFlattenWrapper(torch.nn.Module):
-    """
-    Wraps a decoder to transparently handle a rounds dimension (always dim=1).
-
-    Flattens [B, d, ...] → [B*d, ...] before the inner decoder and reshapes
-    all outputs back to [B, d, ...] afterwards.  No-op when syndrome is 2D
-    (1-channel, 1 round) or 3D with no rounds (2-channel, 1 round).
-
-    Rounds dim convention: [B, rounds, (C), M]
-    """
+    """Wraps a decoder to transparently handle a rounds dimension (always dim=1)."""
 
     def __init__(self, decoder):
         super().__init__()
@@ -219,11 +187,9 @@ class RoundFlattenWrapper(torch.nn.Module):
 
         llr0 = io_dict["llr0"]
         if llr0.ndim == synd.ndim and llr0.shape[:2] == (B, d):
-            # the error model drew a fresh error per round, so the prior already
-            # carries the rounds dimension and is flattened the way the syndrome is.
-            # Expanding it instead gave the inner decoder a [B*d, d, N] prior against
-            # a [B*d, M] syndrome, which is what took every rounds > 1 run down with
-            # `Tensors must have same number of dimensions: got 3 and 2`
+            # the prior already carries the rounds dimension, so it is flattened the
+            # way the syndrome is; expanding it instead hands the inner decoder a
+            # [B*d, d, N] prior against a [B*d, M] syndrome
             io_dict["llr0"] = llr0.reshape(Bd, *llr0.shape[2:])
         else:
             # one prior per shot, shared by every round of that shot
@@ -252,19 +218,15 @@ class RoundFlattenWrapper(torch.nn.Module):
 
 
 # --------------------------------------------------------------------------- #
-# `decoder.config`: the algorithm-specific half of a decoder block.
-#
-# Everything at the top of the block is framework-wide -- `algorithm`, `check_type`,
-# `dtype`, `device`, `force_pytorch`, `checkpoint` and `rebatch_speedup` are read by
-# main.py, this loader, or every decoder alike. What only one algorithm understands
-# (`max_iter`, `sf`, relay_bp's schedule, the quantization widths) lives under
-# `config`, one entry per entry of `algorithm`, so a chain can tune each stage
-# separately instead of sharing one flat namespace.
+# `decoder.config`: the algorithm-specific half of a decoder block. The top of the
+# block is framework-wide (`algorithm`, `check_type`, `dtype`, `device`,
+# `force_pytorch`, `checkpoint`, `rebatch_speedup`); what only one algorithm
+# understands lives under `config`, one entry per entry of `algorithm`, so a chain
+# can tune each stage separately.
 # --------------------------------------------------------------------------- #
 
 # Keys that belong under `config`, not at the top of the block. Rejected there rather
-# than ignored: a decoder silently falling back to max_iter=50 instead of the configured
-# 181 still produces numbers, and they look like results.
+# than ignored: a silent fallback to a default still produces numbers.
 MOVED_TO_CONFIG = (
     "max_iter",
     "damping_factor",
@@ -309,18 +271,7 @@ SHARED_KEYS = (
 
 
 def _split_config(dec_cfg: dict, algorithms: list, source: str):
-    """Return one algorithm-specific config per algorithm, validating placement.
-
-    `config` is positional: entry i belongs to `algorithm[i]`, which is what lets the
-    same algorithm appear twice in a chain with different settings.
-
-    A `config` written as a plain mapping is the settings of the chain's **first**
-    algorithm, and every later stage runs on its defaults. That covers the shipped
-    chains, where only the first stage takes settings (`osd_0` after BP configures
-    nothing), and keeps their yaml a flat block of keys. A chain that has to configure
-    a later stage writes the list form, which is the only one that can say which stage
-    an entry belongs to.
-    """
+    """Return one algorithm-specific config per algorithm, validating placement."""
     misplaced = [key for key in MOVED_TO_CONFIG if key in dec_cfg]
     if misplaced:
         per_algo = " (one entry per algorithm)" if len(algorithms) > 1 else ""
@@ -344,12 +295,9 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
                 f"matched by position, so there is no algorithm for the last "
                 f"<{len(blocks) - n}>."
             )
-        # `- ` with nothing after it parses as None; read it as "no settings". A short
-        # list leaves the stages past its end on their defaults, so a chain ending in
-        # a decoder that configures nothing (osd_0 after BP) writes no entry for it.
-        # Only trailing entries can be dropped: position is what binds an entry to an
-        # algorithm, so a stage that takes no settings before one that does still
-        # needs its `- {}` slot.
+        # `- ` with nothing after it parses as None; read it as "no settings". A
+        # short list leaves the stages past its end on their defaults, but only
+        # trailing entries can be dropped: position binds an entry to an algorithm.
         blocks = [{} if b is None else b for b in blocks]
         blocks = blocks + [{}] * (n - len(blocks))
     else:
@@ -374,9 +322,8 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     return blocks
 
 
-# every call a training run makes on its decoder, in the order the run makes them.
-# The per-batch step is not one of them: the loop steps `self.optimizer` itself, and
-# `configure_optimizer` is what puts that optimizer on the decoder
+# every call a training run makes on its decoder, in order. The per-batch step is not
+# one of them: the loop steps `self.optimizer`, which `configure_optimizer` installs
 TRAINABLE_STAGES = (
     "train_fingerprint",
     "configure_optimizer",
@@ -390,13 +337,7 @@ def is_trainable(decoder):
 
 
 def assert_trainable(decoders):
-    """Raise unless the chain's last decoder implements the whole training protocol.
-
-    `-t` drives the chain's last stage, so that is the decoder a run updates: a stage
-    after it would leave the run learning from output its gradient never passed
-    through. Checked once, before any batch, so an untrainable chain stops the run
-    rather than half-running it.
-    """
+    """Raise unless the chain's last decoder implements the whole training protocol."""
     tail = decoders[-1]
     inner = getattr(tail, "decoder", tail)
     if is_trainable(inner):
@@ -410,13 +351,7 @@ def assert_trainable(decoders):
 
 
 def resolve_configs(dec_cfg: dict, source: str = "dict"):
-    """Return one flat config per algorithm, in `decoder.algorithm` order.
-
-    Each is the shared keys with that algorithm's `config` entry merged on top, which
-    is what a decoder is actually built from. `main.py` needs one of these before
-    `create_decoder` runs, so the positional rule that binds a `config` entry to an
-    algorithm lives here alone rather than being re-derived at the call site.
-    """
+    """Return one flat config per algorithm, in `decoder.algorithm` order."""
     algorithms = dec_cfg["algorithm"]
     if isinstance(algorithms, str):
         algorithms = [algorithms]
@@ -425,12 +360,7 @@ def resolve_configs(dec_cfg: dict, source: str = "dict"):
 
 
 def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
-    """
-    Create decoder(s) from a '.decoder.yaml' file or a config dict.
-
-        create_decoder(yaml_path='bp_hx.decoder.yaml')
-        create_decoder(cfg={'algorithm': 'bp_norm_min_sum', ...})
-    """
+    """Create decoder(s) from a '.decoder.yaml' file or a config dict."""
     header = "decoder"
     func_name = "algorithm"
 
@@ -471,19 +401,6 @@ def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
 def _create_one_decoder(dec_cfg: dict, header: str, func_name: str, **kwargs):
     """Instantiate one decoder, picking the CUDA kernel implementation when the config
     asks for a CUDA device.
-
-    There is no separate ``*_cuda`` algorithm: each algorithm ``<algo>`` lives in
-    ``<algo>/<algo>.py`` (PyTorch, CPU or GPU) and, when a fused/per-step CUDA kernel
-    port exists, in ``<algo>/<algo>_cuda.py`` alongside it. If the decoder's
-    ``device.device_type`` is ``cuda`` and that ``<algo>_cuda.py`` exists, it is used;
-    otherwise the standard ``<algo>/<algo>.py`` module handles the run. Whether the
-    adaptive cap is active is decided purely by the presence of an ``rebatch_speedup``
-    block in the config — not by the algorithm name.
-
-    Set ``force_pytorch: true`` in the decoder config to skip the CUDA kernel port and
-    run the plain ``<algo>/<algo>.py`` PyTorch module even on a ``cuda`` device (eager
-    tensor ops on the GPU). This is the eager-vs-kernel baseline: same device, no custom
-    kernel, so a speedup against it isolates the kernel rather than CPU-vs-GPU.
     """
     algo = dec_cfg[func_name].lower()
     device_type = (dec_cfg.get("device") or {}).get("device_type", "cpu")

@@ -85,9 +85,6 @@ class BatchTracker:
 
     def record_error(self, err):
         """Append the ground-truth error batch, on the same axis its decodings are on.
-
-        A rounds axis is flattened into the batch axis, or replicated across rounds if
-        the error does not vary by round, to match what `record_decoder` stores.
         """
         err = err.to(self.device)
         err_base = 3 if self.number_channel > 1 else 2
@@ -104,7 +101,7 @@ class BatchTracker:
             self.e_all = self.ensure_buffer(err, dtype=err.dtype)
         self.e_all = torch.cat((self.e_all, err))
 
-    def record_decoder(self, decoder_idx, io_dict, elapsed):
+    def record_metric(self, decoder_idx, io_dict, elapsed):
         """Record one decoder's output for the current batch."""
         i = decoder_idx
         self.time_iter_all[i].append(elapsed)
@@ -140,11 +137,7 @@ class BatchTracker:
         )
 
     def keep_samples(self, mask):
-        """Restrict every per-sample buffer to the rows selected by `mask`.
-
-        Only buffers aligned with the full batch are sliced; ones a chained decoder
-        sized to a subset are left as-is.
-        """
+        """Restrict every per-sample buffer to the rows selected by `mask`."""
         mask = mask.to(self.device)
         n = mask.shape[0]
 
@@ -160,11 +153,7 @@ class BatchTracker:
 
 
 def _add_histogram(total, batch):
-    """Add one batch's iteration histogram to the run's, aligning them by bin.
-
-    Batches can hand back different lengths, so the shorter is zero-padded and the
-    run's histogram grows to the longest.
-    """
+    """Add one batch's iteration histogram to the run's, zero-padding to the longest."""
     # the first batch of a decoder lands on the 0.0 the run starts each histogram at
     if not torch.is_tensor(total):
         return batch
@@ -180,8 +169,7 @@ def _yaml_rate(rate):
     if isinstance(rate, (list, tuple)):
         values = [float(value) for value in rate]
         if len(values) == 3:
-            # the first two values are rates, the last is a count of them, and a count
-            # written as 9.0 reads as a rate that lost its decimals
+            # the last value is a count of rates, not a rate
             values[2] = int(rate[2])
         return values
     try:
@@ -190,13 +178,6 @@ def _yaml_rate(rate):
         return str(rate)
 
 
-# how each phase is written in `<stem>_result.yaml`: the block it sits under, then the
-# names of its two terms. Spelled out rather than abbreviated, and the terms carry the
-# phase rather than relying on the block, so a term stays unambiguous once it has been
-# read out of the file and no longer has its parent for context. The abbreviated
-# `train`/`val` stay the internal phase keys -- what `self.acc` and `self.phase` are
-# keyed by -- so this table is the only place the two spellings meet, and renaming a
-# block here cannot reach the accumulators.
 PHASE_YAML_NAMES = {
     "train": ("training", "training loss", "training error"),
     "val": ("validation", "validation loss", "validation error"),
@@ -204,11 +185,7 @@ PHASE_YAML_NAMES = {
 
 
 def _yaml_losses(history, phase):
-    """One phase's epoch means over the whole run, a column per term.
-
-    Only the objective and the class error, which any trained decoder has; a loss's own
-    breakdown stays in the epoch line, and so in `<stem>_train.log`.
-    """
+    """One phase's epoch means over the whole run, a column per term."""
     _, loss_name, error_name = PHASE_YAML_NAMES[phase]
     return {
         name: [float(entry[phase][key]) for entry in history]
@@ -220,15 +197,7 @@ def _yaml_losses(history, phase):
 
 
 def _train_stem(decoder):
-    """What every file a training run writes is named after: algo, check type, size.
-
-    A run directory holding one `<stem>_best.pt` cannot hold two configurations, so the
-    name carries what distinguishes them: the matrix's own shape, which the decoder reads
-    off `H` and can state exactly. A DEM run is named for its detector and fault counts,
-    a matrix run for its qubit count. Neither is named for a code distance: `n` does not
-    determine one (25 qubits is a rotated code at distance 5 and an unrotated one at
-    distance 4), so a distance in a filename would be a guess that outlives the run.
-    """
+    """What every file a training run writes is named after: algo, check type, size."""
     size = (
         f"dem{decoder.m}x{decoder.n}" if decoder.from_circuit_dem else f"n{decoder.n}"
     )
@@ -237,21 +206,6 @@ def _train_stem(decoder):
 
 def _train_fingerprint(cfg, decoder, batch_size, error_rate, H_file_name, loss):
     """The settings a resumed training run must still agree with: model, data, schedule.
-
-    Covers the same ground as `validate_checkpoint` does on the decode side -- which
-    parity-check matrix, at what physical error rate, in what dtype, on what device, on
-    what batch size -- plus what only a training run has: its schedule and its
-    objective. A run resumed under any of them changed would keep the curve and the
-    weights it loaded while measuring them against something else, so the mismatch is
-    refused instead. The device is held to as strictly as the rest, index included: what
-    a curve was produced on is part of what it is.
-
-    Each half is stated by whoever owns it rather than reached into: `MetricState` owns
-    the schedule and the batch size; the decoder owns what algorithm this is, what code
-    shape it was built for, what dtype and device it runs on and what optimizer it will
-    use; and the loss owns which objective this is and what weights its terms, the
-    `loss` block it keeps as `cfg`. A loss keeping no block is pinned by the module it
-    was loaded into instead, so no field is left uncovered.
     """
     # the objective's own settings, straight from the block that configured it
     loss_cfg = getattr(loss, "cfg", {"function": type(loss).__module__})
@@ -262,18 +216,13 @@ def _train_fingerprint(cfg, decoder, batch_size, error_rate, H_file_name, loss):
         "validation_batches": cfg["validation_batches"],
         "error_random_seed": cfg["error_random_seed"],
         "batch_size": batch_size,
-        # a training run's rate is a [lower, upper, points] sweep as often as a single
-        # level, and `_yaml_rate` is what both forms are already written as
+        # a rate is a [lower, upper, points] sweep as often as a single level
         "physical_error_rate": _yaml_rate(error_rate),
         "H_file_name": H_file_name,
         **{f"loss_{key}": value for key, value in loss_cfg.items()},
     }
 
 
-# `<stem>_result.yaml`'s `train_full` block, under the fingerprint's name for the same
-# setting. The file states them for a person to read and the fingerprint states them for
-# a comparison, so this is the one place the two vocabularies meet. A field the file
-# does not record is not listed and stays the `*_last.pt`'s to answer for.
 _TRAIN_YAML_SETUP = {
     "algorithm": "algo",
     "device": "device",
@@ -288,12 +237,7 @@ _TRAIN_YAML_SETUP = {
 
 
 def _yaml_train_setup(path):
-    """Read a training run's `-ckpt` result yaml back as fingerprint fields.
-
-    The `-t` counterpart of `load_checkpoint`'s `ckpt_meta`, and only that half of it:
-    the file is a finished run's report rather than its state, so what is read off it is
-    what the run was set up as, never where it got to. That comes from the `*_last.pt`.
-    """
+    """Read a training run's `-ckpt` result yaml back as fingerprint fields."""
     with open(path, "r") as f:
         try:
             data = yaml.safe_load(f)
@@ -310,20 +254,7 @@ def _yaml_train_setup(path):
 
 
 class MetricState:
-    """This run's metrics, in either mode syndrilla runs in.
-
-    A decode run meters per-decoder accuracy, timing and convergence; a training run
-    meters per-epoch loss and owns the schedule that decides which batch belongs to
-    which phase. The two halves are disjoint and only ever one is live, which `mode`
-    says. They are the same handful of steps either way -- build, begin the run,
-    accumulate a batch, average, report -- so the training half is the decode half's
-    method names with a `train_` in front, and nothing else. Build with
-    `MetricState(num_decoders, number_channel, device)` to decode, or with
-    `train_initial` to train.
-
-    The training half also owns the filtered <stem>_train.log sink, which takes only the
-    records this class tags and leaves the caller's own sinks alone.
-    """
+    """This run's metrics, in either mode syndrilla runs in."""
 
     # Names of scalar (per-decoder) fields
     _scalar_fields = [
@@ -343,10 +274,6 @@ class MetricState:
         "converge_fail",
         "converge_succ",
     ]
-
-    # which half is live. A class attribute as well as an instance one, so the
-    # `__new__`-built state in compute_avg_metrics() still answers the question.
-    mode = "decode"
 
     def __init__(self, num_decoders, number_channel, device):
         """Build the decode half; `train_initial` builds the training one."""
@@ -368,12 +295,183 @@ class MetricState:
         for field in self._channel_fields:
             setattr(self, field, [[0.0] * number_channel for _ in range(num_decoders)])
 
-    def update_metric(self, decoder_idx, batch_metrics):
-        """Add one batch's report_metric result for a decoder.
-
-        Per-sample rates are weighted by the batch's sample count; total_time and the
-        distribution are raw sums.
+    def report_metric(
+        self,
+        num_max_iter,
+        e_estimated,
+        e_actual,
+        iteration,
+        time_iteration,
+        check,
+        converge,
+        converge_next,
+        decode_idx,
+    ):
         """
+        This function reports the decoding iteration and accuracy.
+        Returns a dict of batch metrics.
+        """
+
+        logger.info(f"Reporting decoding metric for decoder {decode_idx}.")
+
+        sample_size = e_estimated.shape[0]
+        number_channel = e_actual.shape[1]
+        dtype = e_estimated.dtype
+        total_time = np.sum(time_iteration)
+        logger.info(f"Total time for <{sample_size}> samples: {total_time} seconds.")
+
+        if iteration.numel() == 0:
+            average_iter = 0.0
+            distribution = torch.zeros(num_max_iter + 1).to(e_estimated.device)
+        else:
+            distribution = (
+                torch.bincount((iteration - 1).int().flatten(), minlength=num_max_iter + 1)
+                .int()
+                .to(e_estimated.device)
+            )
+            average_iter = torch.mean(iteration).item()
+
+        logger.info(f"Average iterations per sample: {average_iter}")
+        logger.info(f"Maximum iterations: {distribution}")
+
+        if total_time == 0:
+            average_time_sample = 0
+            logger.info(f"Average time per sample: {average_time_sample} seconds.")
+
+            average_time_sample_iter = 0
+            logger.info(f"Average time per iteration: {average_time_sample_iter}")
+        else:
+            average_time_sample = total_time / sample_size
+            logger.info(f"Average time per sample: {average_time_sample} seconds.")
+
+            average_time_sample_iter = (average_time_sample / average_iter).item()
+            logger.info(f"Average time per iteration: {average_time_sample_iter}")
+
+        if torch.isinf(torch.sum(converge)) or torch.isnan(torch.sum(converge)):
+            invoke_rate = 1.0
+            logger.info(f"Decoder invoke rate: {invoke_rate}")
+        else:
+            if int(torch.sum(converge)) == 0:
+                invoke_rate = 1.0
+                logger.info(f"Decoder invoke rate: {invoke_rate}")
+            else:
+                invoke_rate = 1.0 - ((int(torch.sum(converge))) / sample_size)
+                logger.info(f"Decoder invoke rate: {invoke_rate}")
+
+        if e_actual.size(1) <= 1:
+            e_estimated = e_estimated.unsqueeze(1).expand(-1, e_actual.size(1), -1)
+        data_qubit_acc = torch.zeros([number_channel], dtype=dtype)
+        correction_acc = torch.zeros([number_channel], dtype=dtype)
+        data_frame_error_rate = torch.zeros([number_channel], dtype=dtype)
+        synd_frame_error_rate = torch.zeros([number_channel], dtype=dtype)
+        logical_error_rate = torch.zeros([number_channel], dtype=dtype)
+        converge_succ_rate = torch.zeros([number_channel], dtype=dtype)
+        converge_fail_rate = torch.zeros([number_channel], dtype=dtype)
+        for i in range(e_actual.size(1)):  # iterate over check_type
+            check_channel = check[:, i]
+            e_actual_channel = e_actual[:, i, :]
+            e_estimated_channel = e_estimated[:, i, :]
+            eq_i = e_estimated_channel == e_actual_channel
+            comp_i = torch.unique(eq_i, return_counts=True)[1]
+            if int(comp_i.shape[0]) == 1:
+                data_qubit_acc[i] = 1.0
+            else:
+                data_qubit_acc[i] = float(comp_i[1]) / (float(comp_i[1]) + float(comp_i[0]))
+
+            num_error = torch.sum(e_estimated_channel != e_actual_channel)
+
+            total_ones = torch.sum((e_estimated_channel == 1) | (e_actual_channel == 1))
+            if float(num_error) == 0:
+                correction_acc[i] = 1
+            else:
+                correction_acc[i] = 1 - float(num_error) / float(total_ones)
+
+            result = (e_estimated_channel == e_actual_channel).all(dim=1).int()
+            num_correct = (result == 1).sum()
+            num_incorrect = (result == 0).sum()
+            if int(result.shape[0]) == 1:
+                data_frame_error_rate[i] = 0.0
+            else:
+                data_frame_error_rate[i] = float(num_incorrect) / (
+                    float(num_incorrect) + float(num_correct)
+                )
+
+            if torch.isinf(torch.sum(converge_next)) or torch.isnan(
+                torch.sum(converge_next)
+            ):
+                synd_frame_error_rate[i] = 0
+            else:
+                if int(torch.sum(converge_next)) == 0:
+                    synd_frame_error_rate[i] = 0.0
+                else:
+                    synd_frame_error_rate[i] = (
+                        check_channel.size()[0] - int(torch.sum(converge_next))
+                    ) / (check_channel.size()[0])
+
+            if int(torch.sum(check_channel)) == 0:
+                logical_error_rate[i] = 0
+            else:
+                logical_error_rate[i] = int(torch.sum(check_channel)) / (
+                    check_channel.size()[0]
+                )
+
+            converge_fail = torch.where(
+                (check_channel == 1) & (converge_next == 1),
+                torch.tensor(1),
+                torch.tensor(0),
+            )
+            if int(torch.sum(converge_fail)) == 0:
+                converge_fail_rate[i] = 0
+            else:
+                converge_fail_rate[i] = int(torch.sum(converge_fail)) / (check.size()[0])
+
+            converge_succ = torch.where(
+                (check_channel == 0) & (converge_next == 1),
+                torch.tensor(1),
+                torch.tensor(0),
+            )
+            if int(torch.sum(converge_succ)) == 0:
+                converge_succ_rate[i] = 0
+            else:
+                converge_succ_rate[i] = int(torch.sum(converge_succ)) / (
+                    check_channel.size()[0]
+                )
+
+            for channel in range(number_channel):
+                logger.info(f"Channel {channel} metrics:")
+                logger.info(f"  Data qubit accuracy: {data_qubit_acc[channel]:.6f}")
+                logger.info(f"  Correction accuracy: {correction_acc[channel]:.6f}")
+                logger.info(
+                    f"  Data frame error rate: {data_frame_error_rate[channel]:.6f}"
+                )
+                logger.info(
+                    f"  Syndrome frame error rate: {synd_frame_error_rate[channel]:.6f}"
+                )
+                logger.info(f"  Logical error rate: {logical_error_rate[channel]:.6f}")
+                logger.info(f"  Converge failure rate: {converge_fail_rate[channel]:.6f}")
+                logger.info(f"  Converge success rate: {converge_succ_rate[channel]:.6f}")
+
+        return MetricResult(
+            {
+                "total_time": total_time,
+                "sample_size": sample_size,
+                "average_time_sample": average_time_sample,
+                "average_iter": average_iter,
+                "distribution": distribution,
+                "average_time_sample_iter": average_time_sample_iter,
+                "data_qubit_acc": data_qubit_acc,
+                "data_frame_error_rate": data_frame_error_rate,
+                "synd_frame_error_rate": synd_frame_error_rate,
+                "correction_acc": correction_acc,
+                "logical_error_rate": logical_error_rate,
+                "invoke_rate": invoke_rate,
+                "converge_fail": converge_fail_rate,
+                "converge_succ": converge_succ_rate,
+            }
+        )
+
+    def update_metric(self, decoder_idx, batch_metrics):
+        """Add one batch's report_metric result for a decoder."""
         i = decoder_idx
         ss = float(batch_metrics.get("sample_size", 1) or 1)
         self.total_samples[i] += ss
@@ -403,11 +501,8 @@ class MetricState:
 
         logger.info(f"Reporting decoding metric for decoder {i}.")
 
-        # per-sample rates were accumulated weighted by sample count -> divide by the
-        # total sample count. Fall back to num_batches for the legacy
-        # compute_avg_metrics() wrapper, which accumulates unweighted.
-        ts = getattr(self, "total_samples", None)
-        denom = ts[i] if (ts is not None and ts[i]) else num_batches
+        # per-sample rates were accumulated weighted by sample count
+        denom = self.total_samples[i] or num_batches
 
         total_time = self.total_time[i]
         average_time_batch = total_time / num_batches
@@ -460,11 +555,8 @@ class MetricState:
         return result
 
     def get_all_metrics(self, num_batches, algo_names, decoders=None):
-        """Compute averaged metrics for all decoders. Returns list of dicts for save_metric.
-
-        When a decoder uses rebatch_speedup, its warm-up batch count (and the chosen cap
-        percentile once warm-up has finished) is attached to that decoder's metrics from
-        its RebatchSpeedup ``cap``.
+        """Compute averaged metrics for all decoders. Returns list of dicts for
+        save_metric.
         """
         all_metrics = []
         for i in range(self.num_decoders):
@@ -484,6 +576,187 @@ class MetricState:
             all_metrics.append(avg)
         return all_metrics
 
+    def save_metric(
+        self,
+        out_dict,
+        curr_dir,
+        batch_size,
+        target_error,
+        dtype,
+        physical_error_rate,
+        num_batches,
+        error_reach,
+        file_name,
+        check_num,
+        done=0,
+    ):
+        """
+        Saves decoding metrics for all decoders into a single YAML file.
+
+        Parameters:
+            out_dict (list of dicts): each item is a dict with metric keys
+            curr_dir (str): directory path to save YAML
+            physical_error_rate (float or str): label for file naming
+        """
+
+        logger.info("Saving all decoding metrics to a YAML file.")
+
+        def float_representer(dumper, value):
+            return dumper.represent_scalar("tag:yaml.org,2002:float", f"{value:.17e}")
+
+        def list_representer(dumper, data):
+            return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
+
+        def format_time(value):
+            return f"{float(value):.17e}"
+
+        all_metrics_results = {}
+        total_time_sum = 0.0
+        all_check_types = ["hx", "hz"]
+        final_list = []
+
+        for i, decoder_metrics in enumerate(out_dict):
+            decoder_key = f"decoder_{i}"
+            raw_dist = decoder_metrics["distribution"].int().cpu()
+            iteration_count = raw_dist.numpy().tolist()
+
+            if done:
+                total = decoder_metrics["distribution"].sum()
+                cdf = torch.cumsum(decoder_metrics["distribution"], dim=0) / total
+                qs = torch.linspace(
+                    0.0, 1.0, 101, device=decoder_metrics["distribution"].device
+                )
+                indices = torch.searchsorted(cdf, qs, right=False)
+                distribution = (indices + 1).int().tolist()
+            else:
+                distribution = raw_dist.numpy().tolist()
+
+            total_time_sum += float(decoder_metrics["total_time"])
+            data_acc = decoder_metrics["data_qubit_acc"]
+            if not isinstance(data_acc, (list, tuple)):
+                data_acc = [data_acc]
+
+            check_list = []
+            for idx in range(len(data_acc)):
+                check_list.append(
+                    {
+                        "data qubit accuracy": float(
+                            decoder_metrics["data_qubit_acc"][idx]
+                            if isinstance(decoder_metrics["data_qubit_acc"], (list, tuple))
+                            else decoder_metrics["data_qubit_acc"]
+                        ),
+                        "data qubit correction accuracy": float(
+                            decoder_metrics["correction_acc"][idx]
+                            if isinstance(decoder_metrics["correction_acc"], (list, tuple))
+                            else decoder_metrics["correction_acc"]
+                        ),
+                        "data frame error rate": float(
+                            decoder_metrics["data_frame_error_rate"][idx]
+                            if isinstance(
+                                decoder_metrics["data_frame_error_rate"], (list, tuple)
+                            )
+                            else decoder_metrics["data_frame_error_rate"]
+                        ),
+                        "syndrome frame error rate": float(
+                            decoder_metrics["synd_frame_error_rate"][idx]
+                            if isinstance(
+                                decoder_metrics["synd_frame_error_rate"], (list, tuple)
+                            )
+                            else decoder_metrics["synd_frame_error_rate"]
+                        ),
+                        "logical error rate": float(
+                            decoder_metrics["logical_error_rate"][idx]
+                            if isinstance(
+                                decoder_metrics["logical_error_rate"], (list, tuple)
+                            )
+                            else decoder_metrics["logical_error_rate"]
+                        ),
+                        "converge failure rate": float(
+                            decoder_metrics["converge_fail_rate"][idx]
+                            if isinstance(
+                                decoder_metrics["converge_fail_rate"], (list, tuple)
+                            )
+                            else decoder_metrics["converge_fail_rate"]
+                        ),
+                        "converge success rate": float(
+                            decoder_metrics["converge_succ_rate"][idx]
+                            if isinstance(
+                                decoder_metrics["converge_succ_rate"], (list, tuple)
+                            )
+                            else decoder_metrics["converge_succ_rate"]
+                        ),
+                    }
+                )
+                final_list.append(
+                    {
+                        "logical error rate": float(
+                            decoder_metrics["logical_error_rate"][idx]
+                            if isinstance(
+                                decoder_metrics["logical_error_rate"], (list, tuple)
+                            )
+                            else decoder_metrics["logical_error_rate"]
+                        )
+                    }
+                )
+
+            check_types = (
+                [all_check_types[check_num]] if len(check_list) == 1 else ["hx", "hz"]
+            )
+            all_metrics_results[decoder_key] = {
+                "algorithm": decoder_metrics["algorithm"],
+                "decoder invoke rate": float(decoder_metrics["invoke_rate"]),
+                "average iteration": float(decoder_metrics["average_iter"]),
+                "sample count": int(round(float(decoder_metrics.get("sample_count", 0)))),
+                "iteration distribution": distribution,
+                "iteration count": iteration_count,
+            }
+            # rebatch_speedup (e.g. warmup batches) is reported before the timing fields.
+            if decoder_metrics.get("rebatch_speedup"):
+                all_metrics_results[decoder_key]["rebatch_speedup"] = decoder_metrics[
+                    "rebatch_speedup"
+                ]
+            all_metrics_results[decoder_key].update(
+                {
+                    "total time (s)": format_time(decoder_metrics["total_time"]),
+                    "average time per batch (s)": format_time(
+                        decoder_metrics["total_time"] / num_batches
+                    ),
+                    "average time per sample (s)": format_time(
+                        decoder_metrics["average_time_sample"]
+                    ),
+                    "average time per iteration (s)": format_time(
+                        decoder_metrics["average_time_sample_iter"]
+                    ),
+                }
+            )
+            for idx, check_name in enumerate(check_types[: len(check_list)]):
+                all_metrics_results[decoder_key][f"{check_name}"] = check_list[idx]
+
+        all_metrics_results["decoder_full"] = {
+            "batch size": batch_size,
+            "batch count": num_batches,
+            "target error": target_error,
+            "target error reached": error_reach,
+            "data type": dtype,
+            "physical error rate": physical_error_rate,
+            "total time (s)": format_time(total_time_sum),
+            "H matrix": file_name,
+        }
+        for idx, check_name in enumerate(check_types[: len(final_list)]):
+            all_metrics_results["decoder_full"][f"{check_name}"] = final_list[idx]
+
+        os.makedirs(curr_dir, exist_ok=True)
+        output_path = os.path.join(curr_dir, f"result_phy_err_{physical_error_rate}.yaml")
+
+        # Add custom representers for proper formatting
+        yaml.SafeDumper.add_representer(float, float_representer)
+        yaml.SafeDumper.add_representer(list, list_representer)
+
+        with open(output_path, "w") as f:
+            yaml.safe_dump(
+                all_metrics_results, f, sort_keys=False, default_flow_style=False
+            )
+
     @classmethod
     def resume_checkpoint(
         cls,
@@ -498,9 +771,6 @@ class MetricState:
         H_file_name,
     ):
         """Build this run's decode state, resuming from `checkpoint` if one was given.
-
-        Returns (metrics, num_err, num_batches). The `-t` counterpart is
-        `train_resume_checkpoint`.
         """
         if checkpoint is None:
             logger.info("No input Checkpoint file.")
@@ -637,10 +907,6 @@ class MetricState:
     @classmethod
     def train_initial(cls, cfg, run_dir, source):
         """Validate a training schedule and build a state whose training half is live.
-
-        The `-t` counterpart of `__init__`: what a training run is built from is its
-        schedule, not a decoder count. `cfg` is the schedule block itself, not the yaml
-        it came from; `source` only names that file in error messages.
         """
         logger.info(f"Reading training schedule from <{get_path(source)}>.")
         if cfg is None:
@@ -691,12 +957,7 @@ class MetricState:
         return state
 
     def train_bind_loss(self, loss):
-        """Key this run's metric columns by the term names the bound loss declares.
-
-        Call before any batch is accumulated: it decides how wide the accumulators are.
-        `train_resume_checkpoint` does it for a real run; a caller metering a loss on its own
-        calls it directly.
-        """
+        """Key this run's metric columns by the term names the bound loss declares."""
         names = tuple(getattr(loss, "term_names", ()))
         clashes = [name for name in names if name in self.KEYS]
         if clashes or len(set(names)) != len(names):
@@ -720,23 +981,8 @@ class MetricState:
         loss,
         H_file_name,
     ):
-        """Set the decoder up for this run, resume it if asked, and open the first batch.
-
-        The `-t` counterpart of `resume_checkpoint`: it binds what the run is metered on, starts
-        the `<stem>_train.log` sink and emits the run header, and resumes from
-        `checkpoint` if one was given. `loss` is asked what its terms are called and
-        what weights them; the loop, not this class, keeps calling it. The error model
-        and `H_file_name` are what the run's noise and code are recorded as, so a
-        resume can be held to them.
-
-        A resume arrives as the pair `main` refuses to split: `result_yaml` is the run's
-        `<stem>_result.yaml` and `checkpoint` the `<stem>_last.pt` it names. Both are
-        held to this run's fingerprint, the yaml over the setup it records and the
-        checkpoint over the whole of it, and the yaml goes first so a resume of the
-        wrong run is answered by the file a person can read. Everything restored is
-        restored from the checkpoint; the yaml is only ever read to be checked.
-
-        Returns the batch index the run picks up at, 0 for a fresh run.
+        """Set the decoder up for this run, resume it if asked, and open the first
+        batch.
         """
         decoder.configure_optimizer(self.epochs)
         rate = error_model.rate
@@ -795,12 +1041,7 @@ class MetricState:
         return start
 
     def train_load_checkpoint(self, path, device):
-        """Reload a run from its `*_last.pt` and report where it picked up.
-
-        The `-t` counterpart of `load_checkpoint`. Restores both halves: the decoder's
-        weights, optimizer, schedule and RNG, and the run position this class owns --
-        which epoch is next, which was best, and the curve so far.
-        """
+        """Reload a run from its `*_last.pt` and report where it picked up."""
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Training checkpoint not found: {path}")
         state = torch.load(path, map_location=device, weights_only=True)
@@ -826,22 +1067,7 @@ class MetricState:
         )
 
     def train_validate_checkpoint(self, saved, path, keys=None):
-        """Validate a checkpoint's fingerprint matches this run's settings.
-
-        The `-t` counterpart of `validate_checkpoint`: a checkpoint written under a
-        different model, code, noise, objective or schedule is refused rather than
-        silently resumed, and every field that moved is named, not just the first. The
-        comparison is driven by this run's fingerprint, so a checkpoint carrying a field
-        this run does not is not what stops it. A checkpoint carrying no value for a
-        field reads as `not recorded` rather than as one that happens to differ: what it
-        was trained under is unknown, not known to disagree.
-
-        `keys` narrows that to the fields the source it came from states. The
-        `*_last.pt` states the whole fingerprint and passes none, so it is held to all
-        of it; `-ckpt`'s result yaml is the run's report and records a part of it, and
-        holding a report to fields it was never written to carry would refuse every
-        resume rather than the ones that disagree.
-        """
+        """Validate a checkpoint's fingerprint matches this run's settings."""
         if saved is None:
             raise ValueError(
                 f"<{path}> carries no training fingerprint, so it cannot be resumed "
@@ -865,44 +1091,28 @@ class MetricState:
             )
 
     def train_set_hyperparameter(self, batch_index):
-        """Open a batch: seed the phase it starts, if it starts one, and enter that phase.
-
-        Puts the decoder into the matching train/eval mode and returns the phase, so
-        the phase a batch is metered as and the mode it runs in are one decision.
+        """Open a batch: seed the phase it starts, if it starts one, and enter that
+        phase.
         """
         position = batch_index % self.period
         if position == 0:
             # no epoch term: that is what makes each epoch train on the same batches
             torch.manual_seed(self.cfg["error_random_seed"] * 1_000_003)
         elif position == self.cfg["test_batches"]:
-            # offset well clear of the training seed so validation never replays its errors
+            # clear of the training seed so validation never replays its errors
             torch.manual_seed(
                 self.cfg["error_random_seed"] * 1_000_003 + 9_999_991 + self.epoch
             )
         self.phase = "train" if position < self.cfg["test_batches"] else "val"
         if self._decoder is not None:
-            # the module mode and the global grad switch are one decision: a validation
-            # batch that still built a graph would train on the wrong set
+            # module mode and the grad switch are one decision: a validation batch that
+            # still built a graph would train on the wrong set
             self._decoder.train(self.phase == "train")
             torch.set_grad_enabled(self.phase == "train")
         return self.phase
 
     def train_update_metric(self, batch_index, terms, class_err):
-        """Add one finished batch in, close the epoch if it ended one, open the next.
-
-        The `-t` counterpart of `update_metric`. `terms` is the total followed by one value
-        per name the bound loss declared, in that order -- `(total, *loss.terms(...))`.
-        They are detached on the way in, so holding them does not keep the batch's graph
-        alive. `batch_index` is how many batches the run has now done, so
-        `batch_index - 1` is the one being recorded and `batch_index` the one about to
-        be drawn.
-
-        Each batch also writes its own line to `<stem>_train.log`. The epoch line
-        reports what a phase averaged; these are the batches that average was taken
-        over, so a run that diverged partway through an epoch shows where rather than
-        only that it did. They go to the log file alone, never to stdout: a run writes
-        one per batch, and the console carries the epoch summaries.
-        """
+        """Add one finished batch in, close the epoch if it ended one, open the next."""
         expected = len(self.keys) - 1
         if len(terms) != expected:
             raise ValueError(
@@ -917,12 +1127,12 @@ class MetricState:
             phase[i] += value
         phase[-1] += float(class_err)
 
-        # `terms` is the total followed by the loss's own named terms, in that order
+        # `terms` is the total followed by the loss's own named terms
         breakdown = " ".join(
             f"{name}={value:.4f}" for name, value in zip(self.term_names, values[1:])
         )
-        # `batch_index` counts the batch just finished, so the one that closes an epoch
-        # sits at the end of that epoch rather than at the start of the next
+        # `batch_index` counts the batch just finished, so the one closing an epoch
+        # sits at its end rather than at the start of the next
         position = (batch_index - 1) % self.period + 1
         # a batch recorded before an optimizer is bound has no rate to report
         lr = "n/a" if self.lr is None else f"{self.lr:.2e}"
@@ -933,21 +1143,13 @@ class MetricState:
             f"err={float(class_err):.4f}"
         )
 
-        # a batch index that is a whole number of periods closes an epoch's train and
-        # validation phases together
+        # a whole number of periods closes both phases of an epoch together
         if batch_index % self.period == 0:
             self.train_compute_avg()
         self.train_set_hyperparameter(batch_index)
 
     def train_compute_avg(self):
-        """Close an epoch: step the schedule, average both phases, save and log.
-
-        The `-t` counterpart of `compute_avg`. Both checkpoints are written here, before
-        the epoch line is printed, so seeing the line means `<stem>_last.pt` for that
-        epoch is complete on disk. The decoder is only asked what its state is: its
-        `state_dict` for the weights a later run decodes from, `train_state` for the
-        optimizer, schedule and RNG a later run resumes from.
-        """
+        """Close an epoch: step the schedule, average both phases, save and log."""
         # once per epoch, not once per batch
         self._decoder.scheduler.step()
 
@@ -967,8 +1169,7 @@ class MetricState:
         self._epoch_start = now
 
         lr = self.lr
-        # the loss's own terms, named as it named them. A loss that declares none
-        # leaves the line reporting the total alone rather than an empty bracket
+        # a loss that declares no terms leaves the line reporting the total alone
         breakdown = " ".join(f"{name}={tr[name]:.4f}" for name in self.term_names)
         line = (
             f"epoch {self.epoch:4d}/{self.epochs}  lr={lr:.2e}  "
@@ -992,9 +1193,8 @@ class MetricState:
 
         stem = _train_stem(self._decoder)
         if is_best:
-            # weights only, in the form the decoder yaml's `checkpoint` key reads back:
-            # asked of the bare decoder, since a wrapper prefixes every key with the
-            # attribute holding it and those no longer load into a bare decoder
+            # weights only, asked of the bare decoder so the keys read back into one:
+            # a wrapper prefixes every key with the attribute holding it
             torch.save(
                 getattr(self._decoder, "decoder", self._decoder).state_dict(),
                 os.path.join(self.run_dir, f"{stem}_best.pt"),
@@ -1018,24 +1218,10 @@ class MetricState:
 
     def train_save_output_yaml(self):
         """Write `<stem>_result.yaml`: what the run is, then the run's curve by column.
-
-        The `-t` counterpart of `get_all_metrics`, which writes the file itself rather
-        than handing the metrics to `save_metric`. The curve is a column per term, every
-        list index-aligned with the `epoch` one, so `training['training loss'][i]`
-        belongs to epoch `epoch[i]`. Rewritten at every epoch boundary, so a run stopped
-        part way keeps the epochs it finished. Returns what it wrote.
-
-        The timings come from the recorded epoch times rather than the wall clock, so
-        they exclude setup and cover the whole of a resumed run; a batch there is a batch
-        of either phase. Only two epochs are written, the run's best and its last, which
-        is what a finished run is read for. Only the file is thinned, `self.history`
-        stays complete for a resume, and the summary above is computed over the whole
-        of it.
         """
         history = list(self.history)
         tail = history[-1:]
-        # the last epoch flagged `best` is the run's best: the flag means 'improved
-        # on everything before it', so later flags supersede earlier ones
+        # the last epoch flagged `best` is the run's best: later flags supersede earlier
         best_epoch = next((e for e in reversed(history) if e["best"]), None)
         if tail and best_epoch is not None and best_epoch["epoch"] < tail[0]["epoch"]:
             history = [best_epoch] + tail
@@ -1078,8 +1264,7 @@ class MetricState:
                 "best checkpoint": os.path.join(self.run_dir, f"{stem}_best.pt"),
                 "last checkpoint": os.path.join(self.run_dir, f"{stem}_last.pt"),
             },
-            # the curve itself, under a name that says what it is rather than what it
-            # is indexed by: its own `epoch` list is the index, one level down
+            # the curve itself; its own `epoch` list is the index, one level down
             "training result": epochs,
         }
         with open(os.path.join(self.run_dir, f"{stem}_result.yaml"), "w") as fh:
@@ -1093,11 +1278,7 @@ class MetricState:
         return result
 
     def train_save_checkpoint(self):
-        """Close the run out, drop the log sink, and report where its outputs landed.
-
-        The result yaml is rewritten once more here, so its `total time (s)` covers the
-        whole run rather than stopping at the last epoch boundary.
-        """
+        """Close the run out, drop the log sink, and report where its outputs landed."""
         stem = _train_stem(self._decoder)
         self.train_save_output_yaml()
         if self._sink_id is not None:
@@ -1117,442 +1298,3 @@ class MetricState:
             f"to continue this run, add to the same command:\n\n"
             f"  -ckpt {result_path} -tckpt {last_path}\n"
         )
-
-
-def report_metric(
-    num_max_iter,
-    e_estimated,
-    e_actual,
-    iteration,
-    time_iteration,
-    check,
-    converge,
-    converge_next,
-    decode_idx,
-):
-    """
-    This function reports the decoding iteration and accuracy.
-    Returns a dict of batch metrics.
-    """
-
-    logger.info(f"Reporting decoding metric for decoder {decode_idx}.")
-
-    sample_size = e_estimated.shape[0]
-    number_channel = e_actual.shape[1]
-    dtype = e_estimated.dtype
-    total_time = np.sum(time_iteration)
-    logger.info(f"Total time for <{sample_size}> samples: {total_time} seconds.")
-
-    if iteration.numel() == 0:
-        average_iter = 0.0
-        distribution = torch.zeros(num_max_iter + 1).to(e_estimated.device)
-    else:
-        distribution = (
-            torch.bincount((iteration - 1).int().flatten(), minlength=num_max_iter + 1)
-            .int()
-            .to(e_estimated.device)
-        )
-        average_iter = torch.mean(iteration).item()
-
-    logger.info(f"Average iterations per sample: {average_iter}")
-    logger.info(f"Maximum iterations: {distribution}")
-
-    if total_time == 0:
-        average_time_sample = 0
-        logger.info(f"Average time per sample: {average_time_sample} seconds.")
-
-        average_time_sample_iter = 0
-        logger.info(f"Average time per iteration: {average_time_sample_iter}")
-    else:
-        average_time_sample = total_time / sample_size
-        logger.info(f"Average time per sample: {average_time_sample} seconds.")
-
-        average_time_sample_iter = (average_time_sample / average_iter).item()
-        logger.info(f"Average time per iteration: {average_time_sample_iter}")
-
-    if torch.isinf(torch.sum(converge)) or torch.isnan(torch.sum(converge)):
-        invoke_rate = 1.0
-        logger.info(f"Decoder invoke rate: {invoke_rate}")
-    else:
-        if int(torch.sum(converge)) == 0:
-            invoke_rate = 1.0
-            logger.info(f"Decoder invoke rate: {invoke_rate}")
-        else:
-            invoke_rate = 1.0 - ((int(torch.sum(converge))) / sample_size)
-            logger.info(f"Decoder invoke rate: {invoke_rate}")
-
-    if e_actual.size(1) <= 1:
-        e_estimated = e_estimated.unsqueeze(1).expand(-1, e_actual.size(1), -1)
-    data_qubit_acc = torch.zeros([number_channel], dtype=dtype)
-    correction_acc = torch.zeros([number_channel], dtype=dtype)
-    data_frame_error_rate = torch.zeros([number_channel], dtype=dtype)
-    synd_frame_error_rate = torch.zeros([number_channel], dtype=dtype)
-    logical_error_rate = torch.zeros([number_channel], dtype=dtype)
-    converge_succ_rate = torch.zeros([number_channel], dtype=dtype)
-    converge_fail_rate = torch.zeros([number_channel], dtype=dtype)
-    for i in range(e_actual.size(1)):  # iterate over check_type
-        check_channel = check[:, i]
-        e_actual_channel = e_actual[:, i, :]
-        e_estimated_channel = e_estimated[:, i, :]
-        eq_i = e_estimated_channel == e_actual_channel
-        comp_i = torch.unique(eq_i, return_counts=True)[1]
-        if int(comp_i.shape[0]) == 1:
-            data_qubit_acc[i] = 1.0
-        else:
-            data_qubit_acc[i] = float(comp_i[1]) / (float(comp_i[1]) + float(comp_i[0]))
-
-        num_error = torch.sum(e_estimated_channel != e_actual_channel)
-
-        total_ones = torch.sum((e_estimated_channel == 1) | (e_actual_channel == 1))
-        if float(num_error) == 0:
-            correction_acc[i] = 1
-        else:
-            correction_acc[i] = 1 - float(num_error) / float(total_ones)
-
-        result = (e_estimated_channel == e_actual_channel).all(dim=1).int()
-        num_correct = (result == 1).sum()
-        num_incorrect = (result == 0).sum()
-        if int(result.shape[0]) == 1:
-            data_frame_error_rate[i] = 0.0
-        else:
-            data_frame_error_rate[i] = float(num_incorrect) / (
-                float(num_incorrect) + float(num_correct)
-            )
-
-        if torch.isinf(torch.sum(converge_next)) or torch.isnan(
-            torch.sum(converge_next)
-        ):
-            synd_frame_error_rate[i] = 0
-        else:
-            if int(torch.sum(converge_next)) == 0:
-                synd_frame_error_rate[i] = 0.0
-            else:
-                synd_frame_error_rate[i] = (
-                    check_channel.size()[0] - int(torch.sum(converge_next))
-                ) / (check_channel.size()[0])
-
-        if int(torch.sum(check_channel)) == 0:
-            logical_error_rate[i] = 0
-        else:
-            logical_error_rate[i] = int(torch.sum(check_channel)) / (
-                check_channel.size()[0]
-            )
-
-        converge_fail = torch.where(
-            (check_channel == 1) & (converge_next == 1),
-            torch.tensor(1),
-            torch.tensor(0),
-        )
-        if int(torch.sum(converge_fail)) == 0:
-            converge_fail_rate[i] = 0
-        else:
-            converge_fail_rate[i] = int(torch.sum(converge_fail)) / (check.size()[0])
-
-        converge_succ = torch.where(
-            (check_channel == 0) & (converge_next == 1),
-            torch.tensor(1),
-            torch.tensor(0),
-        )
-        if int(torch.sum(converge_succ)) == 0:
-            converge_succ_rate[i] = 0
-        else:
-            converge_succ_rate[i] = int(torch.sum(converge_succ)) / (
-                check_channel.size()[0]
-            )
-
-        for channel in range(number_channel):
-            logger.info(f"Channel {channel} metrics:")
-            logger.info(f"  Data qubit accuracy: {data_qubit_acc[channel]:.6f}")
-            logger.info(f"  Correction accuracy: {correction_acc[channel]:.6f}")
-            logger.info(
-                f"  Data frame error rate: {data_frame_error_rate[channel]:.6f}"
-            )
-            logger.info(
-                f"  Syndrome frame error rate: {synd_frame_error_rate[channel]:.6f}"
-            )
-            logger.info(f"  Logical error rate: {logical_error_rate[channel]:.6f}")
-            logger.info(f"  Converge failure rate: {converge_fail_rate[channel]:.6f}")
-            logger.info(f"  Converge success rate: {converge_succ_rate[channel]:.6f}")
-
-    return MetricResult(
-        {
-            "total_time": total_time,
-            "sample_size": sample_size,
-            "average_time_sample": average_time_sample,
-            "average_iter": average_iter,
-            "distribution": distribution,
-            "average_time_sample_iter": average_time_sample_iter,
-            "data_qubit_acc": data_qubit_acc,
-            "data_frame_error_rate": data_frame_error_rate,
-            "synd_frame_error_rate": synd_frame_error_rate,
-            "correction_acc": correction_acc,
-            "logical_error_rate": logical_error_rate,
-            "invoke_rate": invoke_rate,
-            "converge_fail": converge_fail_rate,
-            "converge_succ": converge_succ_rate,
-        }
-    )
-
-
-def save_metric(
-    out_dict,
-    curr_dir,
-    batch_size,
-    target_error,
-    dtype,
-    physical_error_rate,
-    num_batches,
-    error_reach,
-    file_name,
-    check_num,
-    done=0,
-):
-    """
-    Saves decoding metrics for all decoders into a single YAML file.
-
-    Parameters:
-        out_dict (list of dicts): each item is a dict with metric keys
-        curr_dir (str): directory path to save YAML
-        physical_error_rate (float or str): label for file naming
-    """
-
-    logger.info("Saving all decoding metrics to a YAML file.")
-
-    def float_representer(dumper, value):
-        return dumper.represent_scalar("tag:yaml.org,2002:float", f"{value:.17e}")
-
-    def list_representer(dumper, data):
-        return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
-
-    def format_time(value):
-        return f"{float(value):.17e}"
-
-    all_metrics_results = {}
-    total_time_sum = 0.0
-    all_check_types = ["hx", "hz"]
-    final_list = []
-
-    for i, decoder_metrics in enumerate(out_dict):
-        decoder_key = f"decoder_{i}"
-        raw_dist = decoder_metrics["distribution"].int().cpu()
-        iteration_count = raw_dist.numpy().tolist()
-
-        if done:
-            total = decoder_metrics["distribution"].sum()
-            cdf = torch.cumsum(decoder_metrics["distribution"], dim=0) / total
-            qs = torch.linspace(
-                0.0, 1.0, 101, device=decoder_metrics["distribution"].device
-            )
-            indices = torch.searchsorted(cdf, qs, right=False)
-            distribution = (indices + 1).int().tolist()
-        else:
-            distribution = raw_dist.numpy().tolist()
-
-        total_time_sum += float(decoder_metrics["total_time"])
-        data_acc = decoder_metrics["data_qubit_acc"]
-        if not isinstance(data_acc, (list, tuple)):
-            data_acc = [data_acc]
-
-        check_list = []
-        for idx in range(len(data_acc)):
-            check_list.append(
-                {
-                    "data qubit accuracy": float(
-                        decoder_metrics["data_qubit_acc"][idx]
-                        if isinstance(decoder_metrics["data_qubit_acc"], (list, tuple))
-                        else decoder_metrics["data_qubit_acc"]
-                    ),
-                    "data qubit correction accuracy": float(
-                        decoder_metrics["correction_acc"][idx]
-                        if isinstance(decoder_metrics["correction_acc"], (list, tuple))
-                        else decoder_metrics["correction_acc"]
-                    ),
-                    "data frame error rate": float(
-                        decoder_metrics["data_frame_error_rate"][idx]
-                        if isinstance(
-                            decoder_metrics["data_frame_error_rate"], (list, tuple)
-                        )
-                        else decoder_metrics["data_frame_error_rate"]
-                    ),
-                    "syndrome frame error rate": float(
-                        decoder_metrics["synd_frame_error_rate"][idx]
-                        if isinstance(
-                            decoder_metrics["synd_frame_error_rate"], (list, tuple)
-                        )
-                        else decoder_metrics["synd_frame_error_rate"]
-                    ),
-                    "logical error rate": float(
-                        decoder_metrics["logical_error_rate"][idx]
-                        if isinstance(
-                            decoder_metrics["logical_error_rate"], (list, tuple)
-                        )
-                        else decoder_metrics["logical_error_rate"]
-                    ),
-                    "converge failure rate": float(
-                        decoder_metrics["converge_fail_rate"][idx]
-                        if isinstance(
-                            decoder_metrics["converge_fail_rate"], (list, tuple)
-                        )
-                        else decoder_metrics["converge_fail_rate"]
-                    ),
-                    "converge success rate": float(
-                        decoder_metrics["converge_succ_rate"][idx]
-                        if isinstance(
-                            decoder_metrics["converge_succ_rate"], (list, tuple)
-                        )
-                        else decoder_metrics["converge_succ_rate"]
-                    ),
-                }
-            )
-            final_list.append(
-                {
-                    "logical error rate": float(
-                        decoder_metrics["logical_error_rate"][idx]
-                        if isinstance(
-                            decoder_metrics["logical_error_rate"], (list, tuple)
-                        )
-                        else decoder_metrics["logical_error_rate"]
-                    )
-                }
-            )
-
-        check_types = (
-            [all_check_types[check_num]] if len(check_list) == 1 else ["hx", "hz"]
-        )
-        all_metrics_results[decoder_key] = {
-            "algorithm": decoder_metrics["algorithm"],
-            "decoder invoke rate": float(decoder_metrics["invoke_rate"]),
-            "average iteration": float(decoder_metrics["average_iter"]),
-            "sample count": int(round(float(decoder_metrics.get("sample_count", 0)))),
-            "iteration distribution": distribution,
-            "iteration count": iteration_count,
-        }
-        # rebatch_speedup (e.g. warmup batches) is reported before the timing fields.
-        if decoder_metrics.get("rebatch_speedup"):
-            all_metrics_results[decoder_key]["rebatch_speedup"] = decoder_metrics[
-                "rebatch_speedup"
-            ]
-        all_metrics_results[decoder_key].update(
-            {
-                "total time (s)": format_time(decoder_metrics["total_time"]),
-                "average time per batch (s)": format_time(
-                    decoder_metrics["total_time"] / num_batches
-                ),
-                "average time per sample (s)": format_time(
-                    decoder_metrics["average_time_sample"]
-                ),
-                "average time per iteration (s)": format_time(
-                    decoder_metrics["average_time_sample_iter"]
-                ),
-            }
-        )
-        for idx, check_name in enumerate(check_types[: len(check_list)]):
-            all_metrics_results[decoder_key][f"{check_name}"] = check_list[idx]
-
-    all_metrics_results["decoder_full"] = {
-        "batch size": batch_size,
-        "batch count": num_batches,
-        "target error": target_error,
-        "target error reached": error_reach,
-        "data type": dtype,
-        "physical error rate": physical_error_rate,
-        "total time (s)": format_time(total_time_sum),
-        "H matrix": file_name,
-    }
-    for idx, check_name in enumerate(check_types[: len(final_list)]):
-        all_metrics_results["decoder_full"][f"{check_name}"] = final_list[idx]
-
-    os.makedirs(curr_dir, exist_ok=True)
-    output_path = os.path.join(curr_dir, f"result_phy_err_{physical_error_rate}.yaml")
-
-    # Add custom representers for proper formatting
-    yaml.SafeDumper.add_representer(float, float_representer)
-    yaml.SafeDumper.add_representer(list, list_representer)
-
-    with open(output_path, "w") as f:
-        yaml.safe_dump(
-            all_metrics_results, f, sort_keys=False, default_flow_style=False
-        )
-
-
-def compute_avg_metrics(
-    target_error,
-    i,
-    num_batches,
-    total_time_all,
-    average_time_sample_all,
-    average_iter_all,
-    distribution_all,
-    average_time_sample_iter_all,
-    data_qubit_acc,
-    data_frame_error_rate_all,
-    synd_frame_error_rate_all,
-    correction_acc_all,
-    logical_error_rate_all,
-    invoke_rate_all,
-    converge_fail_all,
-    converge_succ_all,
-):
-    """Backward-compatible wrapper. Prefer MetricState.compute_avg() for new code."""
-    state = MetricState.__new__(MetricState)
-    state.num_decoders = len(total_time_all)
-    state.number_channel = (
-        len(data_qubit_acc[0]) if isinstance(data_qubit_acc[0], (list, tuple)) else 1
-    )
-    state.total_time = total_time_all
-    state.average_time_sample = average_time_sample_all
-    state.average_iter = average_iter_all
-    state.distribution = distribution_all
-    state.average_time_sample_iter = average_time_sample_iter_all
-    state.invoke_rate = invoke_rate_all
-    state.data_qubit_acc = data_qubit_acc
-    state.data_frame_error_rate = data_frame_error_rate_all
-    state.synd_frame_error_rate = synd_frame_error_rate_all
-    state.correction_acc = correction_acc_all
-    state.logical_error_rate = logical_error_rate_all
-    state.converge_fail = converge_fail_all
-    state.converge_succ = converge_succ_all
-
-    result = state.compute_avg(i, num_batches)
-    return (
-        result["total_time"],
-        result["average_time_sample"],
-        result["average_iter"],
-        result["distribution"],
-        result["average_time_sample_iter"],
-        result["data_qubit_acc"],
-        result["data_frame_error_rate"],
-        result["synd_frame_error_rate"],
-        result["correction_acc"],
-        result["logical_error_rate"],
-        result["invoke_rate"],
-        result["converge_fail"],
-        result["converge_succ"],
-    )
-
-
-def load_checkpoint_yaml(path, number_channel):
-    """Backward-compatible wrapper. Prefer MetricState.load_checkpoint() for new code."""
-    state, meta = MetricState.load_checkpoint(path, number_channel, "cpu")
-    return (
-        state.total_time,
-        state.average_time_sample,
-        state.average_iter,
-        state.distribution,
-        state.average_time_sample_iter,
-        state.data_qubit_acc,
-        state.data_frame_error_rate,
-        state.synd_frame_error_rate,
-        state.correction_acc,
-        state.logical_error_rate,
-        state.invoke_rate,
-        state.converge_fail,
-        state.converge_succ,
-        meta["num_err"],
-        meta["batch_size"],
-        meta["target_error"],
-        meta["dtype"],
-        meta["physical_error_rate"],
-        meta["batch_count"],
-        meta["H_file_name"],
-    )

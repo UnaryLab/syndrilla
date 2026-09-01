@@ -1,26 +1,3 @@
-"""SAQ -- Stabilizer-Aware Quantum error correction decoder.
-
-PyTorch port of https://github.com/DavidZenati/SAQ-Decoder (Zenati & Nachmani,
-"SAQ: Stabilizer-Aware Quantum Error Correction Decoder", ICLR 2026, arXiv:2512.08914),
-adapted to the syndrilla decoder contract.
-
-SAQ is a *learned* decoder: one feed-forward pass maps a syndrome to an error estimate,
-so there is no message passing and no per-sample iteration count. `forward` chains the
-blocks of the paper's figure 1: `initial_embedding_layer` for stage 1 (dual token streams
-from the syndrome and a shallow logical prior), `SAQ_decoder_layer` for stage 2 (N transformer
-layers, topology-masked syndrome self-attention plus unrestricted S -> L cross-attention),
-then `output_layer` for stage 3 (the heads). Stage 4, CPND, is `project` and
-`nullspace_descent`, and runs at inference only.
-
-Samples whose estimate does not reproduce the measured syndrome are reported unconverged,
-so a chained decoder such as `osd_0` can retry them. The objective lives in
-`syndrilla/loss/logical_centric/` and reads the `llr`, `logical_logits` and
-`logical_prior` entries `forward` writes; trained weights come back through the
-`checkpoint` config key. Supported codes: toric and surface, rotated or not, plus
-circuit-level detector error models; nothing has to declare which, the decoder reads
-only the shape of the matrix it is handed.
-"""
-
 import copy
 import math
 
@@ -50,12 +27,7 @@ def _clones(module, n):
 
 
 def _rref_gf2(matrix):
-    """Reduced row echelon form over GF(2).
-
-    Returns `(R, T, pivots)` with `T @ matrix == R` (mod 2), `T` invertible, and
-    `pivots.size` the rank. Eliminates a whole column of rows per pivot, unlike
-    `syndrilla.utils.row_echelon`, whose Python loop is too slow at construction.
-    """
+    """Reduced row echelon form over GF(2)."""
     a = (np.asarray(matrix) % 2).astype(np.uint8)
     rows, cols = a.shape
     r = a.copy()
@@ -83,12 +55,7 @@ def _rref_gf2(matrix):
 
 
 def _right_inverse(H_hat):
-    """`B` of shape [n, r] with `H_hat @ B == I_r` over GF(2).
-
-    `R[:, P] = I` at the pivot columns makes `T = H_hat[:, P]^-1`, so scattering `T` into
-    the pivot rows of a zero matrix gives a right inverse. Raises rather than returning a
-    matrix that silently fails the identity.
-    """
+    """`B` of shape [n, r] with `H_hat @ B == I_r` over GF(2)."""
     _, t, pivots = _rref_gf2(H_hat)
     rows, cols = np.shape(H_hat)
     if pivots.size != rows:
@@ -104,9 +71,6 @@ def _right_inverse(H_hat):
 
 def _kernel_basis(H_hat):
     """Basis of `ker(H_hat)`, one basis vector per column of the returned [n, g] matrix.
-
-    The reduced-echelon generators, matching upstream: correct, but not minimal weight, so
-    the descent takes longer moves than the code's own plaquette/star stabilizers would.
     """
     r_mat, _, pivots = _rref_gf2(H_hat)
     n = np.shape(H_hat)[1]
@@ -119,10 +83,7 @@ def _kernel_basis(H_hat):
 
 
 def _logits_to_logical_bits(logits, k):
-    """Class logits [B, 2^k] -> the class's bit pattern [B, k], LSB first.
-
-    Inverse of the packing the logical-centric loss trains against.
-    """
+    """Class logits [B, 2^k] -> the class's bit pattern [B, k], LSB first."""
     index = logits.argmax(dim=1)
     shifts = torch.arange(k, device=index.device)
     return (index.unsqueeze(1) >> shifts) & 1
@@ -187,12 +148,7 @@ class SublayerConnection(nn.Module):
 
 
 class SLTDLayer(nn.Module):
-    """One Syndrome-Logical Transformer Decoder layer.
-
-    `x` is the stream being updated and `mem` supplies keys/values, so `mem is x` gives
-    self-attention and passing the syndrome stream gives S -> L cross-attention. Only the
-    query side is normalised, matching upstream.
-    """
+    """One Syndrome-Logical Transformer Decoder layer."""
 
     def __init__(self, size, self_attn, feed_forward, dropout):
         super(SLTDLayer, self).__init__()
@@ -212,7 +168,8 @@ class create(nn.Module):
     TRAIN_STATE_KEYS = ("state_dict", "optimizer", "scheduler")
 
     def __init__(self, decoder_cfg, **kwargs) -> None:
-        """
+        """Initialization for saq decoder.
+
         Input:
             decoder_cfg: the information that come from config file (yaml)
 
@@ -222,8 +179,6 @@ class create(nn.Module):
             cpnd:      enable (default True, forced off when training), passes (default 1)
             optimizer: lr / weight_decay / min_lr, read by `configure_optimizer`
             top level: check_type, dtype, device, checkpoint
-
-        Matrices arrive through the `bundle` kwarg, not the config.
         """
         super(create, self).__init__()
 
@@ -402,12 +357,7 @@ class create(nn.Module):
         logger.info("Complete.")
 
     def _build_cpnd(self, H_matrix, l_matrix):
-        """Precompute `[H; L]`, its right inverse, and the stabilizer moves.
-
-        All of it depends only on the code, so it is built once. Dropping the dependent
-        check rows is what lets `[H; L]` reach the full row rank the right inverse needs;
-        upstream hardcodes `H[:-1]` for toric, which only works for toric.
-        """
+        """Precompute `[H; L]`, its right inverse, and the stabilizer moves."""
         H_np = H_matrix.detach().cpu().numpy().astype(np.uint8) % 2
         L_np = l_matrix.detach().cpu().numpy().astype(np.uint8) % 2
 
@@ -449,12 +399,7 @@ class create(nn.Module):
         )
 
     def _build_masks(self, H_matrix, no_mask=False):
-        """Topology mask M_S plus the (unrestricted) logical cross-attention mask.
-
-        Two stabilizers are neighbours when they share a qubit, `(H H^T)_{ij} != 0`. The
-        global token at index 0 is connected to everything, which is what keeps long-range
-        information flowing. True = "suppress this attention entry".
-        """
+        """Topology mask M_S plus the (unrestricted) logical cross-attention mask."""
         if no_mask:
             self.register_buffer("src_mask_SN", None)
             self.register_buffer("src_mask_LN", None)
@@ -575,18 +520,7 @@ class create(nn.Module):
         return l_v, out_L
 
     def project(self, e_raw, syndrome, out_L):
-        """Stage 4a: map the hard decision onto the exactly-feasible operator.
-
-            e0 = B @ ([s ; logical] + H_hat @ e_raw) + e_raw   (mod 2)
-
-        which satisfies `H e = s` and `L e = class` because `H_hat B = I`. Only the
-        independent check rows constrain it; under perfect measurement the dropped rows
-        follow, and under noisy extraction a syndrome outside the image of `H` falls out
-        as unconverged when `forward` re-checks against the full matrix.
-
-        The GF(2) products run in float32 whatever the decoder dtype: a bfloat16
-        accumulator is exact only to 256, and these sums reach check degree times `n`.
-        """
+        """Stage 4a: map the hard decision onto the exactly-feasible operator."""
         logical_bits = _logits_to_logical_bits(out_L, self.k)
 
         work = torch.float32
@@ -599,17 +533,7 @@ class create(nn.Module):
         return e0.to(self.dtype)
 
     def nullspace_descent(self, e0, l_v):
-        """Stage 4b: lighten the operator without leaving its constraint coset.
-
-        A move along a basis vector changes the cost by `sum_{i in supp} sign_i * l_v_i`
-        with `sign_i = 1 - 2 e_i`, and is taken when that is negative. Sweeps accept only
-        strict decreases, so the objective is monotone and a sweep that changes nothing
-        ends the loop.
-
-        Upstream's `sign[mask][:, v] *= -1` is a no-op, since `sign[mask]` is a copy under
-        advanced indexing, leaving every later delta on stale signs; both `e` and `sign`
-        are written back explicitly here.
-        """
+        """Stage 4b: lighten the operator without leaving its constraint coset."""
         weights = l_v.detach()
         e = e0.to(torch.bool)
         one = torch.ones((), dtype=weights.dtype, device=weights.device)
@@ -632,23 +556,14 @@ class create(nn.Module):
         return e.to(self.dtype)
 
     def syndrome_estimation(self, e_v):
-        """`H @ e_v` over GF(2).
-
-        `V_c_col` is ragged-padded with the index `n`, so a zero dummy column is appended
-        and the padding contributes nothing to the parity.
-        """
+        """`H @ e_v` over GF(2)."""
         dummy = torch.zeros([e_v.size(0), 1], dtype=e_v.dtype, device=e_v.device)
         temp_e = torch.cat([e_v, dummy], dim=1)
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
         return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
 
     def configure_optimizer(self, epochs):
-        """Adam plus a cosine schedule over `epochs`, from this decoder's own config.
-
-        Both are stored on the decoder: the training loop steps `self.optimizer` per
-        batch and `self.scheduler` per epoch. Zeroing here gives every backward pass
-        clean gradients on entry, including the first.
-        """
+        """Adam plus a cosine schedule over `epochs`, from this decoder's own config."""
         lr = _require_number(self.lr, "lr")
         weight_decay = _require_number(self.weight_decay, "weight_decay")
         min_lr = _require_number(self.min_lr, "min_lr")
@@ -674,12 +589,7 @@ class create(nn.Module):
         }
 
     def train_state(self):
-        """Everything needed to resume a run, not just to decode one.
-
-        Adam's moments and the schedule position decide the next step's size and
-        direction, so weights alone warm-start rather than continue. Which `rng`
-        generators exist is a question about this decoder's device, so it is answered here.
-        """
+        """Everything needed to resume a run, not just to decode one."""
         if self.optimizer is None:
             raise ValueError(
                 "saq has no optimizer to save; call configure_optimizer() first."
@@ -695,12 +605,7 @@ class create(nn.Module):
         }
 
     def load_train_state(self, state):
-        """Restore what `train_state` saved, onto an already configured optimizer.
-
-        The error stream does not depend on the restored `rng`, since
-        `MetricState.train_set_hyperparameter` reseeds at every phase boundary; what is restored
-        is the rest of the generator state, for anything resuming mid-epoch.
-        """
+        """Restore what `train_state` saved, onto an already configured optimizer."""
         if self.optimizer is None:
             raise ValueError(
                 "saq cannot resume before configure_optimizer(); there is no optimizer "

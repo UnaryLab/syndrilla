@@ -11,7 +11,7 @@ from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.metric import BatchTracker, MetricState, report_metric, save_metric
+from syndrilla.metric import BatchTracker, MetricState
 from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
@@ -103,7 +103,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 io_dict = decoders[decoder_idx](io_dict)
                 elapsed = time.time() - start_time
 
-                bt.record_decoder(decoder_idx, io_dict, elapsed)
+                bt.record_metric(decoder_idx, io_dict, elapsed)
 
             logger.success('\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------')
 
@@ -121,23 +121,23 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 bt.e_v_all = [t.unsqueeze(1).expand(-1, number_channel, -1) for t in bt.e_v_all]
                 check = [t.unsqueeze(1).expand(-1, number_channel) for t in check]
             for i in range(num_decoders):
-                batch_result = report_metric(num_max_iter[i], bt.e_all, bt.e_v_all[i], bt.iter_all[i],
-                                             bt.time_iter_all[i], check[i], bt.converge_all[i],
-                                             bt.converge_all[i + 1], i)
+                batch_result = metrics.report_metric(num_max_iter[i], bt.e_all, bt.e_v_all[i], bt.iter_all[i],
+                                                     bt.time_iter_all[i], check[i], bt.converge_all[i],
+                                                     bt.converge_all[i + 1], i)
                 metrics.update_metric(i, batch_result)
 
             if num_batches % 100 == 0:
                 logger.success('\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------')
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name)
-                save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                            error_model.rate, num_batches, num_err, H_file_name, check_num)
+                metrics.save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
+                                    error_model.rate, num_batches, num_err, H_file_name, check_num)
                 logger.success(f'Saved log to <{output_log}>.')
                 logger.success(f'Saved metric results to <{run_dir}>.')
 
     logger.success('\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------')
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)
-    save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
+    metrics.save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
+                        error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
     logger.success(f'Saved log to <{output_log}>.')
     logger.success(f'Saved metric results to <{run_dir}>.')
 

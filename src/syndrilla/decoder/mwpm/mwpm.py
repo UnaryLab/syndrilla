@@ -1904,7 +1904,7 @@ class create(torch.nn.Module):
         # hard-decision `<=0 -> 1` stays consistent; MWPM carries no real LLR).
         llr = (1.0 - 2.0 * e_v_t).to(device=dev, dtype=dt)
         converge = torch.ones(B, dtype=torch.int64, device=dev)
-        # Report at least one iteration: metric.report_metric histograms (iter - 1),
+        # Report at least one iteration: MetricState.report_metric histograms (iter - 1),
         # which must stay non-negative (a trivial all-zero syndrome matches 0 defects).
         iters_t = torch.from_numpy(iters).clamp(min=1).to(device=dev)
 

@@ -15,8 +15,6 @@ from syndrilla.matrix import load_matrices
 from syndrilla.metric import (
     BatchTracker,
     MetricState,
-    report_metric,
-    save_metric,
 )
 from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import ExtraQueue, bcolors, get_path, parse_device_dtype, read_yaml
@@ -240,9 +238,6 @@ def main():
         # decoder output, so the checker is never built
         logical_check = None if args.train else create_check(args.logical_yaml)
 
-    # a swept rate is refused by the error model and the measurer themselves, from the
-    # `training` flag they were built with, so there is nothing to re-check here
-
     error_model.rounds = getattr(syndrome_generator, "rounds", 1)
 
     num_decoders = len(decoders)
@@ -250,20 +245,13 @@ def main():
     decoder_device = decoders[0].device
 
     number_channel = error_model.number_channel
-    # the first stage is the one handed the raw syndrome, so its channel count is the
-    # one the error model has to agree with; later stages see whatever it produced.
-    # Checked here rather than left to the sampler, where a mismatch surfaced as
-    # `Size does not match at dimension 2 expected index [200, 1, 20, 4]...` from
-    # inside an index op, naming neither the error model nor the decoder
     expected_channel = 2 if getattr(decoders[0], "_base_synd_ndim", 2) == 3 else 1
     if number_channel != expected_channel:
         # the interface path builds the error model itself, so there may be no -e to name
         source = args.error_yaml or f"<{args.interface_yaml}>'s error model"
         raise ValueError(
             f"Error model <{source}> has <{number_channel}> channel(s), but "
-            f"decoder <{decoders[0].algo}> decodes <{expected_channel}>. Pair a "
-            f"2-channel model such as <depol> with a 2-channel decoder such as <bp4>, "
-            f"or a 1-channel model such as <bsc> with a 1-channel decoder."
+            f"decoder <{decoders[0].algo}> decodes <{expected_channel}>. "
         )
     check_type = decoder_cfg.get("check_type", "hx")
     shape, _, _, _ = bundle.Hx_matrix.get_index()
@@ -329,7 +317,15 @@ def main():
         logger.success(
             "\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
         )
-        bt = BatchTracker(num_decoders, number_channel, shape, dtype, decoder_device)
+        # training reads its loss straight off the decoder and skips Steps 9-11, so
+        # there is nothing for it to buffer
+        bt = (
+            None
+            if args.train
+            else BatchTracker(
+                num_decoders, number_channel, shape, dtype, decoder_device
+            )
+        )
 
         # predict_pct offload scheduler: decide WHEN to re-decode the deferred queue
         do_flush, flushing = queue.should_flush(num_err)
@@ -356,7 +352,8 @@ def main():
 
         num_err_before_batch = num_err
         for err, llr, _ in error_dataloader:
-            bt.record_error(err)
+            if bt is not None:
+                bt.record_error(err)
 
             logger.success(
                 "\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------"
@@ -376,14 +373,9 @@ def main():
                 start_time = time.time()
                 io_dict = decoders[decoder_idx](io_dict)
 
-                # the trained stage is the chain's last one, so the loss is read off the
-                # output of that stage, after every earlier stage has run
                 if args.train and decoder_idx == num_decoders - 1:
                     terms = loss_fn.terms(io_dict, err)
                     total = loss_fn.combine(*terms)
-                    # the mode `train_set_hyperparameter` put the decoder in is the answer to
-                    # whether this batch takes a step; a validation batch is built with
-                    # grad off, so backward on it would raise instead of being skipped
                     if decoders[decoder_idx].training:
                         total.backward()
                         decoders[decoder_idx].optimizer.step()
@@ -395,7 +387,8 @@ def main():
                     )
                     break
                 elapsed = time.time() - start_time
-                bt.record_decoder(decoder_idx, io_dict, elapsed)
+                if bt is not None:
+                    bt.record_metric(decoder_idx, io_dict, elapsed)
 
             if args.train:
                 continue  # Steps 9-11 check logical errors, which training does not
@@ -443,7 +436,7 @@ def main():
                 ]
                 check = [t.unsqueeze(1).expand(-1, number_channel) for t in check]
             for i in range(num_decoders):
-                batch_result = report_metric(
+                batch_result = metrics.report_metric(
                     num_max_iter[i],
                     bt.e_all,
                     bt.e_v_all[i],
@@ -461,7 +454,7 @@ def main():
                     "\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
                 )
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
-                save_metric(
+                metrics.save_metric(
                     all_metrics,
                     args.run_dir + "/",
                     args.batch_size,
@@ -487,7 +480,7 @@ def main():
         "\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------"
     )
     all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
-    save_metric(
+    metrics.save_metric(
         all_metrics,
         args.run_dir + "/",
         args.batch_size,
