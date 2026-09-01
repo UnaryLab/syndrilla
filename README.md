@@ -100,95 +100,31 @@ Following is a table for detailed explaination on each command line arguments:
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/alist/perfect.syndrome.yaml`         |
 | `-m`     | Path to matrix YAML file                     | `-m=examples/alist/surface_10.matrix.yaml`        |
 | `-i`     | Path to interface YAML file, replacing `-m`/`-e`/`-s`/`-c` | `-i=examples/stim/stim_generated.interface.yaml` |
-| `-ckpt`  | Path to checkpoint YAML file to resume | `-ckpt=tests/test_outputs/result_phy_err_0.1.yaml` |
+| `-ckpt`  | Path to checkpoint YAML file to resume; with `-t`, the training run's `*_result.yaml`, given alongside its `-tckpt` | `-ckpt=tests/test_outputs/result_phy_err_0.1.yaml` |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
 | `-te`    | Total number of errors to stop decoding      | `-te=1000`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-ls`    | Path to loss YAML file                       | `-ls=examples/alist/logical_centric.loss.yaml`    |
-| `-tckpt` | Path to a run's `*_last.pt`, to resume training | `-tckpt=tests/test_outputs/saq_hx_n41_last.pt` |
+| `-tckpt` | Path to a run's `*_last.pt`, to resume training; given alongside the same run's `-ckpt` | `-tckpt=tests/test_outputs/saq_hx_n41_last.pt` |
 
 #### Training a learned decoder (`-t`)
-
-Learned decoders (currently `saq`) need trained weights. `-t` trains the decoder given by `-d` and writes its two checkpoints, its result file and its log into `-r` (default `tests/test_outputs`, the same directory decode runs write to), all four named after the configuration that produced them (`<algorithm>_<check_type>_<size>`, where `<size>` is the matrix's qubit count `n<qubits>`, or `dem<detectors>x<mechanisms>` for a circuit-level DEM run), so two configurations in one run directory do not overwrite each other:
+Besides the fixed decoding algorithms above, Syndrilla supports AI decoder models, which learn their parameters from data (currently ```saq```).
+Adding ```-t``` trains the decoder given by ```-d``` instead of decoding with it, supervised by the loss YAML passed with ```-ls```, and writes the trained weights into ```-r```:
 
 ```command
-syndrilla -t
-          -r=tests/test_outputs
-          -d=examples/alist/train_saq_hx.decoder.yaml
-          -m=examples/alist/surface_5.matrix.yaml
-          -e=examples/alist/bsc_train.error.yaml
-          -s=examples/alist/perfect.syndrome.yaml
-          -ls=examples/alist/logical_centric.loss.yaml
+syndrilla -t 
+          -r=tests/test_outputs 
+          -d=examples/alist/train_saq_hx.decoder.yaml 
+          -m=examples/alist/surface_5.matrix.yaml 
+          -e=examples/alist/bsc_train.error.yaml 
+          -s=examples/alist/perfect.syndrome.yaml 
+          -ls=examples/alist/logical_centric.loss.yaml 
           -bs=256
 ```
 
-Then point the decoder YAML's `config.checkpoint` key at `tests/test_outputs/saq_hx_n41_best.pt` and run the normal command above to evaluate.
-
-**The run's log (`<stem>_train.log`).** Written at two granularities: an indented line per batch carrying the learning rate it ran at and the loss it produced, and an epoch line summarising the batches above it. The console shows the epoch lines alone, since a run writes one batch line per batch:
-
-```
-  batch    1/5  epoch    1/2  train  lr=5.00e-04  loss=2.6372 (lc=1.7743 lp=0.8609 ent=0.6907)  err=0.7031
-  batch    4/5  epoch    1/2  val    lr=5.00e-04  loss=2.0701 (lc=1.2145 lp=0.7947 ent=0.6966)  err=0.2812
-epoch    1/2  lr=5.00e-04  train_loss=3.6136 (lc=2.7552 lp=0.8195 ent=0.6945)  val_loss=2.4910  val_err=0.3828  0.3s  <- best
-```
-
-The batch counter runs over the whole period, `test_batches` training batches then `validation_batches` validation ones, and the `train`/`val` column says which of the epoch line's two averages a batch fed.
-
-**The run's results (`<stem>_result.yaml`).** `-t` writes `tests/test_outputs/saq_hx_n41_result.yaml` alongside the checkpoints, the `-t` counterpart of a decode run's `result_phy_err_<rate>.yaml` and the same two-part shape: a `train_full` summary block naming the run (algorithm, `model parameters` (the decoder's trainable weight count, not a seed: the run's seed is its own `error random seed` key), device, dtype, physical error rate in the form it was configured, a swept range's point count included, batch size, schedule, `error random seed`, `best validation error` and the epoch it came from, what the run cost, and the paths to both checkpoints, `best checkpoint` and `last checkpoint`), then the two epochs a finished run is read for, the best and the last, stored by column under `training result`:
-
-```yaml
-training result:
-  epoch: [7, 12]                      # the run's best epoch, then its last
-  learning rate: [0.0002505, 9.5015e-06]
-  time (s): [0.0388, 0.0454]
-  best: [true, false]
-  training:
-    training loss: [1.1736, 1.1249]
-    training error: [0.2578, 0.2266]
-  validation:
-    validation loss: [1.0618, 1.4991]
-    validation error: [0.171875, 0.328125]
-```
-
-Every list is index-aligned with the `epoch` list, so entry `i` of each belongs to epoch `epoch[i]`. The two collapse to a single entry when the last epoch is itself the best, and `epochs_saved` below widens the tail when more of the curve is wanted. Each phase carries a loss and a class error named for that phase (`training loss` and `training error` under `training`, `validation loss` and `validation error` under `validation`), the two terms any trained decoder reports. A loss that splits its total further names the parts itself (`logical_centric` names them `lc`, `lp` and `ent`), and those go to the epoch line, and so to `<stem>_train.log`, rather than here, so this file stays readable the same way whichever loss a run was trained under. It is rewritten at every epoch boundary, so a run stopped part way still leaves behind the epochs it finished.
-
-The summary also reports what the run cost, the way a decode result file does:
-
-```yaml
-  total time (s): 340.09              # wall clock of this invocation, setup included
-  total epoch time (s): 338.71        # summed over the epochs, restored across a resume
-  average time per epoch (s): 3.3871
-  average time per batch (s): 0.015396
-  average time per sample (s): 6.0142e-05
-```
-
-The averages divide the summed epoch time, not the wall clock: the wall clock carries the decoder build and the matrix load, and after a `-tckpt` resume it covers only the epochs since the resume, while the epoch times are restored with the history. A batch is a batch of either phase, so an epoch holds `test_batches + validation_batches` of them.
-
-The best and the last are what a finished run is read for, but a run being watched may want more of the curve, so the schedule takes an optional `epochs_saved` that widens the tail:
-
-```yaml
-    train:
-      epochs: 100000
-      test_batches: 200
-      validation_batches: 20
-      error_random_seed: 42
-      epochs_saved: 50     # write the last 50 epochs, plus the best one
-```
-
-The result yaml then carries the most recent `epochs_saved` epochs instead of the last one alone, still plus the run's best epoch wherever it fell, since that is the epoch `<stem>_best.pt` holds and the summary's `best epoch index` names. The summary reports both numbers separately: `epochs` is the schedule and `epochs saved` the width, which appears only when the key is set. `<stem>_last.pt` is never thinned, so a resumed run still restores the whole curve and the width can be raised or lowered between runs. Leave the key out and the file carries the best and the last.
-
-**Resuming an interrupted run (`-tckpt`).** The `*_last.pt` file is rewritten at every epoch boundary and holds the whole training state: weights, Adam's moments, the cosine schedule's position, the epoch counter, the best score so far, the history, and the generator state. The error stream is reseeded at each phase boundary from the run's `seed`: the training phase gets the same seed every epoch, so training runs on a fixed set of batches, while validation gets a fresh one each epoch. Either way a batch's errors depend on where the run is, not on how it got there. Add `-tckpt` to the same command to continue from it, leaving every other flag as it was:
-
-```command
-syndrilla -t -tckpt=tests/test_outputs/saq_hx_n41_last.pt
-          -r=tests/test_outputs
-          ... the same -d, -m, -e, -s, -ls and -bs as above
-```
-
-The run continues exactly where it stopped, not from a warm start: a run interrupted after epoch 20 and resumed finishes with the same weights a 100-epoch run would have reached uninterrupted. Because that guarantee depends on the settings being unchanged, the `*_last.pt` file also stores a fingerprint of them (schedule, batch size, code shape, optimizer settings), and resuming with any of them changed fails with a message naming the field rather than silently producing a different run. The `<name>_best.pt` file stays a bare `state_dict` for decoding and sharing; only `*_last.pt` carries the extra state, and both still load through the decoder YAML's `config.checkpoint` key.
-
-Training needs `-d`, `-m`, `-e`, `-s` and `-ls`, takes its batch size from `-bs`, and writes into `-r`. It builds no logical check, so `-c` and `-te` are unused, and `-ckpt` resumes a *decode* run and should not be passed alongside `-t` (`-tckpt` is its training counterpart). `-i` replaces `-m`/`-e`/`-s` here as it does for decoding, so a learned decoder trains on circuit-level data from a stim circuit with the same command and `-ls` still naming the loss; see [Interface module](docs/interface.md) for what supervises it and how its noise is swept. Training hyperparameters come from three files: the decoder YAML holds the optimizer settings (`lr`, `weight_decay`, `min_lr`) under `config.optimizer` and the schedule (`epochs`, `test_batches`, `validation_batches`, `error_random_seed`, and the optional `epochs_saved`) under `config.train`, the `-ls` YAML holds the loss weights (`lambda_lc`, `lambda_lp`, `lambda_ent`) under its `loss` key, and the error YAML holds the physical error rates, where a training run may give `rate` as a range (`rate: [0.01, 0.20, 9]`, the last value being the number of levels) so one run covers the whole curve rather than a single point; the phenomenological measurer sweeps its `measurement_error_rate` the same way. Errors and syndromes come from the same error model and syndrome measurer that decoding uses.
+Point the decoder YAML's ```config.checkpoint``` key at the trained weights and the normal command above evaluates them.
+See [Decoder module](docs/decoder.md) for the training loop, its configuration, its outputs, and how an interrupted run is resumed.
 
 ### 2. Input format and configurations
 <table>
@@ -332,6 +268,8 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.config`       | Algorithm-specific settings (e.g. `max_iter`, or a learned decoder's `checkpoint`). A mapping configures the first algorithm; a list gives one entry per entry of `decoder.algorithm` | `max_iter: 181`             |
 
 The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoder.config`. Written as a plain mapping, as above, it configures the first algorithm, so `max_iter` reaches `bp_norm_min_sum` and `osd_0`, which takes no settings of its own, runs on its defaults. Written as a list it is matched to `decoder.algorithm` by position, which is how a chain configures a stage other than its first. Keys left at the old top level are rejected with a message naming the block they moved into. See [Decoder module](docs/decoder.md) for the full rule.
+
+An AI decoder trained with ```-t``` reads its optimizer settings and epoch schedule from the same block, under ```decoder.config.optimizer``` and ```decoder.config.train```; a decode run ignores both and loads ```decoder.config.checkpoint``` instead. See [Decoder module](docs/decoder.md) for the key list.
 
 When `decoder.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This covers every registered decoder except `saq`: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
 
@@ -517,6 +455,8 @@ syndrilla -r=tests/test_outputs
           -te=1000
           -ckpt=tests/test_outputs/result_phy_err_0.1.yaml
 ```
+
+A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to the run's ```*_result.yaml``` and ```-tckpt``` to its ```*_last.pt```, with every other flag left as it was; either flag without the other is refused. See [Decoder module](docs/decoder.md).
 
 ### 5. Sweep configurations
 Syndrilla also allows sweeping configurations during simulation, which is done in the ```zoo``` folder.

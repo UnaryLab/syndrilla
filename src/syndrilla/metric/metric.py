@@ -235,13 +235,26 @@ def _train_stem(decoder):
     return f"{decoder.algo}_{decoder.check_type}_{size}"
 
 
-def _train_fingerprint(cfg, decoder, batch_size):
-    """The settings a resumed training run must still agree with: model, plus schedule.
+def _train_fingerprint(cfg, decoder, batch_size, error_rate, H_file_name, loss):
+    """The settings a resumed training run must still agree with: model, data, schedule.
 
-    `MetricState` owns the schedule and the batch size; what algorithm this is, what
-    code shape it was built for and what optimizer it will use are the decoder's to
-    state, so the two halves are merged rather than reached into.
+    Covers the same ground as `validate_checkpoint` does on the decode side -- which
+    parity-check matrix, at what physical error rate, in what dtype, on what device, on
+    what batch size -- plus what only a training run has: its schedule and its
+    objective. A run resumed under any of them changed would keep the curve and the
+    weights it loaded while measuring them against something else, so the mismatch is
+    refused instead. The device is held to as strictly as the rest, index included: what
+    a curve was produced on is part of what it is.
+
+    Each half is stated by whoever owns it rather than reached into: `MetricState` owns
+    the schedule and the batch size; the decoder owns what algorithm this is, what code
+    shape it was built for, what dtype and device it runs on and what optimizer it will
+    use; and the loss owns which objective this is and what weights its terms, the
+    `loss` block it keeps as `cfg`. A loss keeping no block is pinned by the module it
+    was loaded into instead, so no field is left uncovered.
     """
+    # the objective's own settings, straight from the block that configured it
+    loss_cfg = getattr(loss, "cfg", {"function": type(loss).__module__})
     return {
         **decoder.train_fingerprint(),
         "epochs": cfg["epochs"],
@@ -249,7 +262,51 @@ def _train_fingerprint(cfg, decoder, batch_size):
         "validation_batches": cfg["validation_batches"],
         "error_random_seed": cfg["error_random_seed"],
         "batch_size": batch_size,
+        # a training run's rate is a [lower, upper, points] sweep as often as a single
+        # level, and `_yaml_rate` is what both forms are already written as
+        "physical_error_rate": _yaml_rate(error_rate),
+        "H_file_name": H_file_name,
+        **{f"loss_{key}": value for key, value in loss_cfg.items()},
     }
+
+
+# `<stem>_result.yaml`'s `train_full` block, under the fingerprint's name for the same
+# setting. The file states them for a person to read and the fingerprint states them for
+# a comparison, so this is the one place the two vocabularies meet. A field the file
+# does not record is not listed and stays the `*_last.pt`'s to answer for.
+_TRAIN_YAML_SETUP = {
+    "algorithm": "algo",
+    "device": "device",
+    "data type": "dtype",
+    "physical error rate": "physical_error_rate",
+    "batch size": "batch_size",
+    "epochs": "epochs",
+    "training batches count": "test_batches",
+    "validation batches count": "validation_batches",
+    "error random seed": "error_random_seed",
+}
+
+
+def _yaml_train_setup(path):
+    """Read a training run's `-ckpt` result yaml back as fingerprint fields.
+
+    The `-t` counterpart of `load_checkpoint`'s `ckpt_meta`, and only that half of it:
+    the file is a finished run's report rather than its state, so what is read off it is
+    what the run was set up as, never where it got to. That comes from the `*_last.pt`.
+    """
+    with open(path, "r") as f:
+        try:
+            data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML format: {e}")
+    full = (data or {}).get("train_full")
+    if not isinstance(full, dict):
+        raise ValueError(
+            f"<{path}> carries no `train_full` block, so it is not a training run's "
+            f"result yaml. `-ckpt` takes the `<stem>_result.yaml` the run being resumed "
+            f"wrote; a decode run's `decoder_full` yaml is not one."
+        )
+    return {key: full[name] for name, key in _TRAIN_YAML_SETUP.items() if name in full}
 
 
 class MetricState:
@@ -661,23 +718,42 @@ class MetricState:
         self.acc = {"train": [0.0] * len(self.keys), "val": [0.0] * len(self.keys)}
 
     def train_resume_checkpoint(
-        self, decoder, batch_size, checkpoint, device, error_model, loss
+        self,
+        decoder,
+        batch_size,
+        checkpoint,
+        result_yaml,
+        device,
+        error_model,
+        loss,
+        H_file_name,
     ):
         """Set the decoder up for this run, resume it if asked, and open the first batch.
 
         The `-t` counterpart of `resume_checkpoint`: it binds what the run is metered on, starts
         the `<stem>_train.log` sink and emits the run header, and resumes from
-        `checkpoint` if one was given. `loss` is only asked what its terms are called;
-        the loop, not this class, keeps calling it.
+        `checkpoint` if one was given. `loss` is asked what its terms are called and
+        what weights them; the loop, not this class, keeps calling it. The error model
+        and `H_file_name` are what the run's noise and code are recorded as, so a
+        resume can be held to them.
+
+        A resume arrives as the pair `main` refuses to split: `result_yaml` is the run's
+        `<stem>_result.yaml` and `checkpoint` the `<stem>_last.pt` it names. Both are
+        held to this run's fingerprint, the yaml over the setup it records and the
+        checkpoint over the whole of it, and the yaml goes first so a resume of the
+        wrong run is answered by the file a person can read. Everything restored is
+        restored from the checkpoint; the yaml is only ever read to be checked.
 
         Returns the batch index the run picks up at, 0 for a fresh run.
         """
         decoder.configure_optimizer(self.epochs)
+        rate = error_model.rate
         # the decoder and the fingerprint this run's checkpoints are made of
         self._decoder = decoder
-        self._fingerprint = _train_fingerprint(self.cfg, decoder, batch_size)
+        self._fingerprint = _train_fingerprint(
+            self.cfg, decoder, batch_size, rate, H_file_name, loss
+        )
         self.train_bind_loss(loss)
-        rate = error_model.rate
         params = int(sum(p.numel() for p in decoder.parameters()))
         self.run_meta = {
             "algorithm": decoder.algo,
@@ -688,6 +764,16 @@ class MetricState:
             "batch size": batch_size,
         }
         resume_line, start = "fresh run", 0
+        if result_yaml is not None:
+            if not os.path.isfile(result_yaml):
+                raise FileNotFoundError(
+                    f"Training result yaml not found: {result_yaml}"
+                )
+            self.train_validate_checkpoint(
+                _yaml_train_setup(result_yaml),
+                result_yaml,
+                keys=_TRAIN_YAML_SETUP.values(),
+            )
         if checkpoint is not None:
             resume_line = self.train_load_checkpoint(checkpoint, device)
             # batches consumed by the epochs already recorded
@@ -747,11 +833,22 @@ class MetricState:
             f"best validation error {self.best:.4f}"
         )
 
-    def train_validate_checkpoint(self, saved, path):
+    def train_validate_checkpoint(self, saved, path, keys=None):
         """Validate a checkpoint's fingerprint matches this run's settings.
 
         The `-t` counterpart of `validate_checkpoint`: a checkpoint written under a
-        different model or schedule is refused rather than silently resumed.
+        different model, code, noise, objective or schedule is refused rather than
+        silently resumed, and every field that moved is named, not just the first. The
+        comparison is driven by this run's fingerprint, so a checkpoint carrying a field
+        this run does not is not what stops it. A checkpoint carrying no value for a
+        field reads as `not recorded` rather than as one that happens to differ: what it
+        was trained under is unknown, not known to disagree.
+
+        `keys` narrows that to the fields the source it came from states. The
+        `*_last.pt` states the whole fingerprint and passes none, so it is held to all
+        of it; `-ckpt`'s result yaml is the run's report and records a part of it, and
+        holding a report to fields it was never written to carry would refuse every
+        resume rather than the ones that disagree.
         """
         if saved is None:
             raise ValueError(
@@ -759,9 +856,14 @@ class MetricState:
                 f"from. It holds weights only; point the decoder yaml's `checkpoint` "
                 f"key at it to decode, or start a fresh run."
             )
+        fields = self._fingerprint
+        if keys is not None:
+            wanted = set(keys)
+            fields = {key: value for key, value in fields.items() if key in wanted}
         changed = [
-            f"{key}: checkpoint <{saved.get(key)}> vs now <{value}>"
-            for key, value in self._fingerprint.items()
+            f"{key}: checkpoint <{saved[key] if key in saved else 'not recorded'}> "
+            f"vs now <{value}>"
+            for key, value in fields.items()
             if saved.get(key) != value
         ]
         if changed:
@@ -1016,15 +1118,17 @@ class MetricState:
             self._sink_id = None
         best_path = os.path.join(self.run_dir, f"{stem}_best.pt")
         last_path = os.path.join(self.run_dir, f"{stem}_last.pt")
+        result_path = os.path.join(self.run_dir, f"{stem}_result.yaml")
         print(
             f"\ndone in {time.time() - self.start:.1f}s. "
             f"best validation error {self.best:.4f}"
         )
         print(f"checkpoints: {best_path}, {last_path}")
-        print(f"result: {os.path.join(self.run_dir, f'{stem}_result.yaml')}")
+        print(f"result: {result_path}")
         print(f"\nadd to the decoder yaml to use it:\n\n  checkpoint: {best_path}\n")
         print(
-            f"to continue this run, add to the same command:\n\n  -tckpt {last_path}\n"
+            f"to continue this run, add to the same command:\n\n"
+            f"  -ckpt {result_path} -tckpt {last_path}\n"
         )
 
 

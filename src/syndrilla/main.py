@@ -57,7 +57,7 @@ def parse_commandline_args():
         "--checkpoint_yaml",
         type=str,
         default=None,
-        help="Path to checkpoint result yaml to resume from.",
+        help="Path to checkpoint result yaml to resume from. With -t, the training run's <stem>_result.yaml, which is resumed alongside its -tckpt.",
     )
     parser.add_argument(
         "-bs",
@@ -140,9 +140,15 @@ def main():
             "checkpoint, put its path under the decoder yaml's `checkpoint` key."
         )
 
-    if args.train and args.checkpoint_yaml is not None:
+    if args.train and (args.checkpoint_yaml is None) != (args.train_checkpoint is None):
+        given, missing = (
+            ("-tckpt", "-ckpt <run>_result.yaml")
+            if args.checkpoint_yaml is None
+            else ("-ckpt", "-tckpt <run>_last.pt")
+        )
         raise ValueError(
-            "-ckpt resumes a decode run; a training run resumes with -tckpt."
+            f"Resuming a training run takes both of its checkpoints, but {given} was "
+            f"given without {missing}. Both were printed by the run that wrote them."
         )
 
     required = [("-d", "decoder_yaml")]
@@ -154,9 +160,6 @@ def main():
             ("-ls", "loss_yaml") if args.train else ("-c", "logical_yaml"),
         ]
     elif args.train:
-        # the interface supplies the matrix, error model and measurer, but not the
-        # objective: which loss supervises the run is the run's own choice, exactly as
-        # it is on the -m path
         required += [("-ls", "loss_yaml")]
     missing = [flag for flag, name in required if getattr(args, name) is None]
     if missing:
@@ -295,9 +298,11 @@ def main():
             decoders[-1],
             args.batch_size,
             args.train_checkpoint,
+            args.checkpoint_yaml,
             decoder_device,
             error_model,
             loss_fn,
+            H_file_name,
         )
     else:
         metrics, num_err, num_batches = MetricState.resume_checkpoint(

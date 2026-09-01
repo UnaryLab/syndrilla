@@ -1216,7 +1216,9 @@ def test_train_metrics_take_back_epoch_best_and_history(tmp_path):
         "error_random_seed": 0,
     }
     metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
-    metrics._decoder = _Decoder()  # what `train_resume_checkpoint` binds, without the run
+    metrics._decoder = (
+        _Decoder()
+    )  # what `train_resume_checkpoint` binds, without the run
     metrics._fingerprint = {"epochs": 4}
 
     path = tmp_path / "hand_over_last.pt"
@@ -1454,9 +1456,7 @@ def test_neighbouring_run_seeds_do_not_share_streams(tmp_path):
             "validation_batches": 1,
             "error_random_seed": seed,
         }
-        return _sequence(
-            MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML), 0
-        )
+        return _sequence(MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML), 0)
 
     assert not torch.equal(train_draw(7), train_draw(8))
 
@@ -1600,7 +1600,12 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     assert partial["epoch"] == 4
 
     finished = _run_cli(
-        resumed_dir, *_train_argv(decoder_yaml, f"-tckpt={resumed_dir / LAST_PT}")
+        resumed_dir,
+        *_train_argv(
+            decoder_yaml,
+            f"-ckpt={resumed_dir / RESULT_YAML}",
+            f"-tckpt={resumed_dir / LAST_PT}",
+        ),
     )
     assert finished.returncode == 0, finished.stderr
 
@@ -1632,9 +1637,65 @@ def test_resume_rejects_a_changed_schedule(tmp_path):
         test_batches=5,
         validation_batches=1,
     )
-    result = _run_cli(tmp_path, *_train_argv(changed, f"-tckpt={tmp_path / LAST_PT}"))
+    result = _run_cli(
+        tmp_path,
+        *_train_argv(
+            changed, f"-ckpt={tmp_path / RESULT_YAML}", f"-tckpt={tmp_path / LAST_PT}"
+        ),
+    )
     assert result.returncode != 0
     assert "test_batches" in result.stderr
+
+
+def test_resume_rejects_a_changed_setup(tmp_path):
+    """A resume must be held to what the run was measured on, not only its schedule.
+
+    The `-t` counterpart of what `validate_checkpoint` refuses a decode checkpoint on:
+    a different parity-check matrix, physical error rate or dtype. A training run adds
+    its objective to that list. Any of them changed and the loaded curve and weights
+    would go on being accumulated against something else, so each must stop the run and
+    name the field that moved. One trained checkpoint, four ways of not matching it.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=2, validation_batches=1
+    )
+    assert _run_cli(tmp_path, *_train_argv(decoder_yaml)).returncode == 0
+
+    # a narrower sweep than the shipped [0.01, 0.20, 9]
+    error_yaml = tmp_path / "narrow.error.yaml"
+    error_cfg = _plain(read_yaml(get_path(TRAIN_ERROR_YAML)))
+    error_cfg["error"]["rate"] = [0.05, 0.20, 9]
+    error_yaml.write_text(yaml.safe_dump(error_cfg))
+
+    dtype_yaml = tmp_path / "float64.decoder.yaml"
+    decoder_cfg = yaml.safe_load(decoder_yaml.read_text())
+    decoder_cfg["decoder"]["dtype"] = "float64"
+    dtype_yaml.write_text(yaml.safe_dump(decoder_cfg))
+
+    loss_yaml = tmp_path / "reweighted.loss.yaml"
+    loss_cfg = _plain(read_yaml(get_path(LOSS_YAML)))
+    loss_cfg["loss"]["lambda_lp"] = 0.5
+    loss_yaml.write_text(yaml.safe_dump(loss_cfg))
+
+    for field, override in (
+        ("physical_error_rate", f"-e={error_yaml}"),
+        ("dtype", f"-d={dtype_yaml}"),
+        ("loss_lambda_lp", f"-ls={loss_yaml}"),
+        ("H_file_name", f"-m={TORIC_MATRIX_YAML}"),
+    ):
+        # the override goes last, so argparse reads it over the same flag `_train_argv`
+        # already set
+        result = _run_cli(
+            tmp_path,
+            *_train_argv(
+                decoder_yaml,
+                f"-ckpt={tmp_path / RESULT_YAML}",
+                f"-tckpt={tmp_path / LAST_PT}",
+                override,
+            ),
+        )
+        assert result.returncode != 0, f"{field} was resumed rather than refused"
+        assert field in result.stderr, result.stderr
 
 
 def test_resume_needs_training_mode(tmp_path):
@@ -1654,6 +1715,80 @@ def test_resume_needs_training_mode(tmp_path):
     )
     assert result.returncode != 0
     assert "-tckpt" in result.stderr
+
+
+@pytest.mark.parametrize("given, missing", [("-ckpt", "-tckpt"), ("-tckpt", "-ckpt")])
+def test_resume_needs_both_checkpoints(tmp_path, given, missing):
+    """A training run resumes on the pair or on neither, never on half of it.
+
+    `-tckpt` is where the run got to and `-ckpt` is what it was run as. Accepting one
+    alone would resume against half of what a resume is checked against, so the flag
+    that was left out is named rather than defaulted to.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=2, validation_batches=1
+    )
+    assert _run_cli(tmp_path, *_train_argv(decoder_yaml)).returncode == 0
+
+    path = tmp_path / (RESULT_YAML if given == "-ckpt" else LAST_PT)
+    result = _run_cli(tmp_path, *_train_argv(decoder_yaml, f"{given}={path}"))
+    assert result.returncode != 0
+    assert missing in result.stderr, result.stderr
+
+
+def test_resume_checks_the_result_yaml_it_was_given(tmp_path):
+    """`-ckpt` is validated in its own right, not carried along by a matching `-tckpt`.
+
+    The yaml records the setup and the `*_last.pt` records the setup and the state, so
+    a pair naming two different runs is caught only if the yaml is held to this run
+    too. Here the checkpoint is this run's and the yaml is another run's, which is the
+    one arrangement the `*_last.pt` check cannot see.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=2, validation_batches=1
+    )
+    assert _run_cli(tmp_path, *_train_argv(decoder_yaml)).returncode == 0
+
+    other_dir = tmp_path / "other"
+    other_yaml = _write_decoder_yaml(
+        tmp_path / "other.decoder.yaml", epochs=2, test_batches=3, validation_batches=1
+    )
+    assert _run_cli(other_dir, *_train_argv(other_yaml)).returncode == 0
+
+    result = _run_cli(
+        tmp_path,
+        *_train_argv(
+            decoder_yaml,
+            f"-ckpt={other_dir / RESULT_YAML}",
+            f"-tckpt={tmp_path / LAST_PT}",
+        ),
+    )
+    assert result.returncode != 0
+    assert "test_batches" in result.stderr, result.stderr
+
+
+def test_resume_refuses_a_yaml_that_is_not_a_training_result(tmp_path):
+    """A decode run's result yaml under `-ckpt` must be named as the wrong file.
+
+    Both modes write a `-r` yaml and only the training one carries `train_full`, so
+    the one that cannot describe a training run is refused by what it is missing.
+    """
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=2, validation_batches=1
+    )
+    assert _run_cli(tmp_path, *_train_argv(decoder_yaml)).returncode == 0
+
+    decode_yaml = tmp_path / "decode_result.yaml"
+    decode_yaml.write_text(yaml.safe_dump({"decoder_full": {"batch size": 16}}))
+
+    result = _run_cli(
+        tmp_path,
+        *_train_argv(
+            decoder_yaml, f"-ckpt={decode_yaml}", f"-tckpt={tmp_path / LAST_PT}"
+        ),
+    )
+    assert result.returncode != 0
+    assert "train_full" in result.stderr, result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1754,12 +1889,14 @@ def test_train_cli_does_not_train_on_a_batch_shape_saq_cannot_learn_from(tmp_pat
 
 
 def test_decoder_describes_itself_in_the_resume_fingerprint():
-    """The model half of the fingerprint must come from the decoder, not the metrics.
+    """Each half of the fingerprint must come from whoever owns it, not the metrics.
 
     `MetricState` owns the schedule and the batch size; what algorithm this is, what
-    code shape it was built for, and what optimizer settings it will use are the
-    decoder's to state. The metrics merge the two rather than reaching into the model.
+    code shape it was built for, what dtype and device it runs on and what optimizer
+    settings it will use are the decoder's to state, and what weights the objective is
+    the loss's. The metrics merge the halves rather than reaching into either.
     """
+    from syndrilla.loss import create_loss
     from syndrilla.metric.metric import _train_fingerprint
 
     _, saq = _make_decoder(SURFACE_MATRIX_YAML)
@@ -1769,6 +1906,8 @@ def test_decoder_describes_itself_in_the_resume_fingerprint():
         "n": saq.n,
         "m": saq.m,
         "k": saq.k,
+        "dtype": str(saq.dtype),
+        "device": str(saq.device),
         "lr": saq.lr,
         "weight_decay": saq.weight_decay,
         "min_lr": saq.min_lr,
@@ -1780,11 +1919,21 @@ def test_decoder_describes_itself_in_the_resume_fingerprint():
         "validation_batches": 1,
         "error_random_seed": 0,
     }
-    merged = _train_fingerprint(cfg, saq, batch_size=16)
+    loss = create_loss(LOSS_YAML, decoder=saq)
+    merged = _train_fingerprint(
+        cfg, saq, 16, [0.01, 0.20, 9], "/codes/surface_5.hx.alist", loss
+    )
     # every model key survives the merge, and the schedule half is added to it
     assert merged.items() >= model.items()
     assert merged["batch_size"] == 16
     assert all(merged[k] == v for k, v in cfg.items())
+    # what the run decodes, and at what noise: the same ground the decode side's
+    # `validate_checkpoint` holds a resumed run to
+    assert merged["H_file_name"] == "/codes/surface_5.hx.alist"
+    assert merged["physical_error_rate"] == [0.01, 0.20, 9]
+    # and the objective: which loss it is, and the block that weights its terms
+    assert merged["loss_function"] == "logical_centric"
+    assert merged["loss_lambda_lp"] == loss.lambda_lp
 
 
 # --------------------------------------------------------------------------- #

@@ -433,7 +433,7 @@ class create(nn.Module):
             persistent=False,
         )
 
-        # nullspace_descent support 
+        # nullspace_descent support
         self.cpnd_supports = [
             torch.as_tensor(
                 np.flatnonzero(basis[:, j]), dtype=torch.long, device=self.device
@@ -666,6 +666,8 @@ class create(nn.Module):
             "n": self.n,
             "m": self.m,
             "k": self.k,
+            "dtype": str(self.dtype),
+            "device": str(self.device),
             "lr": self.lr,
             "weight_decay": self.weight_decay,
             "min_lr": self.min_lr,

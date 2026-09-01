@@ -43,7 +43,7 @@ Following is a table for detailed explaination on each command line arguments:
 | `-bs`    | Number of samples in each batch              | `-bs=1000`                                        |
 | `-te`    | Total number of errors to stop decoding      | `-te=100`                                         |
 | `-l`     | Level of logger, default `INFO`              | `-l=SUCCESS`                                      |
-| `-ckpt`  | Path to a checkpoint YAML file to resume a decode run; a training run resumes with `-tckpt` instead, and passing `-ckpt` with `-t` is rejected rather than ignored. The stim path derives its physical error rate from the circuit's DEM, so the filename reflects that value rather than a rate you set | `-ckpt=<run dir>/result_phy_err_<rate>.yaml` |
+| `-ckpt`  | Path to a checkpoint YAML file to resume a decode run. With `-t` it is the training run's `<stem>_result.yaml` and is given together with that run's `-tckpt`; either of the two alone is rejected rather than ignored. The stim path derives its physical error rate from the circuit's DEM, so the filename reflects that value rather than a rate you set | `-ckpt=<run dir>/result_phy_err_<rate>.yaml` |
 
 `-i` derives the matrix and logical-check matrices from the circuit, so `-m` and `-c` are not used. It also makes `-e` and `-s` optional, leaving `-d` as the only required flag; supply them anyway when you want to set noise rates or rounds, since both are still read when present. Training (`-t`) works on the interface path too, and needs `-ls` for the objective, which the interface does not supply; see [decoder.md](decoder.md) for the training flags and [Training on the stim path](#3-training-on-the-stim-path) below.
 

@@ -107,6 +107,9 @@ class create:
         # the RoundFlattenWrapper forwards unknown attributes, but bind to the inner
         # module so `logic_matrix`, `device` and `dtype` resolve directly
         self.decoder = getattr(decoder, "decoder", decoder)
+        # the block this loss was built from, so `metric._train_fingerprint` can hold a
+        # resumed run to the objective it was trained under
+        self.cfg = dict(loss_cfg)
         self.lambda_lc = float(loss_cfg.get("lambda_lc", 1.0))
         self.lambda_lp = float(loss_cfg.get("lambda_lp", 0.2))
         self.lambda_ent = float(loss_cfg.get("lambda_ent", 1.0))
