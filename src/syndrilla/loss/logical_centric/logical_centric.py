@@ -1,15 +1,3 @@
-"""Logical-centric loss for the saq decoder (SAQ paper, Sec. "Logical-Centric Loss").
-
-Supervises the logical class rather than the error bit pattern, so degenerate solutions
-differing by a stabilizer are not penalised. Reads the `llr`, `logical_logits` and
-`logical_prior` entries the decoder writes into its io_dict, so it is coupled to that
-output contract rather than to any one decoder's internals.
-
-Not an nn.Module: it has no learnable parameters, and assigning the decoder to an
-nn.Module attribute would register the whole decoder as a submodule of the loss, putting
-the decoder's parameters into `loss.parameters()` and `loss.state_dict()`.
-"""
-
 import torch
 import torch.nn.functional as F
 
@@ -54,25 +42,6 @@ def _diff_GF2_mul(H, x):
 
 def _parity_llr(H, llr):
     """LLR of the GF(2) parity of `llr`'s bits over each column's support.
-
-    Input `llr` is `[B, n]`, positive meaning the bit is 0; `H` is `[n, k]` in {0, 1}.
-    Returns `[B, k]`, positive meaning that column's parity is 0.
-
-    The parity of independent bits is exactly `2*atanh(prod_i tanh(llr_i / 2))` over the
-    support, which is `_diff_GF2_mul` rewritten in the log domain. Taken literally that
-    is no better conditioned than the product: the magnitude is `exp(sum_i log|tanh|)`,
-    and with a support of 36 mechanisms on a circuit-level detector error model the sum
-    reaches -272, so both the value and its gradient underflow float32 to exactly zero.
-    The loss then reports a constant `ln 2` and trains nothing, which is self-sustaining:
-    a per-bit llr nothing supervises stays at 0, and an llr of 0 is what drives the sum
-    that far down.
-
-    So the magnitude is the standard max-log (min-sum) approximation of that sum,
-    `min_i |llr_i|`, the same one belief propagation's check node uses. It agrees with
-    the exact form to the extent one bit dominates, is an upper bound otherwise, and its
-    gradient is O(1) on the least certain bit in the support rather than exponentially
-    small in the support's size. The sign is exact: a parity flips with the parity of
-    the negative llrs, which no approximation touches.
     """
     mask = H.t().unsqueeze(0).to(llr.dtype)  # [1, k, n]
     x = llr.unsqueeze(1)  # [B, 1, n]
@@ -81,8 +50,6 @@ def _parity_llr(H, llr):
     negatives = (x < 0).to(llr.dtype) * mask
     sign = bin_to_sign(negatives.sum(dim=-1) % 2)  # [B, k]
 
-    # magnitude: min over the support. Bits outside it are held at +inf, the identity
-    # for a min, which is also their exact contribution (an llr of +inf is a certain 0)
     outside = llr.new_tensor(float("inf"))
     magnitude = torch.where(mask.bool(), x.abs(), outside)  # [B, k, n]
     return sign * magnitude.min(dim=-1).values
@@ -90,11 +57,6 @@ def _parity_llr(H, llr):
 
 class create:
     """The three-term logical-centric objective, bound to the decoder it supervises."""
-
-    # what this loss splits its total into, one name per value `terms` returns, in that
-    # order. The metric module meters and logs whatever a loss declares here and knows
-    # none of these names itself, so a loss with a different decomposition names its own
-    # and one whose total has no parts worth logging declares `()`.
     term_names = ("lc", "lp", "ent")
 
     def __init__(self, loss_cfg, **kwargs) -> None:
@@ -104,11 +66,7 @@ class create:
                 "Loss <logical_centric> requires the decoder it supervises, passed as the "
                 "<decoder> kwarg of create_loss()."
             )
-        # the RoundFlattenWrapper forwards unknown attributes, but bind to the inner
-        # module so `logic_matrix`, `device` and `dtype` resolve directly
         self.decoder = getattr(decoder, "decoder", decoder)
-        # the block this loss was built from, so `metric._train_fingerprint` can hold a
-        # resumed run to the objective it was trained under
         self.cfg = dict(loss_cfg)
         self.lambda_lc = float(loss_cfg.get("lambda_lc", 1.0))
         self.lambda_lp = float(loss_cfg.get("lambda_lp", 0.2))
@@ -137,25 +95,6 @@ class create:
                    error bitwise, so degenerate solutions are not penalised
 
         Use `combine` to weight them with the configured lambdas.
-
-        Note on L_Ent: the residual bit is `e_i XOR pred_i`, and its llr is the decoder's
-        own llr with the sign flipped wherever the true error is 1, since a positive llr
-        means the prediction is 0. That is exact, and cheaper and steadier than the round
-        trip through probabilities the term used to make: `sigmoid` then a product then
-        `log` loses on both ends of the range what the llr already holds directly.
-
-        The parity of that residual over each logical operator is then taken by
-        `_parity_llr`, in the log domain, and scored with `softplus(-parity)`, which is
-        `-log P(parity == 0)`: the same objective the probability-domain form wrote as a
-        binary cross-entropy against 0, without its underflow. Upstream instead passes
-        `P(residual == 0)`, the complement. Since
-        `XOR_i not(r_i) == (XOR_i r_i) XOR (w mod 2)` over a logical operator of weight
-        `w`, that complement leaves the term correct for even-weight logicals but
-        *inverts* it for odd-weight ones, where minimising it maximises the logical error
-        rate. Measured on a perfect prediction vs one off by a logical operator: rotated
-        surface d=5 (weight 5) gives 6.39 vs 0.0017 upstream, exactly backwards; toric
-        L=10 (weight 10) gives 0.0034 vs 2.85 either way. The form below is identical on
-        even weights and fixes the odd ones.
         """
         e, target_idx = self._prepare(e)
 
