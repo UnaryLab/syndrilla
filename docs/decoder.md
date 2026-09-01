@@ -322,9 +322,9 @@ decoder:
 `union_find` introduces no algorithm-specific fields beyond Section 1. Like `mwpm` it carries no real per-bit LLR, so it emits `llr = 1 − 2·e_v` and always reports `converge = 1`.
 
 ### 3.11. saq
-SAQ (arXiv:2512.08914), a **learned** decoder: a syndrome is mapped to an error estimate in one feed-forward pass, so there is no message passing and no per-sample iteration count (`max_iter` is ignored, `iter` is always 1, `num_max_iter` is 1). The output heads emit a per-qubit posterior LLR (`llr`, positive ⇒ no error, the same sign convention as the BP decoders) and logical class logits. A final CPND stage (constraint-projected nullspace descent) projects the hard decision onto an operator that reproduces the measured syndrome exactly and then lightens it within the stabilizer coset; it is inference-only, on by default, and skipped during training.
+SAQ (arXiv:2512.08914), a **learned** decoder: one feed-forward pass from syndrome to error estimate, so `max_iter` is ignored and `iter` is always 1. The heads emit a per-qubit posterior `llr` and logical class logits; a final CPND stage projects the hard decision onto a syndrome-consistent operator and lightens it within the stabilizer coset, inference-only and skipped during training.
 
-Only **toric and surface codes** are supported, rotated or unrotated. The family is not configured: it is measured from the matrix, and a config still carrying the removed `code_type` key is rejected rather than ignored. Nothing reports a code distance, since `n` does not determine one, so run files are named by `n`. `llr0` is not consumed: SAQ conditions on the syndrome alone and learns the physical error rate from its training distribution. Standalone example (`saq_hx.decoder.yaml`):
+It takes toric and surface codes, rotated or unrotated, and circuit-level detector error models from the stim interface ([interface.md](interface.md)); which one is measured from the matrix, never configured. No code distance is reported, so run files are stemmed `<algorithm>_<check_type>_n<qubits>`, or `dem<detectors>x<mechanisms>` for a DEM. Example (`saq_hx.decoder.yaml`):
 
 ```
 decoder:
@@ -345,37 +345,22 @@ decoder:
     cpnd:
       enable: true
       passes: 1
-    optimizer:
-      lr: 5.0e-4
-      weight_decay: 5.0e-8
-      min_lr: 1.0e-6
-    train:
-      epochs: 100
-      test_batches: 200
-      validation_batches: 20
-      error_random_seed: 42
-      # optional; absent, the best epoch and the last are written out
-      epochs_saved: 20
 ```
-
-All four blocks live under `decoder.config`, grouped so each has exactly one reader: `model`, `cpnd` and `optimizer` are read by the decoder, `train` by `MetricState`. A key written at the top of the `decoder` block instead is rejected with a message naming where it belongs, rather than silently falling back to its default. `cpnd` is a block, so a bare `cpnd: false` is rejected.
 
 | Key                          | Description                                                                    | Example            |
 |------------------------------|--------------------------------------------------------------------------------|--------------------|
-| `decoder.config.model.d_model`      | Token embedding width                                                           | `128`              |
-| `decoder.config.model.N_dec`        | Number of transformer (SLTD) layers                                             | `6`                |
-| `decoder.config.model.h`            | Number of attention heads (must divide `d_model`)                               | `16`               |
-| `decoder.config.model.dropout`      | (optional) Dropout in attention and feed-forward blocks; training only          | `0.0`              |
-| `decoder.config.model.no_mask`      | (optional) `>0` disables the topology attention mask (paper ablation)           | `0`                |
-| `decoder.config.cpnd.enable`        | (optional) Run stage 4 (constraint projection + nullspace descent)              | `true`             |
-| `decoder.config.cpnd.passes`        | (optional) Sweeps over the stabilizer basis in the descent                      | `1`                |
-| `decoder.config.checkpoint`         | (optional) Trained weights to load; a decode run needs it, `-t` writes it       | `tests/test_outputs/saq_hx_n41_best.pt` |
-| `decoder.config.optimizer.lr`       | (optional) Adam learning rate; training only                                    | `5.0e-4`           |
-| `decoder.config.optimizer.weight_decay` | (optional) Adam weight decay; training only                                 | `5.0e-8`           |
-| `decoder.config.optimizer.min_lr`   | (optional) Floor of the cosine schedule (`eta_min`); training only              | `1.0e-6`           |
-| `decoder.config.train.*`            | (training only) The `-t` epoch schedule; see Training below                     | `epochs: 100`      |
+| `decoder.config.checkpoint`         | (optional) Trained weights; a decode run needs them, `-t` writes them      | `tests/test_outputs/saq_hx_n41_best.pt` |
+| `decoder.config.model.d_model`      | Token embedding width                                                      | `128`              |
+| `decoder.config.model.N_dec`        | Number of transformer (SLTD) layers                                        | `6`                |
+| `decoder.config.model.h`            | Number of attention heads (must divide `d_model`)                          | `16`               |
+| `decoder.config.model.dropout`      | (optional) Dropout; training only                                          | `0.0`              |
+| `decoder.config.model.no_mask`      | (optional) `>0` disables the topology attention mask (paper ablation)      | `0`                |
+| `decoder.config.cpnd.enable`        | (optional) Run the CPND stage; a block, so a bare `cpnd: false` is rejected | `true`            |
+| `decoder.config.cpnd.passes`        | (optional) Sweeps over the stabilizer basis in the descent                 | `1`                |
+| `decoder.config.optimizer.*`        | (training only) Adam `lr`, `weight_decay`, `min_lr`                        | `lr: 5.0e-4`       |
+| `decoder.config.train.*`            | (training only) `epochs`, `test_batches`, `validation_batches`, `error_random_seed` | `epochs: 100` |
 
-`decoder.dtype` defaults to `float32` here rather than the BP decoders' `float64`, since float64 attention costs several times more for no accuracy gain. **Without `checkpoint` the decoder runs on randomly initialized weights and decodes at chance**, and warns when this happens.
+Each block has one reader, the decoder for `model`, `cpnd` and `optimizer` and the metric module for `train`; a key written at the top of `decoder` is rejected naming where it belongs. `dtype` defaults to `float32`, since float64 attention costs several times more for no accuracy gain, and **without `checkpoint` the decoder runs on random weights and decodes at chance**.
 
 **Training (`-t`).**
 
@@ -389,22 +374,9 @@ syndrilla -t -r=tests/test_outputs \
     -bs=256
 ```
 
-The settings are split by file: the decoder yaml holds the optimizer settings (`config.optimizer`) and the schedule (`config.train`), the `-ls` yaml holds the loss weights (`lambda_lc`, `lambda_lp`, `lambda_ent`) under its `loss` key, the error yaml holds the physical error rate, and `-bs` is the batch size. A training error yaml takes a `rate` range such as `[0.01, 0.20, 9]`, its last value the number of levels, and draws one rate per shot, so a single run covers the whole curve (`bsc_train.error.yaml`); the phenomenological measurer sweeps its `measurement_error_rate` the same way. A chain trains its **last** decoder, so `[bp_norm_min_sum, saq]` trains while `[saq, osd_0]` is rejected, naming where a trainable stage actually sits. The `-i` interface path trains too, with `-ls` still supplying the objective.
+The optimizer settings and schedule come from `config.optimizer` and `config.train`, the loss weights from the `-ls` yaml, the error rate from the error yaml (a `[lower, upper, points]` range draws one level per shot, so a run covers a stretch of the curve), and the batch size from `-bs`. A chain trains its **last** decoder, and `-i` trains from circuit-level data the same way. The run writes into `-r`: `<stem>_best.pt`, the `state_dict` `decoder.config.checkpoint` loads; `<stem>_last.pt`, the run position `-tckpt` resumes from; `<stem>_result.yaml`, a `train_full` summary plus the curve by column; and `<stem>_train.log`. A second configuration adds files rather than overwriting the first.
 
-The run writes four files into `-r` (default `tests/test_outputs`, the same directory a decode run writes to), named after the configuration that produced them as `<algorithm>_<check_type>_<size>`, where `<size>` is `n<qubits>` or `dem<detectors>x<mechanisms>` for a circuit-level DEM run. Training the shipped hx config on `surface_5`, whose matrix has 41 columns, gives the stem `saq_hx_n41`:
-
-| File | What it holds |
-|---|---|
-| `<stem>_best.pt` | bare `state_dict` of the best epoch: what `decoder.config.checkpoint` points at to decode |
-| `<stem>_last.pt` | the whole run position (weights, optimizer, schedule, RNG, curve, fingerprint): what `-tckpt` resumes from |
-| `<stem>_result.yaml` | a `train_full` summary of the run and what it cost, then the curve stored by column under `training result`, index-aligned with its `epoch` list. The run's best epoch and its last, widened to the last `epochs_saved` epochs when that key is set. What `-ckpt` is checked against on a resume |
-| `<stem>_train.log` | one line per batch, one per epoch |
-
-Training a second configuration into the same run directory adds files rather than overwriting the first. To evaluate the result, put `<stem>_best.pt` in `decoder.config.checkpoint` and run the normal decode CLI.
-
-**Resuming (`-ckpt` and `-tckpt`).** `syndrilla -t -ckpt tests/test_outputs/<stem>_result.yaml -tckpt tests/test_outputs/<stem>_last.pt`, with every other flag left as it was, continues the run rather than warm-starting a new one: a run interrupted after epoch 3 and resumed ends with bit-identical weights and an identical curve to an uninterrupted run. Both flags are printed by the run that wrote them, and a training run takes the pair or neither: either one alone is refused naming the other, since the yaml says what the run was and the checkpoint says where it got to.
-
-Everything is restored from the `*_last.pt`; the yaml is only ever read to be checked. Both halves are checked the same way, by `MetricState.train_validate_checkpoint`, which refuses a resume whose fingerprint differs on any field and names every one that moved, not just the first: `algo`, code shape (`n`, `m`, `k`), `dtype`, `device`, the optimizer settings, the schedule, `error_random_seed`, `-bs`, the physical error rate, the parity-check matrix file, and the loss and its weights. The `*_last.pt` states all of that and is held to all of it. `-ckpt`'s yaml is the run's report and states the part of it a person reads a finished run for (`algorithm`, `device`, `data type`, `physical error rate`, `batch size`, `epochs`, the two batch counts and `error random seed`), so it is held to those, which is what catches a pair naming two different runs. A field the checkpoint carries no value for is reported as `not recorded` rather than as one that happens to differ, which is what an older checkpoint looks like. A weights-only `<stem>_best.pt` has no fingerprint at all and is refused with a message pointing at `decoder.config.checkpoint` instead, and a decode run's `decoder_full` yaml under `-ckpt` is refused by the `train_full` block it lacks. `-tckpt` without `-t` is an error, as is combining it with a `decoder.config.checkpoint` key, since both would supply weights from different files. The flag is spelled `-tckpt`, not `-tc`: argparse splits `-tc` into `-t -c`, which would turn a typo into a silent training run.
+**Resuming (`-ckpt` and `-tckpt`).** The pair, `-ckpt <stem>_result.yaml` and `-tckpt <stem>_last.pt` with every other flag unchanged, continues a run to bit-identical weights and an identical curve; either alone is refused naming the other. State is restored from the `*_last.pt`, while the yaml is only checked: `MetricState.train_validate_checkpoint` names every fingerprint field that moved, not just the first, over the model, code shape, noise, schedule, `-bs` and the loss. A weights-only `*_best.pt` has no fingerprint and is refused pointing at `decoder.config.checkpoint`; `-tckpt` needs `-t`.
 
 ### 3.12. bp_sf
 Normalized min-sum BP followed by syndrome-flipping post-processing on the samples BP leaves unconverged: the most-oscillating bits become flip candidates, and combinations of them are sampled to look for one that satisfies the syndrome. Example configuration (`bp_sf_hx.decoder.yaml`):

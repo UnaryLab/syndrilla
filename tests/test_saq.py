@@ -776,15 +776,14 @@ def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
 
     The averages have to come from the epoch times rather than the wall clock: the
     wall clock includes building the decoder and loading the matrices, so on a short
-    run the two differ by more than rounding. `epochs_saved` keeps every epoch's time in
-    the file, so the summed column can be checked against the summary that averages it.
+    run the two differ by more than rounding. A one-epoch run is written whole, so the
+    column can be checked against the summary that averages it.
     """
     decoder_yaml = _write_decoder_yaml(
         tmp_path / "small.decoder.yaml",
-        epochs=3,
+        epochs=1,
         test_batches=4,
         validation_batches=2,
-        epochs_saved=3,
     )
     result = _run_cli(
         tmp_path,
@@ -802,11 +801,9 @@ def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
     summary = written["train_full"]
     per_epoch_times = written["training result"]["time (s)"]
 
-    assert len(per_epoch_times) == 3 and all(t > 0 for t in per_epoch_times)
+    assert len(per_epoch_times) == 1 and all(t > 0 for t in per_epoch_times)
     assert summary["total epoch time (s)"] == pytest.approx(sum(per_epoch_times))
-    assert summary["average time per epoch (s)"] == pytest.approx(
-        sum(per_epoch_times) / 3
-    )
+    assert summary["average time per epoch (s)"] == pytest.approx(per_epoch_times[0])
     # a batch is a batch of either phase, so an epoch holds test_batches + val
     period = 4 + 2
     assert summary["average time per batch (s)"] == pytest.approx(
@@ -817,84 +814,6 @@ def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
     )
     # the wall clock covers the epochs and the setup ahead of them
     assert summary["total time (s)"] > summary["total epoch time (s)"]
-
-
-def test_train_epochs_saved_caps_the_result_yaml(tmp_path):
-    """`epochs_saved` bounds the result yaml, so a long run stays readable.
-
-    What survives is the run's tail plus its best epoch: the summary block names the
-    best epoch and the saved checkpoint holds it, so a file that dropped it would name
-    an epoch it did not carry.
-    """
-    decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml",
-        epochs=6,
-        test_batches=4,
-        validation_batches=2,
-        epochs_saved=2,
-    )
-    result = _run_cli(
-        tmp_path,
-        "-t",
-        f"-d={decoder_yaml}",
-        f"-m={SURFACE_MATRIX_YAML}",
-        f"-e={TRAIN_ERROR_YAML}",
-        f"-s={TRAIN_SYNDROME_YAML}",
-        f"-ls={LOSS_YAML}",
-        "-bs=32",
-    )
-    assert result.returncode == 0, result.stderr
-
-    written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
-    epochs = written["training result"]
-    numbers = epochs["epoch"]
-    summary = written["train_full"]
-    # all six ran, and the tail is always the last two of them
-    assert summary["epochs"] == 6 and summary["epochs saved"] == 2
-    assert numbers[-2:] == [5, 6]
-    # the best epoch is kept wherever it fell, so it is the tail alone only when the
-    # best is already in it
-    i = len(numbers) - 1 - epochs["best"][::-1].index(True)
-    assert summary["best epoch index"] == numbers[i]
-    assert summary["best validation error"] == pytest.approx(
-        epochs["validation"]["validation error"][i]
-    )
-    assert len(numbers) == (2 if numbers[i] in (5, 6) else 3)
-    assert numbers == sorted(numbers)
-    # the columns are thinned with the epoch list, not left at their full length
-    assert all(
-        len(epochs[phase][term]) == len(numbers)
-        for phase, terms in TERMS.items()
-        for term in terms
-    )
-
-    # the resume checkpoint keeps the whole curve: the cap is a file concern, and a
-    # run resumed from here has to know every epoch it already ran
-    state = torch.load(tmp_path / LAST_PT, map_location="cpu", weights_only=True)
-    assert [entry["epoch"] for entry in state["history"]] == [1, 2, 3, 4, 5, 6]
-
-
-def test_train_epochs_saved_must_be_a_positive_integer(tmp_path):
-    """A cap of zero saves nothing, so it is rejected the way a zero schedule is."""
-    decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml",
-        epochs=2,
-        test_batches=4,
-        validation_batches=2,
-        epochs_saved=0,
-    )
-    result = _run_cli(
-        tmp_path,
-        "-t",
-        f"-d={decoder_yaml}",
-        f"-m={SURFACE_MATRIX_YAML}",
-        f"-e={TRAIN_ERROR_YAML}",
-        f"-s={TRAIN_SYNDROME_YAML}",
-        f"-ls={LOSS_YAML}",
-        "-bs=32",
-    )
-    assert result.returncode != 0
-    assert "epochs_saved" in result.stderr and "integer >= 1" in result.stderr
 
 
 def _write_decode_yaml(path, checkpoint):

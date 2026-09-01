@@ -633,9 +633,6 @@ class MetricState:
     KEYS = ("total", "class_err")
     # the schedule the '-tr' yaml must supply under its 'train' key
     TRAIN_KEYS = ("epochs", "test_batches", "validation_batches", "error_random_seed")
-    # keys of the same block a run may leave out. `epochs_saved` widens how many epochs
-    # the result yaml carries; absent, it carries the run's best and its last.
-    OPTIONAL_TRAIN_KEYS = ("epochs_saved",)
 
     @classmethod
     def train_initial(cls, cfg, run_dir, source):
@@ -658,13 +655,9 @@ class MetricState:
                 f"Decoder yaml {source} is missing under 'decoder.train': "
                 f"{', '.join(missing)}."
             )
-        present = list(cls.TRAIN_KEYS) + [
-            key for key in cls.OPTIONAL_TRAIN_KEYS if key in cfg
-        ]
-        for key in present:
+        for key in cls.TRAIN_KEYS:
             value = cfg[key]
-            # seed 0 is a valid seed; a zero-length schedule is not, and neither is a
-            # run that saves no epoch at all
+            # seed 0 is a valid seed; a zero-length schedule is not
             floor = 0 if key == "error_random_seed" else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < floor:
                 raise ValueError(
@@ -676,7 +669,6 @@ class MetricState:
         state.run_dir = run_dir
         state.cfg = cfg
         state.epochs = cfg["epochs"]
-        state.epochs_saved = cfg.get("epochs_saved")
         state.period = cfg["test_batches"] + cfg["validation_batches"]
         state.total_batches = state.epochs * state.period
         state.epoch = 1
@@ -1036,13 +1028,12 @@ class MetricState:
         The timings come from the recorded epoch times rather than the wall clock, so
         they exclude setup and cover the whole of a resumed run; a batch there is a batch
         of either phase. Only two epochs are written, the run's best and its last, which
-        is what a finished run is read for; `epochs_saved` widens the tail to that many
-        epochs, still plus the best wherever it fell. Only the file is thinned,
-        `self.history` stays complete for a resume, and the summary above is computed
-        over the whole of it.
+        is what a finished run is read for. Only the file is thinned, `self.history`
+        stays complete for a resume, and the summary above is computed over the whole
+        of it.
         """
         history = list(self.history)
-        tail = history[-(self.epochs_saved or 1) :]
+        tail = history[-1:]
         # the last epoch flagged `best` is the run's best: the flag means 'improved
         # on everything before it', so later flags supersede earlier ones
         best_epoch = next((e for e in reversed(history) if e["best"]), None)
@@ -1065,15 +1056,11 @@ class MetricState:
         times = [float(entry.get("time", 0.0)) for entry in self.history]
         per_epoch = sum(times) / len(times) if times else 0.0
         samples = self.period * (self.batch_size or 0)
-        # named only when it is capping something, so an uncapped run's file keeps the
-        # shape it had before the key existed
-        capped = {"epochs saved": self.epochs_saved} if self.epochs_saved else {}
         stem = _train_stem(self._decoder)
         result = {
             "train_full": {
                 **self.run_meta,
                 "epochs": self.epochs,
-                **capped,
                 "training batches count": self.cfg["test_batches"],
                 "validation batches count": self.cfg["validation_batches"],
                 "error random seed": self.cfg["error_random_seed"],
