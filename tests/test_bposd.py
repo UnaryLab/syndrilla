@@ -124,7 +124,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 batch_result = report_metric(num_max_iter[i], bt.e_all, bt.e_v_all[i], bt.iter_all[i],
                                              bt.time_iter_all[i], check[i], bt.converge_all[i],
                                              bt.converge_all[i + 1], i)
-                metrics.accumulate(i, batch_result)
+                metrics.update_metric(i, batch_result)
 
             if num_batches % 100 == 0:
                 logger.success('\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------')

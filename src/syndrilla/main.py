@@ -91,7 +91,7 @@ def parse_commandline_args():
         "-t",
         "--train",
         action="store_true",
-        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<code>_<size>{.pt,_last.pt,_history.json,_result.yaml,_train.log} to --run_dir.",
+        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<size>{_best.pt,_last.pt,_result.yaml,_train.log} to --run_dir.",
     )
     parser.add_argument(
         "-ls",
@@ -167,10 +167,10 @@ def main():
 
     if args.train:
         trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[-1]
-        metrics = MetricState.from_cfg(
+        metrics = MetricState.train_initial(
             trained_cfg.get("train"), args.run_dir, args.decoder_yaml
         )
-        torch.manual_seed(metrics.cfg["seed"])
+        torch.manual_seed(metrics.cfg["error_random_seed"])
         yaml_ckpt = trained_cfg.get("checkpoint")
         if args.train_checkpoint is not None and yaml_ckpt:
             raise ValueError(
@@ -291,15 +291,16 @@ def main():
 
     if args.train:
         assert_trainable(decoders)
-        num_batches = metrics.begin_train_run(
+        num_batches = metrics.train_resume_checkpoint(
             decoders[-1],
             args.batch_size,
             args.train_checkpoint,
             decoder_device,
             error_model,
+            loss_fn,
         )
     else:
-        metrics, num_err, num_batches = MetricState.begin_run(
+        metrics, num_err, num_batches = MetricState.resume_checkpoint(
             args.checkpoint_yaml,
             num_decoders,
             number_channel,
@@ -375,9 +376,14 @@ def main():
                 if args.train and decoder_idx == num_decoders - 1:
                     terms = loss_fn.terms(io_dict, err)
                     total = loss_fn.combine(*terms)
-                    decoders[decoder_idx].backward(total)
-                    decoders[decoder_idx].update()
-                    metrics.record_batch(
+                    # the mode `train_set_hyperparameter` put the decoder in is the answer to
+                    # whether this batch takes a step; a validation batch is built with
+                    # grad off, so backward on it would raise instead of being skipped
+                    if decoders[decoder_idx].training:
+                        total.backward()
+                        decoders[decoder_idx].optimizer.step()
+                        decoders[decoder_idx].optimizer.zero_grad(set_to_none=True)
+                    metrics.train_update_metric(
                         num_batches,
                         (total, *terms),
                         loss_fn.class_error(io_dict, err),
@@ -443,7 +449,7 @@ def main():
                     bt.converge_all[i + 1],
                     i,
                 )
-                metrics.accumulate(i, batch_result)
+                metrics.update_metric(i, batch_result)
 
             if num_batches % 100 == 0:
                 logger.success(
@@ -469,8 +475,7 @@ def main():
             queue.freeze_density(num_err - num_err_before_batch, n)
 
     if args.train:
-        metrics.save_history()
-        metrics.close_log()
+        metrics.train_save_checkpoint()
         return
 
     logger.success(

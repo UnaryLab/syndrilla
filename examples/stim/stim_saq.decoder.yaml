@@ -1,5 +1,5 @@
 # Decoding config for the learned `saq` decoder on the stim circuit-level path.
-# Train first with stim_saq_train.decoder.yaml, then point `checkpoint` at the weights
+# Train first with train_stim_saq.decoder.yaml, then point `checkpoint` at the weights
 # that run wrote. Checkpoints from this path are named after the detector error model
 # they were trained on (`saq_hx_dem<detectors>x<mechanisms>.pt`), since a DEM column is a
 # circuit fault mechanism and carries no code distance.
@@ -12,7 +12,7 @@ decoder:
     device_type: cpu
     device_idx: 0
   config:
-    checkpoint: tests/test_outputs/saq_hx_dem24x221.pt
+    checkpoint: tests/test_outputs/saq_hx_dem24x221_best.pt
     model:
       d_model: 128
       N_dec: 4

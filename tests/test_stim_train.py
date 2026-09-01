@@ -6,7 +6,6 @@ it flips. These tests pin that consistency, then drive the CLI end to end to che
 actually learns from it rather than merely finishing.
 """
 
-import json
 import math
 import os
 import subprocess
@@ -33,7 +32,7 @@ from syndrilla.loss.logical_centric.logical_centric import (
 INTERFACE_YAML = "examples/stim/stim_generated.interface.yaml"
 TRAIN_ERROR_YAML = "examples/stim/stim_train.error.yaml"
 TRAIN_SYNDROME_YAML = "examples/stim/stim_train.syndrome.yaml"
-TRAIN_DECODER_YAML = "examples/stim/stim_saq_train.decoder.yaml"
+TRAIN_DECODER_YAML = "examples/stim/train_stim_saq.decoder.yaml"
 DECODE_ERROR_YAML = "examples/stim/stim_generated.error.yaml"
 LOSS_YAML = "examples/stim/logical_centric.loss.yaml"
 
@@ -213,7 +212,7 @@ class TestTrainCLI:
         assert result.returncode == 0, result.stderr[-3000:]
         # named for the detector error model, since a DEM column is a fault mechanism
         # and carries no code distance to name it after
-        assert (run_dir / f"{CKPT_STEM}.pt").exists()
+        assert (run_dir / f"{CKPT_STEM}_best.pt").exists()
         assert (run_dir / f"{CKPT_STEM}_last.pt").exists()
 
     def test_the_run_actually_learns(self, tmp_path):
@@ -234,8 +233,8 @@ class TestTrainCLI:
             "-bs=256",
         )
         assert result.returncode == 0, result.stderr[-3000:]
-        history = json.loads((run_dir / f"{CKPT_STEM}_history.json").read_text())
-        val_errors = [epoch["val"]["class_err"] for epoch in history]
+        written = yaml.safe_load((run_dir / f"{CKPT_STEM}_result.yaml").read_text())
+        val_errors = written["training result"]["validation"]["validation error"]
         assert min(val_errors) < 0.25, f"no better than chance: {val_errors}"
 
     def test_training_needs_a_loss(self, tmp_path):
@@ -308,9 +307,9 @@ def _fast_decoder(tmp_path):
     cfg = yaml.safe_load(open(TRAIN_DECODER_YAML))
     cfg["decoder"]["config"]["train"] = {
         "epochs": 4,
-        "batches_per_epoch": 25,
-        "val_batches": 5,
-        "seed": 42,
+        "test_batches": 25,
+        "validation_batches": 5,
+        "error_random_seed": 42,
     }
     cfg["decoder"]["config"]["model"] = dict(
         cfg["decoder"]["config"]["model"], d_model=64, N_dec=2, h=4

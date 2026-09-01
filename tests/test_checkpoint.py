@@ -14,7 +14,9 @@ For each config:
   Phase 3 — confirm averaged LER survives the round-trip
   Phase 4 — resume + run a few more batches on top of loaded state
 
-Run:
+Run either way -- as a pytest module, one test per config:
+    pytest tests/test_checkpoint.py
+or as a script, which prints every compared field and a summary table:
     python tests/test_checkpoint.py
 """
 
@@ -22,11 +24,11 @@ import os
 import sys
 import time
 
+import pytest
 import torch
 from loguru import logger
 
 sys.path.append(os.getcwd())
-logger.remove()  # silence syndrilla's INFO chatter
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
@@ -107,8 +109,11 @@ def run_one_batch(
     l_mat = bundle.get_l_matrix(check_type, number_channel)
     nmi = [getattr(d, "num_max_iter", 0) for d in decoders]
 
-    rounds = getattr(sg, "rounds", 1)
-    bt = BatchTracker(nd, number_channel, shape, dtype, dev, rounds=rounds)
+    # no `rounds=`, exactly as main.py builds it: a multi-round measurer hands the
+    # decoder a rounds axis but the decoder collapses it, so the ground-truth error is
+    # recorded once per sample. Replicating it per round would leave `e_all` R times
+    # taller than the decodings it is checked against.
+    bt = BatchTracker(nd, number_channel, shape, dtype, dev)
     zq = torch.zeros([batch_size, shape[1]], dtype=dtype)
     _, dl = em.inject_error(zq, batch_size)
     for err, llr, _ in dl:
@@ -139,7 +144,7 @@ def run_one_batch(
                 bt.converge_all[i + 1],
                 i,
             )
-            metrics.accumulate(i, br)
+            metrics.update_metric(i, br)
     return num_err
 
 
@@ -286,7 +291,7 @@ def run_one_config(
     # ---------- Phase 2: drop, reload, validate ----------
     print("  Phase 2: drop state, reload ckpt, validate")
     del m
-    m_loaded, meta = MetricState.from_checkpoint(ckpt_path, nc, dev)
+    m_loaded, meta = MetricState.load_checkpoint(ckpt_path, nc, dev)
     m_loaded.validate_checkpoint(meta, batch_size, target_error, dtype, em.rate, H_file)
     issues = compare(pre, m_loaded, nc, nd)
     nb_ok = meta["batch_count"] == save_every
@@ -393,7 +398,6 @@ def run_one_config(
                     pre_disp = f"{float(cv):.6f}"
                     post_disp = f"{float(pv):.6f}"
                     print(fmt.format(f"d{d}.{field}.{ck}", pre_disp, post_disp, cok))
-    ler_ok = not avg_issues
     if avg_issues:
         print(f"    BROKEN — {len(avg_issues)} averaged field(s) mismatched")
 
@@ -401,6 +405,7 @@ def run_one_config(
     print(f"  Phase 4: resume + {resume_extra} more batches")
     nb = meta["batch_count"]
     ne = meta["num_err"]
+    resume_error = None
     try:
         for b in range(1, resume_extra + 1):
             ne = run_one_batch(
@@ -411,33 +416,93 @@ def run_one_config(
             f"    resumed OK — final batches={nb}  num_err={ne}  "
             f"LER={m_loaded.logical_error_rate[0][0]/nb:.6f}"
         )
-        resume_ok = True
     except Exception as e:
-        print(f"    RESUME FAILED — {type(e).__name__}: {str(e)[:120]}")
-        resume_ok = False
+        resume_error = f"{type(e).__name__}: {e}"
+        print(f"    RESUME FAILED — {resume_error[:140]}")
 
-    return not issues and nb_ok and ne_ok and ler_ok and resume_ok
+    # what each phase found, rather than one bool: a caller reporting the failure needs
+    # to say which field disagreed, not only that something did
+    return {
+        "accumulators": issues,
+        "batch count": (meta["batch_count"], save_every),
+        "error count": (meta["num_err"], pre_ne),
+        "averages": avg_issues,
+        "resume": resume_error,
+    }
+
+
+def failures(report):
+    """One message per thing `run_one_config` found wrong. Empty means it round-tripped."""
+    problems = []
+    if report["accumulators"]:
+        problems += [
+            f"accumulator {f}[{d}][{c}] changed across the round trip: "
+            f"pre={p} post={q}"
+            for f, d, c, p, q in report["accumulators"]
+        ]
+    for name in ("batch count", "error count"):
+        saved, expected = report[name]
+        if saved != expected:
+            problems.append(f"{name} came back as {saved}, expected {expected}")
+    if report["averages"]:
+        problems += [
+            f"averaged {field} for decoder {d} changed across the round trip: "
+            f"pre={p} post={q}"
+            for d, field, p, q in report["averages"]
+        ]
+    if report["resume"]:
+        problems.append(f"resuming from the checkpoint raised {report['resume']}")
+    return problems
+
+
+@pytest.mark.parametrize("cfg", CONFIGS, ids=[cfg[0] for cfg in CONFIGS])
+def test_checkpoint_round_trip(cfg, tmp_path, quiet_logger):
+    """Every accumulator and averaged metric must survive a save/load, and resume.
+
+    One case per dimension layout the framework supports, since the checkpoint yaml
+    stores per-channel rates under `hx`/`hz` keys and a run is resumed by multiplying
+    them back by the sample count: a layout that round-trips at one channel can still
+    lose a channel or a rounds axis at another.
+    """
+    problems = failures(run_one_config(*cfg, tmp_dir=str(tmp_path)))
+    assert not problems, "\n".join(problems)
+
+
+@pytest.fixture
+def quiet_logger():
+    """Silence syndrilla's INFO chatter for one test, leaving a sink behind after.
+
+    Scoped to the test rather than done at import: removing every sink at import time
+    would silence whichever modules pytest collects after this one.
+    """
+    logger.remove()
+    yield
+    logger.add(sys.stderr)
 
 
 def main():
+    logger.remove()  # silence syndrilla's INFO chatter
     results = {}
     out_dir = "tests/test_outputs"
     os.makedirs(out_dir, exist_ok=True)
     for cfg in CONFIGS:
         label = cfg[0]
         try:
-            ok = run_one_config(*cfg, tmp_dir=out_dir)
+            problems = failures(run_one_config(*cfg, tmp_dir=out_dir))
         except Exception as e:
             print(f"\n  CONFIG ERROR — {type(e).__name__}: {e}")
-            ok = False
-        results[label] = ok
+            problems = [f"{type(e).__name__}: {e}"]
+        results[label] = problems
 
     print("\n========================================================================")
     print("OVERALL SUMMARY")
     print("========================================================================")
-    for label, ok in results.items():
-        print(f'  {"PASS" if ok else "FAIL"}  {label}')
+    for label, problems in results.items():
+        print(f'  {"PASS" if not problems else "FAIL"}  {label}')
+        for problem in problems:
+            print(f"          {problem}")
+    return 1 if any(results.values()) else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

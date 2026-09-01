@@ -91,6 +91,12 @@ def _parity_llr(H, llr):
 class create:
     """The three-term logical-centric objective, bound to the decoder it supervises."""
 
+    # what this loss splits its total into, one name per value `terms` returns, in that
+    # order. The metric module meters and logs whatever a loss declares here and knows
+    # none of these names itself, so a loss with a different decomposition names its own
+    # and one whose total has no parts worth logging declares `()`.
+    term_names = ("lc", "lp", "ent")
+
     def __init__(self, loss_cfg, **kwargs) -> None:
         decoder = kwargs.get("decoder")
         if decoder is None:

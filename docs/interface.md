@@ -136,7 +136,7 @@ The circuit's detectors already span every round, so the sampled syndrome carrie
 
 ```command
 syndrilla -t -r=tests/test_outputs \
-    -d=examples/stim/stim_saq_train.decoder.yaml \
+    -d=examples/stim/train_stim_saq.decoder.yaml \
     -i=examples/stim/stim_generated.interface.yaml \
     -e=examples/stim/stim_train.error.yaml \
     -s=examples/stim/stim_train.syndrome.yaml \
@@ -156,7 +156,7 @@ Measured on the shipped configuration, comparing that fix against weighting the 
 |---------------------|-------------------------------------------------------------------------------------------------|--------------------|
 | `error.rate`        | Scalar: the physical error rate a result file records, defaulting to the DEM's mean mechanism probability. `[lower, upper, points]`: a training-only sweep of the circuit's noise over that many evenly spaced levels | `[0.0005, 0.006, 9]` |
 
-**Checkpoint names.** Weights trained here are named `<algorithm>_<check_type>_dem<detectors>x<mechanisms>`, not after a code distance: a DEM column is a circuit fault mechanism, so the column count carries no distance, and reading one off it would be a coincidence. The shipped distance-3 rotated circuit over 3 rounds gives 24 detectors and 221 mechanisms, so a `saq` run on `hx` writes `saq_hx_dem24x221.pt` and `saq_hx_dem24x221_last.pt`.
+**Checkpoint names.** Weights trained here are named `<algorithm>_<check_type>_dem<detectors>x<mechanisms>`, not after a code distance: a DEM column is a circuit fault mechanism, so the column count carries no distance, and reading one off it would be a coincidence. The shipped distance-3 rotated circuit over 3 rounds gives 24 detectors and 221 mechanisms, so a `saq` run on `hx` writes `saq_hx_dem24x221_best.pt` and `saq_hx_dem24x221_last.pt`.
 
 **What a decoder can assume.** A decoder built from a DEM is not looking at a code's Tanner graph: its checks are detectors in spacetime and its variables are fault mechanisms, so anything keyed to a code family, a distance or a qubit count does not apply. Decoders that measure such things off their matrix are told which kind they have through the loader's `is_circuit_dem` flag, rather than guessing from the shape.
 

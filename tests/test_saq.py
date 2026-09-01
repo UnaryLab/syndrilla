@@ -1,4 +1,3 @@
-import json
 import os
 import subprocess
 import sys
@@ -14,21 +13,29 @@ from syndrilla.decoder.decoder import SHARED_KEYS
 from syndrilla.matrix import load_matrices
 from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
-DECODER_YAML = "examples/alist/saq_hx_train.decoder.yaml"
+DECODER_YAML = "examples/alist/train_saq_hx.decoder.yaml"
 DECODE_YAML = "examples/alist/saq_hx.decoder.yaml"
 SURFACE_MATRIX_YAML = "examples/alist/surface_5.matrix.yaml"
 TORIC_MATRIX_YAML = "examples/alist/toric_10.matrix.yaml"
 
 # Checkpoints are named after the configuration that produced them. The CLI tests train
-# the shipped hx config on surface_5, whose 41 qubits solve the unrotated surface
-# relation `d^2 + (d-1)^2` at distance 5.
-CKPT_STEM = "saq_hx_d5"
-BEST_PT = f"{CKPT_STEM}.pt"
+# the shipped hx config on surface_5, whose matrix has 41 columns.
+CKPT_STEM = "saq_hx_n41"
+BEST_PT = f"{CKPT_STEM}_best.pt"
 LAST_PT = f"{CKPT_STEM}_last.pt"
-HISTORY = f"{CKPT_STEM}_history.json"
 RESULT_YAML = f"{CKPT_STEM}_result.yaml"
-# the per-phase terms the result yaml carries a column of, as its epoch line names them
-TERMS = ("loss", "lc", "lp", "ent", "class error")
+TRAIN_LOG = f"{CKPT_STEM}_train.log"
+# the result yaml's two phase blocks and the columns each carries: the objective and the
+# class error, which any trained decoder reports, each named for the phase it belongs to.
+# The split of the total into lc/lp/ent is the logical-centric loss's own, so it stays in
+# the epoch line and so in the train log. Keyed by the yaml's spelling, not the internal
+# `train`/`val` the in-memory history keeps
+TERMS = {
+    "training": ("training loss", "training error"),
+    "validation": ("validation loss", "validation error"),
+}
+# the terms that split is made of, which the result yaml must not carry
+MODEL_TERMS = ("lc", "lp", "ent")
 TRAIN_ERROR_YAML = "examples/alist/bsc_train.error.yaml"
 TRAIN_SYNDROME_YAML = "examples/alist/perfect.syndrome.yaml"
 LOSS_YAML = "examples/alist/logical_centric.loss.yaml"
@@ -137,7 +144,12 @@ def test_converge_flag_matches_syndrome():
 
 
 def test_hard_decision_and_syndrome_estimation():
-    """The two shared stage helpers must agree with their closed forms."""
+    """The hard decision and `syndrome_estimation` must agree with their closed forms.
+
+    The hard decision is read off a forward pass rather than called directly: it is a
+    line inside `forward`, and CPND is what would otherwise move `e_v` off it, so the
+    decoder is built in training mode, where the decoder turns that stage off itself.
+    """
     decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
     e, _, H = _random_shots(saq, batch_size=8, error_rate=0.2)
 
@@ -146,15 +158,26 @@ def test_hard_decision_and_syndrome_estimation():
         saq.syndrome_estimation(e), ((e.to(torch.float32) @ H.t()) % 2).to(saq.dtype)
     )
 
-    llr = torch.tensor([[-1.0, 0.0, 1.0, -0.5]], dtype=saq.dtype, device=saq.device)
-    assert torch.equal(
-        saq.hard_decision(llr),
-        torch.tensor([[1.0, 1.0, 0.0, 1.0]], dtype=saq.dtype, device=saq.device),
-    )
+    train_decoder, train_saq = _make_decoder(SURFACE_MATRIX_YAML, training=True)
+    train_decoder.eval()
+    _, synd, H = _random_shots(train_saq, batch_size=8)
+    out = train_decoder(_io_dict(train_saq, synd, H))
+
+    # non-positive (<= 0) posterior LLR means flipped, zero included
+    l_v = out["llr"]
+    assert torch.equal(out["e_v"], (l_v <= 0.0).to(train_saq.dtype))
+    assert out["e_v"].dtype == train_saq.dtype
 
 
-def test_stage_methods_compose_into_forward():
-    """The named stages must reproduce forward() exactly when run by hand."""
+def test_forward_matches_the_paper_pipeline():
+    """forward() must equal the SAQ pipeline transcribed independently from the paper.
+
+    `forward` runs stages 1 and 2 inline, so this is what pins its wiring: the streams
+    are rebuilt here from the learned parameters directly, the layers are driven with
+    the two masks by hand, and the heads are applied separately. A mis-plumbed mask, a
+    dropped global token, a missed mid-depth norm, or LN reading the *previous* layer's
+    SN would all show up as a mismatch against the decoder's own output.
+    """
     decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
     decoder.eval()
     _, synd, H = _random_shots(saq)
@@ -162,17 +185,23 @@ def test_stage_methods_compose_into_forward():
 
     with torch.no_grad():
         syndrome_pm = 1 - 2 * synd
-        out_LP = saq.logical_prior(syndrome_pm)
-        SN, LN = saq.build_streams(syndrome_pm, out_LP)
+        out_LP = saq.MLP(syndrome_pm)
+        SN = saq.learnable_embed_S.unsqueeze(0) * syndrome_pm.unsqueeze(-1)
+        LN = saq.learnable_embed_L.unsqueeze(0) * out_LP.unsqueeze(-1)
+        SN = torch.cat([saq.global_tok.expand(SN.size(0), -1, -1), SN], dim=1)
         assert SN.shape == (synd.size(0), saq.m + 1, 32)  # +1 for the global token
         assert LN.shape == (synd.size(0), saq.logical_classes, 32)
+
         for idx in range(saq.N_dec):
-            SN = saq.sn_update(SN, idx)
-            LN = saq.ln_update(LN, SN, idx)
+            SN = saq.layers[idx](SN, SN, saq.src_mask_SN, "syndrome")
+            LN = saq.layers[idx](LN, SN, saq.src_mask_LN, "logical")
             if saq.N_dec > 1 and idx == saq.N_dec // 2:
                 SN, LN = saq.SN_norm2(SN), saq.LN_norm2(LN)
-        l_v, out_L = saq.head_update(SN, LN)
 
+        l_v = saq.out_fc_S(saq.proj_e(saq.SN_norm(SN)[:, 1:, :]).squeeze(-1))
+        out_L = saq.out_fc_L(saq.proj_l(saq.LN_norm(LN)).squeeze(-1))
+
+    assert torch.allclose(out_LP, out["logical_prior"], atol=1e-6)
     assert torch.allclose(l_v, out["llr"], atol=1e-6)
     assert torch.allclose(out_L, out["logical_logits"], atol=1e-6)
 
@@ -305,14 +334,15 @@ def test_overfits_a_fixed_batch():
     for _ in range(40):
         out = decoder(_io_dict(saq, synd, H))
         loss = loss_fn(out, e)
-        saq.backward(loss)
-        saq.update()
+        loss.backward()
+        saq.optimizer.step()
+        saq.optimizer.zero_grad(set_to_none=True)
         losses.append(loss.item())
 
     assert losses[-1] < losses[0]
 
 
-# ── CPND (stage 3) ───────────────────────────────────────────────────
+# ── CPND (stage 4) ───────────────────────────────────────────────────
 CPND_CODES = [
     (SURFACE_MATRIX_YAML, 0),
     (TORIC_MATRIX_YAML, 1),
@@ -376,7 +406,10 @@ def test_cpnd_descent_lowers_the_weighted_cost():
     out = decoder(_io_dict(saq, synd, H))
     l_v = out["llr"]
 
-    e0 = saq.project(saq.hard_decision(l_v), synd, out["logical_logits"])
+    # the hard decision `forward` makes, recomputed here to feed CPND its raw input
+    e0 = saq.project(
+        torch.where(l_v <= 0.0, 1.0, 0.0).to(saq.dtype), synd, out["logical_logits"]
+    )
     cost_projected = (e0 * l_v).sum(dim=1)
     cost_final = (out["e_v"] * l_v).sum(dim=1)
 
@@ -384,11 +417,8 @@ def test_cpnd_descent_lowers_the_weighted_cost():
     assert torch.any(cost_final < cost_projected - 1e-6)
 
     # extra sweeps keep improving and keep the constraints
-    more = (
-        _saq_module(saq)
-        ._cpnd_descent(e0, saq.cpnd_supports, l_v, passes=5)
-        .to(torch.float32)
-    )
+    saq.cpnd_passes = 5
+    more = saq.nullspace_descent(e0, l_v).to(torch.float32)
     assert torch.all((more * l_v).sum(dim=1) <= cost_final + 1e-4)
     assert torch.equal((more @ saq.cpnd_H_hat.t()) % 2, (e0 @ saq.cpnd_H_hat.t()) % 2)
 
@@ -405,7 +435,10 @@ def test_cpnd_sign_vector_stays_consistent():
     _, synd, H = _random_shots(saq, batch_size=32)
     out = decoder(_io_dict(saq, synd, H))
     l_v = out["llr"]
-    e0 = saq.project(saq.hard_decision(l_v), synd, out["logical_logits"])
+    # the hard decision `forward` makes, recomputed here to feed CPND its raw input
+    e0 = saq.project(
+        torch.where(l_v <= 0.0, 1.0, 0.0).to(saq.dtype), synd, out["logical_logits"]
+    )
 
     # replay the descent, tracking sign alongside, and require the invariant to hold
     e = e0.to(torch.bool)
@@ -441,7 +474,8 @@ def test_cpnd_weights_use_signed_llr_magnitudes():
     _, synd, H = _random_shots(saq, batch_size=32)
     out = decoder(_io_dict(saq, synd, H))
     l_v = out["llr"]
-    e_raw = saq.hard_decision(l_v)
+    # the hard decision `forward` makes, recomputed here to feed CPND its raw input
+    e_raw = torch.where(l_v <= 0.0, 1.0, 0.0).to(saq.dtype)
     e0 = saq.project(e_raw, synd, out["logical_logits"])
 
     # what upstream actually computes, from the hard decision rather than the logits
@@ -458,10 +492,8 @@ def test_cpnd_weights_use_signed_llr_magnitudes():
 
     # descending on the inverted sign must do worse under the true cost
     cost = lambda e: (e * l_v).sum(dim=1).mean()
-    fixed = _saq_module(saq)._cpnd_descent(e0, saq.cpnd_supports, l_v).to(torch.float32)
-    inverted = (
-        _saq_module(saq)._cpnd_descent(e0, saq.cpnd_supports, -l_v).to(torch.float32)
-    )
+    fixed = saq.nullspace_descent(e0, l_v).to(torch.float32)
+    inverted = saq.nullspace_descent(e0, -l_v).to(torch.float32)
     assert cost(fixed) < cost(inverted)
 
 
@@ -557,7 +589,7 @@ def _write_decoder_yaml(path, source=None, **overrides):
 def test_train_cli_produces_a_loadable_checkpoint(tmp_path):
     """`-t` must train and write a checkpoint the decoder's `checkpoint` key can load."""
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=2, batches_per_epoch=4, val_batches=2
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=4, validation_batches=2
     )
     result = _run_cli(
         tmp_path,
@@ -573,15 +605,23 @@ def test_train_cli_produces_a_loadable_checkpoint(tmp_path):
 
     best = tmp_path / BEST_PT
     assert best.is_file() and (tmp_path / LAST_PT).is_file()
-    assert (tmp_path / HISTORY).is_file()
+    assert (tmp_path / RESULT_YAML).is_file()
 
     # the schedule and the optimizer settings come from their own blocks of the same
     # decoder yaml
-    history = json.loads((tmp_path / HISTORY).read_text())
-    assert [entry["epoch"] for entry in history] == [1, 2]
-    shipped = read_yaml(get_path(DECODER_YAML))["decoder"]
-    assert history[0]["lr"] == shipped["config"]["optimizer"]["lr"]
-    assert history[1]["lr"] < history[0]["lr"]
+    epochs = yaml.safe_load((tmp_path / RESULT_YAML).read_text())["training result"]
+    # the run's best and its last, so epoch 2 is always there and epoch 1 only if it
+    # was the better of the two
+    numbers = epochs["epoch"]
+    assert numbers[-1] == 2
+    rates = epochs["learning rate"]
+    shipped_lr = read_yaml(get_path(DECODER_YAML))["decoder"]["config"]["optimizer"][
+        "lr"
+    ]
+    if numbers[0] == 1:
+        assert rates[0] == shipped_lr and rates[-1] < rates[0]
+    else:
+        assert rates[-1] < shipped_lr
 
     # training must not emit any decode-path artefact
     assert not list(tmp_path.glob("result_phy_err_*.yaml"))
@@ -612,12 +652,13 @@ def test_train_cli_produces_a_loadable_checkpoint(tmp_path):
 def test_train_cli_writes_a_result_yaml_indexed_by_epoch(tmp_path):
     """`-t` writes its results as a yaml too, the way a decode run does.
 
-    The curve is stored by column: `epoch` lists the epoch numbers and every other list
-    is index-aligned with it, so entry `i` of each is one epoch, and every number in it
-    is the one the run's epoch line printed.
+    Two epochs are written, the run's best and its last, stored by column: `epoch` lists
+    the epoch numbers and every other list is index-aligned with it, so entry `i` of each
+    is one epoch, and every number in it is the one the run's epoch line printed. The
+    two collapse to one entry only when the last epoch is itself the best.
     """
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=3, batches_per_epoch=4, val_batches=2
+        tmp_path / "small.decoder.yaml", epochs=3, test_batches=4, validation_batches=2
     )
     result = _run_cli(
         tmp_path,
@@ -632,38 +673,102 @@ def test_train_cli_writes_a_result_yaml_indexed_by_epoch(tmp_path):
     assert result.returncode == 0, result.stderr
 
     written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
-    epochs = written["epoch"]
-    assert epochs["epoch"] == [1, 2, 3]
+    epochs = written["training result"]
+    # the last epoch is always written; the best joins it unless it is that epoch
+    assert epochs["epoch"][-1] == 3
+    kept = len(epochs["epoch"])
+    assert kept in (1, 2)
+    if kept == 2:
+        assert epochs["best"][0] is True and epochs["epoch"][0] < 3
     # every column is as long as the epoch list, or the alignment they are read by
     # would be silently wrong
     columns = [epochs["learning rate"], epochs["best"]]
-    columns += [epochs[phase][term] for phase in ("train", "val") for term in TERMS]
-    assert all(len(column) == 3 for column in columns)
+    columns += [epochs[phase][term] for phase, terms in TERMS.items() for term in terms]
+    assert all(len(column) == kept for column in columns)
+    # and nothing else: a term one loss decomposes its total into is not something the
+    # result file can name for a model that has no such decomposition
+    for phase, terms in TERMS.items():
+        assert set(epochs[phase]) == set(terms)
 
     summary = written["train_full"]
     assert summary["epochs"] == 3
-    assert summary["batches per epoch"] == 4 and summary["validation batches"] == 2
+    assert (
+        summary["training batches count"] == 4
+        and summary["validation batches count"] == 2
+    )
     assert summary["batch size"] == 32
-    assert summary["checkpoint"] == str(tmp_path / BEST_PT)
+    assert summary["best checkpoint"] == str(tmp_path / BEST_PT)
+    assert summary["last checkpoint"] == str(tmp_path / LAST_PT)
     # the summary's best has to be the epoch the columns say is best, not a second
     # opinion
-    val_class_err = epochs["val"]["class error"]
+    val_class_err = epochs["validation"]["validation error"]
     i = val_class_err.index(min(val_class_err))
-    assert summary["best epoch"] == epochs["epoch"][i]
-    assert summary["best val class error"] == pytest.approx(val_class_err[i])
+    assert summary["best epoch index"] == epochs["epoch"][i]
+    assert summary["best validation error"] == pytest.approx(val_class_err[i])
     assert epochs["best"][i] is True
 
-    # same numbers as the json history, so neither file can drift from the other
-    history = json.loads((tmp_path / HISTORY).read_text())
-    assert [entry["epoch"] for entry in history] == epochs["epoch"]
-    for i, recorded in enumerate(history):
-        assert epochs["learning rate"][i] == pytest.approx(recorded["lr"])
-        assert epochs["train"]["loss"][i] == pytest.approx(recorded["train"]["total"])
-        assert epochs["train"]["lc"][i] == pytest.approx(recorded["train"]["lc"])
-        assert epochs["val"]["loss"][i] == pytest.approx(recorded["val"]["total"])
-        assert epochs["val"]["class error"][i] == pytest.approx(
-            recorded["val"]["class_err"]
-        )
+    # the breakdown the yaml drops is still recorded, in the epoch lines of the run's
+    # own log rather than in the toolchain's result format
+    lines = [
+        line
+        for line in (tmp_path / TRAIN_LOG).read_text().splitlines()
+        if "train_loss=" in line
+    ]
+    assert len(lines) == 3
+    assert all(f"{term}=" in line for line in lines for term in MODEL_TERMS)
+
+
+def test_train_log_records_every_batch_with_its_loss_and_rate(tmp_path):
+    """The log carries the batches an epoch averaged, not only the average.
+
+    An epoch line alone says a run got worse, never which batch it happened on, so
+    each batch writes its own loss and the rate it ran at. The two granularities have
+    to agree: the epoch's reported average is the mean of the batch losses above it.
+    """
+    epochs, train_batches, val_batches = 2, 4, 2
+    decoder_yaml = _write_decoder_yaml(
+        tmp_path / "small.decoder.yaml",
+        epochs=epochs,
+        test_batches=train_batches,
+        validation_batches=val_batches,
+    )
+    result = _run_cli(
+        tmp_path,
+        "-t",
+        f"-d={decoder_yaml}",
+        f"-m={SURFACE_MATRIX_YAML}",
+        f"-e={TRAIN_ERROR_YAML}",
+        f"-s={TRAIN_SYNDROME_YAML}",
+        f"-ls={LOSS_YAML}",
+        "-bs=32",
+    )
+    assert result.returncode == 0, result.stderr
+
+    period = train_batches + val_batches
+    lines = (tmp_path / TRAIN_LOG).read_text().splitlines()
+    batch_lines = [line for line in lines if "batch " in line and "loss=" in line]
+    assert len(batch_lines) == epochs * period
+
+    # every batch names the phase it was metered as and the rate it ran at, and splits
+    # its loss the way the epoch line does
+    assert sum("  train  " in line for line in batch_lines) == epochs * train_batches
+    assert sum("  val    " in line for line in batch_lines) == epochs * val_batches
+    assert all("lr=" in line for line in batch_lines)
+    assert all(f"{term}=" in line for line in batch_lines for term in MODEL_TERMS)
+
+    # the console keeps the epoch summaries only: one batch line per batch would bury
+    # them, so they go to the log file alone
+    assert "batch " not in result.stdout
+
+    def loss_of(line):
+        return float(line.split("loss=")[1].split()[0])
+
+    # the first epoch's training average is the mean of the training batches above it
+    first = batch_lines[:train_batches]
+    epoch_line = next(line for line in lines if "train_loss=" in line)
+    assert float(epoch_line.split("train_loss=")[1].split()[0]) == pytest.approx(
+        sum(loss_of(line) for line in first) / train_batches, abs=1e-4
+    )
 
 
 def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
@@ -671,10 +776,15 @@ def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
 
     The averages have to come from the epoch times rather than the wall clock: the
     wall clock includes building the decoder and loading the matrices, so on a short
-    run the two differ by more than rounding.
+    run the two differ by more than rounding. `epochs_saved` keeps every epoch's time in
+    the file, so the summed column can be checked against the summary that averages it.
     """
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=3, batches_per_epoch=4, val_batches=2
+        tmp_path / "small.decoder.yaml",
+        epochs=3,
+        test_batches=4,
+        validation_batches=2,
+        epochs_saved=3,
     )
     result = _run_cli(
         tmp_path,
@@ -690,14 +800,14 @@ def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
 
     written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
     summary = written["train_full"]
-    per_epoch_times = written["epoch"]["time (s)"]
+    per_epoch_times = written["training result"]["time (s)"]
 
     assert len(per_epoch_times) == 3 and all(t > 0 for t in per_epoch_times)
     assert summary["total epoch time (s)"] == pytest.approx(sum(per_epoch_times))
     assert summary["average time per epoch (s)"] == pytest.approx(
         sum(per_epoch_times) / 3
     )
-    # a batch is a batch of either phase, so an epoch holds batches_per_epoch + val
+    # a batch is a batch of either phase, so an epoch holds test_batches + val
     period = 4 + 2
     assert summary["average time per batch (s)"] == pytest.approx(
         summary["average time per epoch (s)"] / period
@@ -708,13 +818,9 @@ def test_train_result_yaml_reports_what_the_run_cost(tmp_path):
     # the wall clock covers the epochs and the setup ahead of them
     assert summary["total time (s)"] > summary["total epoch time (s)"]
 
-    # the json history carries the per-epoch times too, so the two files still agree
-    history = json.loads((tmp_path / HISTORY).read_text())
-    assert [entry["time"] for entry in history] == pytest.approx(per_epoch_times)
 
-
-def test_train_epochs_saved_caps_both_output_files(tmp_path):
-    """`epochs_saved` bounds the two output files, so a long run stays readable.
+def test_train_epochs_saved_caps_the_result_yaml(tmp_path):
+    """`epochs_saved` bounds the result yaml, so a long run stays readable.
 
     What survives is the run's tail plus its best epoch: the summary block names the
     best epoch and the saved checkpoint holds it, so a file that dropped it would name
@@ -723,8 +829,8 @@ def test_train_epochs_saved_caps_both_output_files(tmp_path):
     decoder_yaml = _write_decoder_yaml(
         tmp_path / "small.decoder.yaml",
         epochs=6,
-        batches_per_epoch=4,
-        val_batches=2,
+        test_batches=4,
+        validation_batches=2,
         epochs_saved=2,
     )
     result = _run_cli(
@@ -740,7 +846,7 @@ def test_train_epochs_saved_caps_both_output_files(tmp_path):
     assert result.returncode == 0, result.stderr
 
     written = yaml.safe_load((tmp_path / RESULT_YAML).read_text())
-    epochs = written["epoch"]
+    epochs = written["training result"]
     numbers = epochs["epoch"]
     summary = written["train_full"]
     # all six ran, and the tail is always the last two of them
@@ -749,22 +855,18 @@ def test_train_epochs_saved_caps_both_output_files(tmp_path):
     # the best epoch is kept wherever it fell, so it is the tail alone only when the
     # best is already in it
     i = len(numbers) - 1 - epochs["best"][::-1].index(True)
-    assert summary["best epoch"] == numbers[i]
-    assert summary["best val class error"] == pytest.approx(
-        epochs["val"]["class error"][i]
+    assert summary["best epoch index"] == numbers[i]
+    assert summary["best validation error"] == pytest.approx(
+        epochs["validation"]["validation error"][i]
     )
     assert len(numbers) == (2 if numbers[i] in (5, 6) else 3)
     assert numbers == sorted(numbers)
     # the columns are thinned with the epoch list, not left at their full length
     assert all(
         len(epochs[phase][term]) == len(numbers)
-        for phase in ("train", "val")
-        for term in TERMS
+        for phase, terms in TERMS.items()
+        for term in terms
     )
-
-    # the json is the same record in the other format, cap included
-    history = json.loads((tmp_path / HISTORY).read_text())
-    assert [entry["epoch"] for entry in history] == numbers
 
     # the resume checkpoint keeps the whole curve: the cap is a file concern, and a
     # run resumed from here has to know every epoch it already ran
@@ -777,8 +879,8 @@ def test_train_epochs_saved_must_be_a_positive_integer(tmp_path):
     decoder_yaml = _write_decoder_yaml(
         tmp_path / "small.decoder.yaml",
         epochs=2,
-        batches_per_epoch=4,
-        val_batches=2,
+        test_batches=4,
+        validation_batches=2,
         epochs_saved=0,
     )
     result = _run_cli(
@@ -819,7 +921,7 @@ def test_train_then_decode_cli(tmp_path, batch_size=200, target_error=20):
     """
     train_dir = tmp_path / "train"
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=2, batches_per_epoch=4, val_batches=2
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=4, validation_batches=2
     )
     trained = _run_cli(train_dir, *_train_argv(decoder_yaml))
     assert trained.returncode == 0, trained.stderr
@@ -854,7 +956,7 @@ def test_train_then_decode_cli(tmp_path, batch_size=200, target_error=20):
 def test_train_cli_rejects_untrainable_and_missing_args(tmp_path):
     """`-t` must fail loudly rather than half-run."""
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=1, batches_per_epoch=1, val_batches=1
+        tmp_path / "small.decoder.yaml", epochs=1, test_batches=1, validation_batches=1
     )
 
     no_matrix = _run_cli(
@@ -928,7 +1030,7 @@ def test_train_cli_rejects_a_schedule_missing_a_key(tmp_path):
     """A `train` block without every key must fail before any training."""
     cfg = read_yaml(get_path(DECODER_YAML))["decoder"]
     cfg["config"]["train"] = {
-        k: v for k, v in cfg["config"]["train"].items() if k != "val_batches"
+        k: v for k, v in cfg["config"]["train"].items() if k != "validation_batches"
     }
     bad = tmp_path / "bad.decoder.yaml"
     bad.write_text(yaml.safe_dump(_plain({"decoder": cfg})))
@@ -943,13 +1045,13 @@ def test_train_cli_rejects_a_schedule_missing_a_key(tmp_path):
         f"-ls={LOSS_YAML}",
     )
     assert result.returncode != 0
-    assert "missing under 'decoder.train': val_batches" in result.stderr
+    assert "missing under 'decoder.train': validation_batches" in result.stderr
 
 
 def test_train_cli_requires_the_loss_yaml(tmp_path):
     """`-t` without `-ls` must fail before anything is constructed."""
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=1, batches_per_epoch=1, val_batches=1
+        tmp_path / "small.decoder.yaml", epochs=1, test_batches=1, validation_batches=1
     )
     result = _run_cli(
         tmp_path,
@@ -1035,8 +1137,9 @@ def _train_step(decoder, saq, loss_fn, seed):
     """One batch -> forward -> loss -> backward -> update, on a seeded batch."""
     e, synd, H = _random_shots(saq, batch_size=8, seed=seed)
     out = decoder(_io_dict(saq, synd, H))
-    saq.backward(loss_fn.combine(*loss_fn.terms(out, e)))
-    saq.update()
+    loss_fn.combine(*loss_fn.terms(out, e)).backward()
+    saq.optimizer.step()
+    saq.optimizer.zero_grad(set_to_none=True)
 
 
 def _fresh_run(epochs, seed=0):
@@ -1044,7 +1147,8 @@ def _fresh_run(epochs, seed=0):
     torch.manual_seed(seed)
     decoder, saq, loss_fn = _training_setup()
     saq.configure_optimizer(epochs)
-    saq.set_training(True)
+    saq.train(True)
+    torch.set_grad_enabled(True)
     return decoder, saq, loss_fn
 
 
@@ -1059,12 +1163,12 @@ def test_resume_continues_optimizer_and_schedule(tmp_path):
     straight, straight_saq, straight_loss = _fresh_run(4)
     for epoch in range(4):
         _train_step(straight, straight_saq, straight_loss, seed=epoch)
-        straight_saq.lr_step()
+        straight_saq.scheduler.step()
 
     part, part_saq, part_loss = _fresh_run(4)
     for epoch in range(2):
         _train_step(part, part_saq, part_loss, seed=epoch)
-        part_saq.lr_step()
+        part_saq.scheduler.step()
     path = tmp_path / "train_state.pt"
     torch.save(part_saq.train_state(), path)
 
@@ -1074,41 +1178,166 @@ def test_resume_continues_optimizer_and_schedule(tmp_path):
     )
     for epoch in range(2, 4):
         _train_step(resumed, resumed_saq, resumed_loss, seed=epoch)
-        resumed_saq.lr_step()
+        resumed_saq.scheduler.step()
 
-    assert resumed_saq.current_lr() == straight_saq.current_lr()
+    assert (
+        resumed_saq.scheduler.get_last_lr()[0]
+        == straight_saq.scheduler.get_last_lr()[0]
+    )
     reference = straight_saq.state_dict()
     for key, value in resumed_saq.state_dict().items():
         assert torch.equal(value, reference[key]), key
 
 
-def test_train_metrics_hand_over_epoch_best_and_history(tmp_path):
-    """The training half of `MetricState` must export the run position it owns, and take it back.
+def _run_stem(decoder):
+    """The stem a training run would name its files after, for the given decoder."""
+    from syndrilla.metric.metric import _train_stem
+
+    return _train_stem(decoder)
+
+
+def test_train_metrics_take_back_epoch_best_and_history(tmp_path):
+    """The training half of `MetricState` must take back the run position it owns.
 
     This is the half of `last.pt` the decoder does not own: which epoch is next,
-    which was best, and the history so far. `main.py`'s resume calls exactly these.
+    which was best, and the history so far. `main.py`'s resume reads exactly these
+    back out of the checkpoint.
     """
     from syndrilla.metric import MetricState
 
-    cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 0}
-    metrics = MetricState.for_training(str(tmp_path), cfg)
-    metrics.epoch = 3
-    metrics.best = 0.25
-    metrics.history = [{"epoch": 1}, {"epoch": 2}]
+    class _Decoder:
+        def load_train_state(self, state):
+            self.state = state
 
-    restored = MetricState.for_training(str(tmp_path), cfg)
-    restored.load_train_state(metrics.train_state())
+    cfg = {
+        "epochs": 4,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 0,
+    }
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
+    metrics._decoder = _Decoder()  # what `train_resume_checkpoint` binds, without the run
+    metrics._fingerprint = {"epochs": 4}
 
-    assert restored.epoch == 3
-    assert restored.best == 0.25
-    assert restored.history == [{"epoch": 1}, {"epoch": 2}]
+    path = tmp_path / "hand_over_last.pt"
+    torch.save(
+        {
+            "epoch": 3,
+            "best": 0.25,
+            "history": [{"epoch": 1}, {"epoch": 2}],
+            "fingerprint": {"epochs": 4},
+        },
+        path,
+    )
+    metrics.train_load_checkpoint(str(path), "cpu")
+
+    assert metrics.epoch == 3
+    assert metrics.best == 0.25
+    assert metrics.history == [{"epoch": 1}, {"epoch": 2}]
     # two epochs of (2 train + 1 val) batches are behind us
-    assert restored.batches_done == 6
+    assert (metrics.epoch - 1) * metrics.period == 6
+
+
+def _metrics_under(tmp_path, term_names, **overrides):
+    """A training state metering a loss that declares `term_names`."""
+    from syndrilla.metric import MetricState
+
+    class _Loss:
+        pass
+
+    _Loss.term_names = term_names
+    cfg = dict(
+        {
+            "epochs": 1,
+            "test_batches": 1,
+            "validation_batches": 1,
+            "error_random_seed": 0,
+        },
+        **overrides,
+    )
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
+    metrics.train_bind_loss(_Loss())
+    return metrics
+
+
+def _metered(metrics, phase="train"):
+    """What one phase has accumulated, by the name each slot is keyed on."""
+    return dict(zip(metrics.keys, metrics.acc[phase]))
+
+
+def test_metrics_meter_the_terms_the_loss_declares(tmp_path):
+    """The run is keyed by the bound loss's own term names, not by a fixed set.
+
+    `lc`/`lp`/`ent` are the logical-centric loss's decomposition of its total. A second
+    loss splits its total some other way, and the metric half has to meter that one
+    without being edited, so the names come from the loss.
+    """
+    metrics = _metrics_under(tmp_path, ("a", "b"))
+
+    assert metrics.keys == ("total", "a", "b", "class_err")
+    metrics.train_set_hyperparameter(0)
+    metrics.train_update_metric(1, (torch.tensor(1.0), 0.25, 0.75), 0.5)
+
+    assert _metered(metrics) == {
+        "total": 1.0,
+        "a": 0.25,
+        "b": 0.75,
+        "class_err": 0.5,
+    }
+
+
+def test_a_loss_with_no_breakdown_is_metered_on_its_total(tmp_path):
+    """A loss whose total has no parts worth logging declares none, and still runs."""
+    metrics = _metrics_under(tmp_path, ())
+
+    assert metrics.keys == ("total", "class_err")
+    metrics.train_set_hyperparameter(0)
+    metrics.train_update_metric(1, (2.0,), 0.5)
+
+    assert _metered(metrics) == {"total": 2.0, "class_err": 0.5}
+
+
+def test_a_loss_handing_back_the_wrong_number_of_terms_is_refused(tmp_path):
+    """Each value lands in the slot its position picks, so a miscount cannot be silent.
+
+    An undeclared term would be filed under the next term's name and the run would
+    report numbers it never computed, which nothing downstream could detect.
+    """
+    metrics = _metrics_under(tmp_path, ("a", "b"))
+    metrics.train_set_hyperparameter(0)
+
+    with pytest.raises(ValueError, match="term"):
+        metrics.train_update_metric(1, (1.0, 0.25), 0.5)
+
+
+def test_a_loss_cannot_name_a_term_the_run_already_meters(tmp_path):
+    """`total` and `class_err` are the run's own, so a loss reusing one is rejected."""
+    with pytest.raises(ValueError, match="total"):
+        _metrics_under(tmp_path, ("total",))
+
+
+def test_logical_centric_declares_every_term_it_returns():
+    """The loss's `term_names` is the contract the metric half meters it by.
+
+    A name per value `terms` hands back, in that order, so a term added to the loss
+    without a name for it is caught here rather than surfacing as a mislabelled column.
+    """
+    from syndrilla.loss.logical_centric import logical_centric
+
+    decoder, saq = _make_decoder(SURFACE_MATRIX_YAML)
+    saq.train()
+    e, synd, H = _random_shots(saq)
+    loss_fn = _make_loss(saq)
+
+    assert logical_centric.create.term_names == ("lc", "lp", "ent")
+    assert len(loss_fn.terms(decoder(_io_dict(saq, synd, H)), e)) == len(
+        loss_fn.term_names
+    )
 
 
 def _sequence(metrics, batch_index, k=6):
     """The first `k` draws of the phase `batch_index` opens."""
-    metrics.begin_batch(batch_index)
+    metrics.train_set_hyperparameter(batch_index)
     return torch.rand(k)
 
 
@@ -1120,8 +1349,13 @@ def test_every_epoch_trains_on_the_same_batches(tmp_path):
     """
     from syndrilla.metric import MetricState
 
-    cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = MetricState.for_training(str(tmp_path), cfg)
+    cfg = {
+        "epochs": 4,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 7,
+    }
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
 
     first = _sequence(metrics, 0)  # epoch 1, first training batch
     metrics.epoch = 3
@@ -1134,27 +1368,37 @@ def test_validation_draws_new_errors_each_epoch(tmp_path):
     """Validation is not the training set replayed, and not the same twice."""
     from syndrilla.metric import MetricState
 
-    cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = MetricState.for_training(str(tmp_path), cfg)
+    cfg = {
+        "epochs": 4,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 7,
+    }
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
 
     metrics.epoch = 1
-    val_1 = _sequence(metrics, cfg["batches_per_epoch"])
+    val_1 = _sequence(metrics, cfg["test_batches"])
     train = _sequence(metrics, 0)
     metrics.epoch = 2
-    val_2 = _sequence(metrics, metrics.period + cfg["batches_per_epoch"])
+    val_2 = _sequence(metrics, metrics.period + cfg["test_batches"])
 
     assert not torch.equal(val_1, val_2), "validation replayed the same errors"
     assert not torch.equal(val_1, train), "validation replayed the training set"
 
 
-def test_begin_batch_reports_the_phase(tmp_path):
+def test_train_set_hyperparameter_reports_the_phase(tmp_path):
     """Seeding must not disturb which batches count as training."""
     from syndrilla.metric import MetricState
 
-    cfg = {"epochs": 2, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = MetricState.for_training(str(tmp_path), cfg)
+    cfg = {
+        "epochs": 2,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 7,
+    }
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
 
-    phases = [metrics.begin_batch(i) for i in range(metrics.period * 2)]
+    phases = [metrics.train_set_hyperparameter(i) for i in range(metrics.period * 2)]
 
     assert phases == ["train", "train", "val", "train", "train", "val"]
     # the phase it returns is the phase it is left in, so a caller can read it back
@@ -1162,11 +1406,11 @@ def test_begin_batch_reports_the_phase(tmp_path):
     assert metrics.phase == "val"
 
 
-def test_begin_batch_puts_the_decoder_in_the_phase_it_opened(tmp_path):
+def test_train_set_hyperparameter_puts_the_decoder_in_the_phase_it_opened(tmp_path):
     """The phase the metrics pick and the mode the decoder runs in are one decision.
 
     A validation batch that still built a graph, or a training batch that did not,
-    would train on the wrong set while reporting the right one, so `begin_batch` moves
+    would train on the wrong set while reporting the right one, so `train_set_hyperparameter` moves
     the bound decoder itself rather than leaving each caller to pair the two.
     """
     from syndrilla.metric import MetricState
@@ -1174,29 +1418,45 @@ def test_begin_batch_puts_the_decoder_in_the_phase_it_opened(tmp_path):
     class _Decoder:
         training = None
 
-        def set_training(self, training):
+        def train(self, training):
             self.training = training
 
-    cfg = {"epochs": 2, "batches_per_epoch": 2, "val_batches": 1, "seed": 7}
-    metrics = MetricState.for_training(str(tmp_path), cfg)
+    cfg = {
+        "epochs": 2,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 7,
+    }
+    metrics = MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML)
     decoder = _Decoder()
-    metrics.bind_decoder(decoder, fingerprint={})
+    metrics._decoder = decoder  # what `train_resume_checkpoint` binds, without the run
 
     modes = []
-    for i in range(metrics.period):
-        metrics.begin_batch(i)
-        modes.append(decoder.training)
+    try:
+        for i in range(metrics.period):
+            metrics.train_set_hyperparameter(i)
+            modes.append((decoder.training, torch.is_grad_enabled()))
+    finally:
+        # the switch is global, so a val batch left mid-test would follow the process out
+        torch.set_grad_enabled(True)
 
-    assert modes == [True, True, False]
+    assert modes == [(True, True), (True, True), (False, False)]
 
 
 def test_neighbouring_run_seeds_do_not_share_streams(tmp_path):
-    """`seed` and `seed + 1` must not produce the same training set."""
+    """`error_random_seed` and `error_random_seed + 1` must not produce the same training set."""
     from syndrilla.metric import MetricState
 
     def train_draw(seed):
-        cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": seed}
-        return _sequence(MetricState.for_training(str(tmp_path), cfg), 0)
+        cfg = {
+            "epochs": 4,
+            "test_batches": 2,
+            "validation_batches": 1,
+            "error_random_seed": seed,
+        }
+        return _sequence(
+            MetricState.train_initial(cfg, str(tmp_path), DECODER_YAML), 0
+        )
 
     assert not torch.equal(train_draw(7), train_draw(8))
 
@@ -1230,7 +1490,7 @@ def test_train_cli_runs_a_chain_ending_in_the_trained_decoder(tmp_path):
     saq_block = dict(cfg["config"])
     saq_block["model"] = dict(saq_block["model"], d_model=16, N_dec=1, h=2)
     saq_block["train"] = dict(
-        saq_block["train"], epochs=1, batches_per_epoch=2, val_batches=1
+        saq_block["train"], epochs=1, test_batches=2, validation_batches=1
     )
     cfg = dict(
         cfg,
@@ -1296,7 +1556,7 @@ def _train_argv(decoder_yaml, *extra):
 def _interrupt_after_epoch(run_dir, decoder_yaml, epoch):
     """Start a training run and SIGINT it once `epoch`'s line has been printed.
 
-    `record_epoch` writes the checkpoint before printing the line, so seeing the line
+    `train_compute_avg` writes the checkpoint before printing the line, so seeing the line
     means `last.pt` for that epoch is complete on disk.
     """
     import signal
@@ -1325,7 +1585,7 @@ def _interrupt_after_epoch(run_dir, decoder_yaml, epoch):
 def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     """`-tckpt` must finish an interrupted run exactly as if it had never stopped."""
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=4, batches_per_epoch=3, val_batches=1
+        tmp_path / "small.decoder.yaml", epochs=4, test_batches=3, validation_batches=1
     )
 
     straight_dir = tmp_path / "straight"
@@ -1333,8 +1593,8 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
 
     resumed_dir = tmp_path / "resumed"
     _interrupt_after_epoch(resumed_dir, decoder_yaml, 3)
-    # an interrupted run writes no history file -- that is `save_history`'s job at the
-    # end -- so the three finished epochs have to be in the checkpoint, or they are lost
+    # an interrupted run never reaches `train_save_checkpoint`, so the three finished epochs have
+    # to be in the checkpoint, or they are lost
     partial = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
     assert [entry["epoch"] for entry in partial["history"]] == [1, 2, 3]
     assert partial["epoch"] == 4
@@ -1345,15 +1605,16 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
     assert finished.returncode == 0, finished.stderr
 
     # the resumed run must reach the same place, epoch by epoch and weight by weight.
-    # Every recorded number is reproducible except how long the epoch took, which is
-    # wall clock and is asserted on separately
-    resumed_history = json.loads((resumed_dir / HISTORY).read_text())
-    straight_history = json.loads((straight_dir / HISTORY).read_text())
+    # The checkpoint's history is the whole curve, the epochs before the interrupt
+    # included. Every recorded number is reproducible except how long the epoch took,
+    # which is wall clock and is asserted on separately
+    expected = torch.load(straight_dir / LAST_PT, map_location="cpu", weights_only=True)
+    actual = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
+    resumed_history = actual["history"]
+    straight_history = expected["history"]
     assert all(entry.pop("time") > 0 for entry in resumed_history)
     assert all(entry.pop("time") > 0 for entry in straight_history)
     assert resumed_history == straight_history
-    expected = torch.load(straight_dir / LAST_PT, map_location="cpu", weights_only=True)
-    actual = torch.load(resumed_dir / LAST_PT, map_location="cpu", weights_only=True)
     for key, value in expected["state_dict"].items():
         assert torch.equal(actual["state_dict"][key], value), key
 
@@ -1361,16 +1622,19 @@ def test_resume_cli_finishes_an_interrupted_run(tmp_path):
 def test_resume_rejects_a_changed_schedule(tmp_path):
     """A checkpoint from a different schedule must be refused, not silently resumed."""
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=2, batches_per_epoch=2, val_batches=1
+        tmp_path / "small.decoder.yaml", epochs=2, test_batches=2, validation_batches=1
     )
     assert _run_cli(tmp_path, *_train_argv(decoder_yaml)).returncode == 0
 
     changed = _write_decoder_yaml(
-        tmp_path / "changed.decoder.yaml", epochs=2, batches_per_epoch=5, val_batches=1
+        tmp_path / "changed.decoder.yaml",
+        epochs=2,
+        test_batches=5,
+        validation_batches=1,
     )
     result = _run_cli(tmp_path, *_train_argv(changed, f"-tckpt={tmp_path / LAST_PT}"))
     assert result.returncode != 0
-    assert "batches_per_epoch" in result.stderr
+    assert "test_batches" in result.stderr
 
 
 def test_resume_needs_training_mode(tmp_path):
@@ -1395,17 +1659,17 @@ def test_resume_needs_training_mode(tmp_path):
 @pytest.mark.parametrize(
     "matrix_yaml, expected",
     [
-        # toric pins n = 2d^2, so d is recoverable: 200 qubits -> d10
-        (TORIC_MATRIX_YAML, "saq_hx_d10"),
-        # surface_5 carries 41 qubits: the unrotated relation d^2 + (d-1)^2 at d=5
-        (SURFACE_MATRIX_YAML, "saq_hx_d5"),
+        # the qubit count is read off the matrix, never turned into a distance
+        (TORIC_MATRIX_YAML, "saq_hx_n200"),
+        # surface_5's matrix carries 41 columns, which is also not d5
+        (SURFACE_MATRIX_YAML, "saq_hx_n41"),
     ],
 )
-def test_checkpoint_stem_names_the_configuration(matrix_yaml, expected):
-    """Checkpoints are named after what produced them, and never guess a distance."""
+def test_run_stem_names_the_configuration(matrix_yaml, expected):
+    """A run names its files after what produced them, and never guesses a distance."""
     _, saq = _make_decoder(matrix_yaml)
 
-    assert saq.checkpoint_stem() == expected
+    assert _run_stem(saq) == expected
 
 
 def test_code_type_is_rejected_rather_than_ignored():
@@ -1418,18 +1682,18 @@ def test_code_type_is_rejected_rather_than_ignored():
         _make_decoder(SURFACE_MATRIX_YAML, code_type="toric")
 
 
-def test_checkpoint_stem_separates_two_configurations(tmp_path):
+def test_run_stem_separates_two_configurations():
     """Two configs trained into one run dir must not overwrite each other's weights."""
     _, surface = _make_decoder(SURFACE_MATRIX_YAML)
     _, toric = _make_decoder(TORIC_MATRIX_YAML)
 
-    assert surface.checkpoint_stem() != toric.checkpoint_stem()
+    assert _run_stem(surface) != _run_stem(toric)
 
 
 def test_best_pt_stays_bare_weights_and_last_pt_still_decodes(tmp_path):
     """`best.pt` must stay a portable state_dict; `last.pt` must still load to decode."""
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=1, batches_per_epoch=2, val_batches=1
+        tmp_path / "small.decoder.yaml", epochs=1, test_batches=2, validation_batches=1
     )
     assert _run_cli(tmp_path, *_train_argv(decoder_yaml)).returncode == 0
 
@@ -1453,42 +1717,23 @@ def test_best_pt_stays_bare_weights_and_last_pt_still_decodes(tmp_path):
 # --------------------------------------------------------------------------- #
 # Batch-shape constraints
 #
-# These are saq's, not training's: `logical_logits` / `logical_prior` are written
-# per forward row and are not unfolded by RoundFlattenWrapper, so a multi-round
-# batch reaches the loss with the llr at [B, d, n] and the logical head at
-# [B*d, 2^k]. A second channel is read as a second round for the same reason.
+# `logical_logits` / `logical_prior` are written per forward row and are not unfolded
+# by RoundFlattenWrapper, so a multi-round batch reaches the loss with the llr at
+# [B, d, n] and the logical head at [B*d, 2^k]. A second channel is read as a second
+# round for the same reason. Nothing checks the shape up front, so what stops such a
+# run is the mismatch itself, raised by the loss.
 # --------------------------------------------------------------------------- #
 
 
-def test_check_train_batch_accepts_a_single_round_single_channel_batch():
-    """The shape saq is built for must pass without complaint."""
-    _, saq = _make_decoder(SURFACE_MATRIX_YAML)
-    assert saq.check_train_batch(1, 1) is None
+def test_train_cli_does_not_train_on_a_batch_shape_saq_cannot_learn_from(tmp_path):
+    """`-t` on a multi-round measurer must fail rather than train on paired-up shapes.
 
-
-def test_check_train_batch_rejects_multiple_rounds():
-    """A multi-round batch must be refused by the decoder, naming rounds."""
-    _, saq = _make_decoder(SURFACE_MATRIX_YAML)
-    with pytest.raises(ValueError, match="rounds"):
-        saq.check_train_batch(2, 1)
-
-
-def test_check_train_batch_rejects_multiple_channels():
-    """A multi-channel batch must be refused by the decoder, naming the channels."""
-    _, saq = _make_decoder(SURFACE_MATRIX_YAML)
-    with pytest.raises(ValueError, match="number_channel"):
-        saq.check_train_batch(1, 2)
-
-
-def test_train_cli_reports_the_decoders_own_batch_constraint(tmp_path):
-    """`-t` on a multi-round measurer must fail with saq's message, not main.py's.
-
-    The constraint belongs to the decoder, so the error has to name the decoder. A
-    generic "training needs a single-round batch" from `main.py` would be wrong for a
-    decoder that consumes the rounds dimension itself.
+    The rows are what disagree: the loss is handed one logical row per forward row,
+    `rounds` times as many as the targets it is scored against. This is the run
+    failing where the mismatch lands, not being refused for a shape it declared.
     """
     decoder_yaml = _write_decoder_yaml(
-        tmp_path / "small.decoder.yaml", epochs=1, batches_per_epoch=1, val_batches=1
+        tmp_path / "small.decoder.yaml", epochs=1, test_batches=1, validation_batches=1
     )
     result = _run_cli(
         tmp_path,
@@ -1505,17 +1750,17 @@ def test_train_cli_reports_the_decoders_own_batch_constraint(tmp_path):
     # `create_decoder_with_saq` on every run and would pass no matter who raised
     raised = [ln for ln in result.stderr.splitlines() if ln.startswith("ValueError:")]
     assert raised, result.stderr
-    assert "saq" in raised[-1] and "rounds" in raised[-1], raised[-1]
+    assert "batch_size" in raised[-1], raised[-1]
 
 
-def test_decoder_describes_itself_in_the_resume_fingerprint(tmp_path):
+def test_decoder_describes_itself_in_the_resume_fingerprint():
     """The model half of the fingerprint must come from the decoder, not the metrics.
 
     `MetricState` owns the schedule and the batch size; what algorithm this is, what
     code shape it was built for, and what optimizer settings it will use are the
     decoder's to state. The metrics merge the two rather than reaching into the model.
     """
-    from syndrilla.metric import MetricState
+    from syndrilla.metric.metric import _train_fingerprint
 
     _, saq = _make_decoder(SURFACE_MATRIX_YAML)
     model = saq.train_fingerprint()
@@ -1529,10 +1774,13 @@ def test_decoder_describes_itself_in_the_resume_fingerprint(tmp_path):
         "min_lr": saq.min_lr,
     }
 
-    cfg = {"epochs": 4, "batches_per_epoch": 2, "val_batches": 1, "seed": 0}
-    merged = MetricState.for_training(str(tmp_path), cfg).fingerprint(
-        saq, batch_size=16
-    )
+    cfg = {
+        "epochs": 4,
+        "test_batches": 2,
+        "validation_batches": 1,
+        "error_random_seed": 0,
+    }
+    merged = _train_fingerprint(cfg, saq, batch_size=16)
     # every model key survives the merge, and the schedule half is added to it
     assert merged.items() >= model.items()
     assert merged["batch_size"] == 16
@@ -1552,12 +1800,14 @@ def test_decoder_reads_its_settings_from_their_own_blocks():
     """Architecture, CPND and optimizer settings each come from their own block."""
     _, saq = _make_decoder(
         SURFACE_MATRIX_YAML,
-        "rotated_surface",
         model={"d_model": 64, "N_dec": 3, "h": 8, "dropout": 0.25, "no_mask": 1},
         cpnd={"enable": False, "passes": 4},
         optimizer={"lr": 1.0e-3, "weight_decay": 2.0e-7, "min_lr": 3.0e-6},
     )
-    assert (saq.d_model, saq.N_dec) == (64, 3)
+    # d_model is checked where it lands, on the token embeddings, rather than on a copy
+    # of the setting: an architecture built at some other width would still pass that
+    assert (saq.learnable_embed_S.shape[1], len(saq.layers)) == (64, 3)
+    assert saq.N_dec == 3
     assert saq.src_mask_SN is None  # no_mask: 1
     assert saq.use_cpnd is False and saq.cpnd_passes == 4
     assert (saq.lr, saq.weight_decay, saq.min_lr) == (1.0e-3, 2.0e-7, 3.0e-6)

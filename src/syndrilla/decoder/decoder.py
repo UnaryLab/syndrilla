@@ -374,13 +374,13 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     return blocks
 
 
-# every call a training run makes on its decoder, in the order the run makes them
+# every call a training run makes on its decoder, in the order the run makes them.
+# The per-batch step is not one of them: the loop steps `self.optimizer` itself, and
+# `configure_optimizer` is what puts that optimizer on the decoder
 TRAINABLE_STAGES = (
-    "check_train_batch",
     "train_fingerprint",
     "configure_optimizer",
-    "backward",
-    "update",
+    "train_state",
 )
 
 
