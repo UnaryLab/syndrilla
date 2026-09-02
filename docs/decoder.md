@@ -347,11 +347,11 @@ decoder:
     checkpoint: examples/alist/saq_hx_n41_best.pt
 ```
 
-`checkpoint` is the only key that tells training from decoding, so the architecture ships as two yamls that differ in that one line: `train_saq_hx.decoder.yaml` leaves it out, which is what `-t` fits from random weights, and `saq_hx.decoder.yaml` is the file above, the same model pointed at the weights that run produced. Each mode is held to its own file. A decode run is **refused** if a learned decoder in the chain names no weights, since a decoder left at its initialization decodes at chance and the result file reports that like any other logical error rate; and `-t` **ignores** the key rather than warm-starting from it, saying so in the log, because resuming a run is `-tckpt`'s job and it restores the optimizer and the schedule alongside the weights. Editing the architecture means editing both files, or the checkpoint no longer fits the yaml naming it; a mismatch is refused when the weights are loaded rather than decoded around. The stim path ships the same pair, `train_stim_saq.decoder.yaml` and `stim_saq.decoder.yaml` ([interface.md](interface.md)).
+`checkpoint` is the only key that tells a fitted architecture from an unfitted one, so it ships as two yamls that differ in that one line: `train_saq_hx.decoder.yaml` leaves it out and is the one a training run fits from random weights ([trainer.md](trainer.md)), and `saq_hx.decoder.yaml` is the file above, the same model pointed at the weights that run produced. Each mode is held to its own file. A decode run is **refused** if a learned decoder in the chain names no weights, since a decoder left at its initialization decodes at chance and the result file reports that like any other logical error rate. Editing the architecture means editing both files, or the checkpoint no longer fits the yaml naming it; a mismatch is refused when the weights are loaded rather than decoded around. The stim path ships the same pair, `train_stim_saq.decoder.yaml` and `stim_saq.decoder.yaml` ([interface.md](interface.md)).
 
 | Key                          | Description                                                                    | Example            |
 |------------------------------|--------------------------------------------------------------------------------|--------------------|
-| `decoder.config.checkpoint`         | Trained weights; required by every decode run, ignored by `-t`, which writes them | `examples/alist/saq_hx_n41_best.pt` |
+| `decoder.config.checkpoint`         | Trained weights; required by every decode run, written by a training run ([trainer.md](trainer.md)) | `examples/alist/saq_hx_n41_best.pt` |
 | `decoder.config.model.d_model`      | Token embedding width                                                      | `128`              |
 | `decoder.config.model.N_dec`        | Number of transformer (SLTD) layers                                        | `6`                |
 | `decoder.config.model.h`            | Number of attention heads (must divide `d_model`)                          | `16`               |
@@ -360,65 +360,9 @@ decoder:
 | `decoder.config.cpnd.enable`        | (optional) Run the CPND stage; a block, so a bare `cpnd: false` is rejected | `true`            |
 | `decoder.config.cpnd.passes`        | (optional) Sweeps over the stabilizer basis in the descent                 | `1`                |
 
-Each block has one reader, the decoder itself; a key written at the top of `decoder` is rejected naming where it belongs. The optimizer and the epoch schedule are not here: they configure the run rather than the model, so they live in the training yaml (`-tr`) under `training.optimizer` and `training.schedule`, and an `optimizer` or `train` block left in the decoder yaml is rejected pointing there. `dtype` defaults to `float32`, since float64 attention costs several times more for no accuracy gain, and **a decode run naming no `checkpoint` is refused rather than metering random weights**.
+Each block has one reader, the decoder itself; a key written at the top of `decoder` is rejected naming where it belongs. The optimizer and the epoch schedule are not here: they configure a run rather than the model, so they belong to the trainer module and live in the training yaml `-tr` names; an `optimizer` or `train` block left in the decoder yaml is rejected pointing there. `dtype` defaults to `float32`, since float64 attention costs several times more for no accuracy gain, and **a decode run naming no `checkpoint` is refused rather than metering random weights**.
 
-**Training (`-t`).**
-
-```
-syndrilla -t -r=tests/test_outputs \
-    -d=examples/alist/train_saq_hx.decoder.yaml \
-    -m=examples/alist/surface_5.matrix.yaml \
-    -e=examples/alist/bsc_train.error.yaml \
-    -s=examples/alist/perfect.syndrome.yaml \
-    -tr=examples/alist/train_saq_hx.training.yaml \
-    -bs=256
-```
-
-The `-tr` yaml is three blocks, one per thing a run is configured by; the error rate comes from the error yaml (a `[lower, upper, points]` range draws one level per shot, so a run covers a stretch of the curve) and the batch size from `-bs`.
-
-```
-training:
-  loss:
-    function: saq
-    lambda_lc: 1.0
-    lambda_lp: 0.2
-    lambda_ent: 1.0
-  optimizer:
-    lr: 5.0e-4
-    weight_decay: 5.0e-8
-    min_lr: 1.0e-6
-  schedule:
-    epochs: 100
-    test_batches: 200
-    validation_batches: 20
-    error_random_seed: 42
-```
-
-| Key                                   | Description                                                                    | Example            |
-|---------------------------------------|--------------------------------------------------------------------------------|--------------------|
-| `training.loss.function`              | Which objective supervises the run; names a module under `syndrilla/trainer/`  | `saq`  |
-| `training.loss.*`                     | That objective's own settings, e.g. `saq`'s three term weights      | `lambda_lp: 0.2`   |
-| `training.optimizer.*`                | What the `Trainer` builds the run's optimizer from; it fits Adam with `lr`, `weight_decay` and `min_lr` | `lr: 5.0e-4` |
-| `training.schedule.epochs`            | Epochs to run                                                                   | `100`              |
-| `training.schedule.test_batches`      | Training batches per epoch                                                      | `200`              |
-| `training.schedule.validation_batches`| Validation batches per epoch, drawn clear of the training set                    | `20`               |
-| `training.schedule.error_random_seed` | Seeds the error stream, so each epoch trains on the same batches                 | `42`               |
-
-Each block has one reader: `loss` the training module, `optimizer` the decoder being trained, `schedule` the metric module.
-
-**The `saq` objective.** The one objective shipped under `syndrilla/trainer/`, and what the `saq` decoder is trained with. It is three terms, weighted by the three lambdas above and reported separately on every epoch and batch line:
-
-| Term | Weight | What it supervises |
-|------|--------|--------------------|
-| `L_LC` | `lambda_lc` | Cross-entropy of the decoder's logical class logits against the true logical class of the error |
-| `L_LP` | `lambda_lp` | The same cross-entropy on the logical *prior*, the class the embedding layer predicts before the transformer runs |
-| `L_Ent` | `lambda_ent` | The per-qubit `llr`, through the GF(2) parity of the residual error over the logical operator's support |
-
-`L_Ent` is computed in the **log domain**: its parity is the sign and minimum magnitude of the residual llrs over that support, not a product of per-bit probabilities. The probability-domain form multiplies one factor below 1 per bit in the support, which is exact on a code's handful of qubits and worthless on a circuit-level DEM's tens of fault mechanisms, where the product and its gradient both underflow and the term reports a constant `ln 2`. See [interface.md](interface.md) for the measured effect on the stim path. A decoder trained with this objective must therefore emit `logical_logits` and `logical_prior` alongside `llr`; `terms()` names what it returns in `term_names`, which is what the metric module keys the run's columns by.
-
-A chain trains its **last** decoder, and `-i` trains from circuit-level data the same way. The run writes into `-r`: `<stem>_best.pt`, the `state_dict` `decoder.config.checkpoint` loads; `<stem>_last.pt`, the run position `-tckpt` resumes from; and `<stem>_result.yaml`, a `train_full` summary plus the curve by column. Beside them sits the `main-<time>.log` every run writes, which carries the run's epoch and batch lines along with the rest of the toolchain's trace at `-l`; the console keeps the epoch lines as they are made. A second configuration adds files rather than overwriting the first.
-
-**Resuming (`-ckpt` and `-tckpt`).** The pair, `-ckpt <stem>_result.yaml` and `-tckpt <stem>_last.pt` with every other flag unchanged, continues a run to bit-identical weights and an identical curve; either alone is refused naming the other. State is restored from the `*_last.pt`, while the yaml is only checked: a run whose model, noise, schedule, `-bs`, loss, optimizer or selection metric moved is refused, naming every field that did. A weights-only `*_best.pt` has no fingerprint and is refused pointing at `decoder.config.checkpoint`; `-tckpt` needs `-t`.
+The weights this architecture needs are produced by a training run, which the trainer module owns end to end: the objective, the optimizer, the epoch schedule, the run's outputs, and how an interrupted run is resumed. See [trainer.md](trainer.md).
 
 ### 3.12. bp_sf
 Normalized min-sum BP followed by syndrome-flipping post-processing on the samples BP leaves unconverged: the most-oscillating bits become flip candidates, and combinations of them are sampled to look for one that satisfies the syndrome. Example configuration (`bp_sf_hx.decoder.yaml`):

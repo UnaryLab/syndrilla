@@ -23,7 +23,7 @@ A PyTorch-based numerical simulator for decoders in quantum error correction.
       - [2.4. Decoder module](#24-decoder-module)
       - [2.5. Logical check module](#25-logical-check-module)
       - [2.6. Interface module](#26-interface-module)
-      - [2.7. Training module](#27-training-module)
+      - [2.7. Trainer module](#27-trainer-module)
       - [2.8. Metric module](#28-metric-module)
     - [3. Output format and metrics](#3-output-format-and-metrics)
       - [3.1. Per-decoder metrics](#31-per-decoder-metrics)
@@ -128,7 +128,7 @@ syndrilla -t
 The weights kept are the epoch the decoder scores best, the lowest validation logical error for ```saq```, named in the result YAML under ```selection metric```.
 A learned decoder therefore ships as two YAMLs of one architecture: ```train_saq_hx.decoder.yaml``` names no weights and is the one ```-t``` fits, and ```saq_hx.decoder.yaml``` adds the ```config.checkpoint``` key naming trained weights, so the normal command above evaluates them.
 Each mode is held to its own file: a run without ```-t``` is refused if a learned decoder names no weights, since it would decode at chance and still report a logical error rate, and ```-t``` ignores the key rather than warm-starting from it (that is what ```-tckpt``` does, optimizer and schedule included).
-See [Decoder module](docs/decoder.md) for the training loop, its configuration, its outputs, and how an interrupted run is resumed.
+See [Trainer module](docs/trainer.md) for the training loop, its configuration, its outputs, and how an interrupted run is resumed.
 
 ### 2. Input format and configurations
 <table>
@@ -139,9 +139,9 @@ See [Decoder module](docs/decoder.md) for the training loop, its configuration, 
   </tr>
 </table>
 
-Syndrilla virtualizes the full decoder pipeline of data encoding, syndrome measurement, and error decoding into modules: error, syndrome, matrix, decoder, logical check, interface, training, and metric, as shown in the figure above.
+Syndrilla virtualizes the full decoder pipeline of data encoding, syndrome measurement, and error decoding into modules: error, syndrome, matrix, decoder, logical check, interface, trainer, and metric, as shown in the figure above.
 All configurations are defined through YAML files. 
-Each module requires its own dedicated YAML configuration file, with the exception of the metric module. The training module is used only for training and is selected with `-tr`; it carries the objective, the optimizer, and the epoch schedule.
+Each module requires its own dedicated YAML configuration file, with the exception of the metric module. The trainer module supports the decoder rather than sitting in the decode pipeline: it is built only for a `-t` run, is selected with `-tr`, and carries the objective, the optimizer, and the epoch schedule.
 
 #### 2.1. Error module
 The error YAML file defines all configuration parameters associated with the error model. 
@@ -271,9 +271,9 @@ The following table details the configuration parameters used in the decoder mod
 | `decoder.rebatch_speedup`| (optional) Adaptive batch-shrinking cap; see [Decoder module](docs/decoder.md) | `{kl_eps: 0.001}`                                |
 | `decoder.config`       | Algorithm-specific settings (e.g. `max_iter`, or a learned decoder's `checkpoint`). A mapping configures the first algorithm; a list gives one entry per entry of `decoder.algorithm` | `max_iter: 181`             |
 
-The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoder.config`. Written as a plain mapping, as above, it configures the first algorithm, so `max_iter` reaches `bp_norm_min_sum` and `osd_0`, which takes no settings of its own, runs on its defaults. Written as a list it is matched to `decoder.algorithm` by position, which is how a chain configures a stage other than its first. Keys left at the old top level are rejected with a message naming the block they moved into. See [Decoder module](docs/decoder.md) for the full rule.
+The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoder.config`. Written as a plain mapping, as above, it configures the first algorithm, so `max_iter` reaches `bp_norm_min_sum` and `osd_0`, which takes no settings of its own, runs on its defaults. Written as a list it is matched to `decoder.algorithm` by position, which is how a chain configures a stage other than its first. A key written at the top level that belongs under `decoder.config`, or the reverse, is rejected with a message naming the block it belongs in. See [Decoder module](docs/decoder.md) for the full rule.
 
-An AI decoder trained with ```-t``` takes no run settings from this block: its optimizer and epoch schedule configure the run rather than the model, so they live in the training YAML passed with ```-tr```, under ```training.optimizer``` and ```training.schedule```. The decoder block keeps the model itself, and a decode run loads ```decoder.config.checkpoint``` from it. See [Decoder module](docs/decoder.md) for the key list.
+An AI decoder trained with ```-t``` takes no run settings from this block: its optimizer and epoch schedule configure the run rather than the model, so they live in the training YAML passed with ```-tr```, under ```training.optimizer``` and ```training.schedule```; see [Trainer module](docs/trainer.md). The decoder block keeps the model itself, and a decode run loads ```decoder.config.checkpoint``` from it, whose key list is in [Decoder module](docs/decoder.md).
 
 When `decoder.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This covers every registered decoder except `saq`: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
 
@@ -330,8 +330,8 @@ The following table provides a detailed explanation of the configuration paramet
 
 The device and dtype of an interface run come from the **decoder** YAML, not from this file. See [Interface module](docs/interface.md) for the full key list.
 
-#### 2.7. Training module
-The training YAML file defines everything that configures a ```-t``` run rather than the model it fits: the objective, the optimizer, and the epoch schedule.
+#### 2.7. Trainer module
+The trainer is a support module for the decoder: its YAML file defines everything that configures a ```-t``` run rather than the model it fits, namely the objective, the optimizer, and the epoch schedule.
 It is read only when training, and is the one module a decode run never builds.
 An example configuration file is provided in ```train_saq_hx.training.yaml```:
 
@@ -353,7 +353,7 @@ training:
     error_random_seed: 42
 ```
 
-The following table provides a detailed explanation of the configuration parameters used in the training module YAML file.
+The following table provides a detailed explanation of the configuration parameters used in the trainer module YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
 | `training.loss.function`| Objective that supervises the run, naming a module under `syndrilla/trainer/` | `saq` |
@@ -364,7 +364,7 @@ The following table provides a detailed explanation of the configuration paramet
 | `training.schedule.validation_batches`| Validation batches per epoch, drawn clear of the training set | `20`      |
 | `training.schedule.error_random_seed`| Seeds the error stream, so every epoch trains on the same batches | `42`       |
 
-Each block has one reader: `loss` the training module, `optimizer` the decoder being trained, `schedule` the metric module. See [Decoder module](docs/decoder.md) for the training loop and its outputs.
+Each block has one reader: `loss` the trainer module, `optimizer` the decoder being trained, `schedule` the metric module. See [Trainer module](docs/trainer.md) for the training loop and its outputs.
 
 #### 2.8. Metric module
 This module does not take any YAML file as inputs, it will report default metrics as output, which will be described in the output.
@@ -498,7 +498,7 @@ syndrilla -r=tests/test_outputs
           -ckpt=tests/test_outputs/result_phy_err_0.1.yaml
 ```
 
-A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to the run's ```*_result.yaml``` and ```-tckpt``` to its ```*_last.pt```, with every other flag left as it was; either flag without the other is refused, as is a resume under a different selection metric. See [Decoder module](docs/decoder.md).
+A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to the run's ```*_result.yaml``` and ```-tckpt``` to its ```*_last.pt```, with every other flag left as it was; either flag without the other is refused, as is a resume under a different selection metric. See [Trainer module](docs/trainer.md).
 
 ### 5. Sweep configurations
 Syndrilla also allows sweeping configurations during simulation, which is done in the ```zoo``` folder.
