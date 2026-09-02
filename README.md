@@ -102,8 +102,8 @@ Following is a table for detailed explaination on each command line arguments:
 | `-i`     | Path to interface YAML file, replacing `-m`/`-e`/`-s`/`-c` | `-i=examples/stim/stim_generated.interface.yaml` |
 | `-ckpt`  | Path to checkpoint YAML file to resume; with `-t`, the training run's `*_result.yaml`, given alongside its `-tckpt` | `-ckpt=tests/test_outputs/result_phy_err_0.1.yaml` |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
-| `-te`    | Total number of errors to stop decoding, default `100` | `-te=1000`                                         |
-| `-tb`    | Total number of batches to stop decoding, instead of an error target; not given with `-te` | `-tb=500`                                         |
+| `-te`    | Total number of errors to stop decoding, default `1000`; ignored with `-t` | `-te=1000`                                         |
+| `-tb`    | Target number of batches to stop decoding, instead of an error target; wins over `-te` with a warning if both are given, ignored with `-t` | `-tb=500`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-ls`    | Path to loss YAML file                       | `-ls=examples/alist/logical_centric.loss.yaml`    |
@@ -124,6 +124,7 @@ syndrilla -t
           -bs=256
 ```
 
+The weights kept are the epoch the decoder scores best, the lowest validation logical error for ```saq```, named in the result YAML under ```selection metric```.
 Point the decoder YAML's ```config.checkpoint``` key at the trained weights and the normal command above evaluates them.
 See [Decoder module](docs/decoder.md) for the training loop, its configuration, its outputs, and how an interrupted run is resumed.
 
@@ -431,6 +432,7 @@ The following table provides a detailed explanation of the metrics in the output
 | `batch size`                   | Number of samples in each batch                               |
 | `batch count`                  | Total number of batches                                    |
 | `target error`                 | Total number of errors to stop decoding                        |
+| `target batch`                 | Batch budget the run was given with `-tb`, `null` under an error target |
 | `target error reached`         | Actual number of logical errors observed                       |
 | `data type`                    | Floating point data used                                       |
 | `physical error rate`          | Physical error rate                                            |
@@ -457,7 +459,7 @@ syndrilla -r=tests/test_outputs
           -ckpt=tests/test_outputs/result_phy_err_0.1.yaml
 ```
 
-A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to the run's ```*_result.yaml``` and ```-tckpt``` to its ```*_last.pt```, with every other flag left as it was; either flag without the other is refused. See [Decoder module](docs/decoder.md).
+A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to the run's ```*_result.yaml``` and ```-tckpt``` to its ```*_last.pt```, with every other flag left as it was; either flag without the other is refused, as is a resume under a different selection metric. See [Decoder module](docs/decoder.md).
 
 ### 5. Sweep configurations
 Syndrilla also allows sweeping configurations during simulation, which is done in the ```zoo``` folder.

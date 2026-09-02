@@ -610,7 +610,7 @@ class MetricState:
         file_name,
         check_num,
         done=0,
-        total_batch=None,
+        target_batch=None,
     ):
         """
         Saves decoding metrics for all decoders into a single YAML file.
@@ -766,7 +766,7 @@ class MetricState:
             "batch size": batch_size,
             "batch count": num_batches,
             "target error": target_error,
-            "total batch": total_batch,
+            "target batch": target_batch,
             "target error reached": error_reach,
             "data type": dtype,
             "physical error rate": physical_error_rate,
@@ -802,7 +802,7 @@ class MetricState:
         dtype,
         error_rate,
         H_file_name,
-        total_batch=None,
+        target_batch=None,
     ):
         """Build this run's decode state, resuming from `checkpoint` if one was given."""
         if checkpoint is None:
@@ -818,7 +818,7 @@ class MetricState:
             dtype,
             error_rate,
             H_file_name,
-            total_batch,
+            target_batch,
         )
         return metrics, ckpt_meta["num_err"], ckpt_meta["batch_count"]
 
@@ -837,7 +837,7 @@ class MetricState:
             "batch_size": int(full.get("batch size", 0)),
             "batch_count": int(full.get("batch count", 0)),
             "target_error": _opt_int(full.get("target error", 0)),
-            "total_batch": _opt_int(full.get("total batch")),
+            "target_batch": _opt_int(full.get("target batch")),
             "num_err": int(full.get("target error reached", 0)),
             "dtype": full.get("data type", 0),
             "physical_error_rate": float(full.get("physical error rate", 0.0)),
@@ -918,13 +918,13 @@ class MetricState:
         dtype,
         physical_error_rate,
         H_file_name,
-        total_batch=None,
+        target_batch=None,
     ):
         """Validate checkpoint metadata matches current run parameters."""
         checks = [
             ("batch_size", ckpt_meta["batch_size"], batch_size),
             ("target_error", ckpt_meta["target_error"], target_error),
-            ("total_batch", ckpt_meta["total_batch"], total_batch),
+            ("target_batch", ckpt_meta["target_batch"], target_batch),
             ("dtype", ckpt_meta["dtype"], str(dtype)),
             (
                 "physical_error_rate",
@@ -983,8 +983,6 @@ class MetricState:
         state.start = time.time()
         state._epoch_start = state.start
         state.batch_size = None
-        state.log = logger.bind(train=True)
-        state._sink_id = None
         state.phase = "train"
         state.lr = None
         state._decoder = None
@@ -1056,12 +1054,6 @@ class MetricState:
             # batches consumed by the epochs already recorded
             start = (self.epoch - 1) * self.period
 
-        self._sink_id = logger.add(
-            os.path.join(self.run_dir, f"{_train_stem(decoder)}_train.log"),
-            level="INFO",
-            filter=lambda record: record["extra"].get("train", False),
-            format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
-        )
         for line in (
             f"training <{decoder.algo}>: params={params:,} "
             f"device={decoder.device} dtype={decoder.dtype}",
@@ -1069,9 +1061,7 @@ class MetricState:
             f"config: {dict(self.cfg)}",
             resume_line,
         ):
-            print(line)
-            self.log.info(line)
-        print()
+            logger.info(line)
 
         self.lr = decoder.scheduler.get_last_lr()[0]
         self.batch_size = batch_size
@@ -1098,7 +1088,8 @@ class MetricState:
         if saved_name != score_name:
             raise ValueError(
                 f"Cannot resume <{path}>: its best score is a <{saved_name}> and this "
-                f"run selects on <{score_name}>."
+                f"run selects on <{score_name}>. The two are not comparable, so the "
+                f"record cannot carry over."
             )
         self._decoder.load_train_state(state)
         self.epoch = state["epoch"]
@@ -1181,7 +1172,7 @@ class MetricState:
         position = (batch_index - 1) % self.period + 1
         # a batch recorded before an optimizer is bound has no rate to report
         lr = "n/a" if self.lr is None else f"{self.lr:.2e}"
-        self.log.info(
+        logger.info(
             f"  batch {position:4d}/{self.period}  epoch {self.epoch:4d}/{self.epochs}  "
             f"{self.phase:5s}  lr={lr}  "
             f"loss={values[0]:.4f}{f' ({breakdown})' if breakdown else ''}  "
@@ -1271,8 +1262,7 @@ class MetricState:
         )
         self.train_save_output_yaml()
 
-        print(line)
-        self.log.info(line)
+        logger.info(line)
         # after the step: `lr` above was the rate this epoch ran at, this is the next's
         self.lr = self._decoder.scheduler.get_last_lr()[0]
 
@@ -1342,23 +1332,19 @@ class MetricState:
         return result
 
     def train_save_checkpoint(self):
-        """Close the run out, drop the log sink, and report where its outputs landed."""
+        """Close the run out and report where its outputs landed."""
         stem = _train_stem(self._decoder)
         self.train_save_output_yaml()
-        if self._sink_id is not None:
-            logger.remove(self._sink_id)
-            self._sink_id = None
         best_path = os.path.join(self.run_dir, f"{stem}_best.pt")
         last_path = os.path.join(self.run_dir, f"{stem}_last.pt")
         result_path = os.path.join(self.run_dir, f"{stem}_result.yaml")
-        print(
-            f"\ndone in {time.time() - self.start:.1f}s. "
-            f"best {_train_score_name(self._decoder)} {self.best:.4f}"
-        )
-        print(f"checkpoints: {best_path}, {last_path}")
-        print(f"result: {result_path}")
-        print(f"\nadd to the decoder yaml to use it:\n\n  checkpoint: {best_path}\n")
-        print(
-            f"to continue this run, add to the same command:\n\n"
-            f"  -ckpt {result_path} -tckpt {last_path}\n"
-        )
+        for line in (
+            f"done in {time.time() - self.start:.1f}s. "
+            f"best {_train_score_name(self._decoder)} {self.best:.4f}",
+            f"checkpoints: {best_path}, {last_path}",
+            f"result: {result_path}",
+            f"add to the decoder yaml to use it: checkpoint: {best_path}",
+            f"to continue this run, add to the same command: "
+            f"-ckpt {result_path} -tckpt {last_path}",
+        ):
+            logger.info(line)

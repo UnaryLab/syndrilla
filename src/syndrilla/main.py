@@ -1,5 +1,4 @@
 import argparse
-import sys
 import time
 
 import pyfiglet
@@ -69,14 +68,14 @@ def parse_commandline_args():
         "--target_error",
         type=int,
         default=None,
-        help="Total number of errors to stop decoding, default 100 (unless -tb is given; ignored with -t).",
+        help="Total number of errors to stop decoding, default 1000 unless -tb is given. Ignored with -t.",
     )
     parser.add_argument(
         "-tb",
-        "--total_batch",
+        "--target_batch",
         type=int,
         default=None,
-        help="Total number of batches to stop decoding, instead of an error target. Not with -te; ignored with -t.",
+        help="Target number of batches to stop decoding, instead of an error target. Wins over -te, with a warning, if both are given; ignored with -t.",
     )
     parser.add_argument(
         "-m", "--matrix_yaml", type=str, default=None, help="Path to matrix yaml."
@@ -96,7 +95,7 @@ def parse_commandline_args():
         "-t",
         "--train",
         action="store_true",
-        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<size>{_best.pt,_last.pt,_result.yaml,_train.log} to --run_dir.",
+        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<size>{_best.pt,_last.pt,_result.yaml} to --run_dir, beside the run's main-<time>.log.",
     )
     parser.add_argument(
         "-ls",
@@ -121,13 +120,10 @@ def parse_commandline_args():
 def main():
     args = parse_commandline_args()
 
-    # set up output log
+    # set up output log: the same trace either mode writes, every module in it
     logger.remove()
-    if args.train:
-        logger.add(sys.stderr, level="WARNING")
-    else:
-        output_log = args.run_dir + "/main" + "-" + str(time.time()) + ".log"
-        logger.add(output_log, level=args.log_level)
+    output_log = args.run_dir + "/main" + "-" + str(time.time()) + ".log"
+    logger.add(output_log, level=args.log_level)
 
     # set up banner
     ascii_banner = pyfiglet.figlet_format("SYNDRILLA")
@@ -156,16 +152,16 @@ def main():
             f"given without {missing}. Both were printed by the run that wrote them."
         )
 
-    # a training run's batch budget comes from the decoder yaml's `train` block, so
-    # both decode stop conditions are left unset and ignored
     if not args.train:
-        if args.total_batch is not None and args.target_error is not None:
-            raise ValueError(
-                f"-te <{args.target_error}> and -tb <{args.total_batch}> are two "
-                "different stop conditions; give one, not both."
+        if args.target_batch is not None and args.target_error is not None:
+            logger.warning(
+                f"-te <{args.target_error}> and -tb <{args.target_batch}> are two "
+                f"different stop conditions; running to the batch target and "
+                f"dropping -te."
             )
-        if args.total_batch is None and args.target_error is None:
-            args.target_error = 100  # the stop condition when neither flag is given
+            args.target_error = None
+        if args.target_batch is None and args.target_error is None:
+            args.target_error = 1000  # default to target error
 
     required = [("-d", "decoder_yaml")]
     if args.interface_yaml is None:
@@ -319,7 +315,7 @@ def main():
             dtype,
             error_model.rate,
             H_file_name,
-            args.total_batch,
+            args.target_batch,
         )
 
     queue = ExtraQueue(
@@ -329,7 +325,9 @@ def main():
     if args.train:
         max_batches = metrics.total_batches
     else:
-        max_batches = args.total_batch if args.total_batch is not None else float("inf")
+        max_batches = (
+            args.target_batch if args.target_batch is not None else float("inf")
+        )
     # a -tb run has no error target, so only max_batches ends it
     error_budget = float("inf") if args.target_error is None else args.target_error
 
@@ -342,8 +340,6 @@ def main():
         logger.success(
             "\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
         )
-        # training reads its loss straight off the decoder and skips Steps 9-11, so
-        # there is nothing for it to buffer
         bt = (
             None
             if args.train
@@ -448,8 +444,8 @@ def main():
                 )
             num_err += int(torch.sum(check[num_decoders - 1]))
             logger.info(
-                f"batch count {num_batches}/{args.total_batch}"
-                if args.total_batch is not None
+                f"batch count {num_batches}/{args.target_batch}"
+                if args.target_batch is not None
                 else f"number of errors at the current batch {num_err}/{args.target_error}"
             )
 
@@ -492,7 +488,7 @@ def main():
                     num_err,
                     H_file_name,
                     check_num,
-                    total_batch=args.total_batch,
+                    target_batch=args.target_batch,
                 )
                 logger.success(f"Saved log to <{output_log}>.")
                 logger.success(f"Saved metric results to <{args.run_dir}>.")
@@ -501,6 +497,9 @@ def main():
             queue.freeze_density(num_err - num_err_before_batch, n)
 
     if args.train:
+        logger.success(
+            "\n----------------------------------------------\nStep 9: Save final checkpoints and result yaml\n----------------------------------------------"
+        )
         metrics.train_save_checkpoint()
         return
 
@@ -520,7 +519,7 @@ def main():
         H_file_name,
         check_num,
         1,
-        total_batch=args.total_batch,
+        target_batch=args.target_batch,
     )
     logger.success(f"Saved log to <{output_log}>.")
     logger.success(f"Saved metric results to <{args.run_dir}>.")

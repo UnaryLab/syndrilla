@@ -24,7 +24,6 @@ CKPT_STEM = "saq_hx_n41"
 BEST_PT = f"{CKPT_STEM}_best.pt"
 LAST_PT = f"{CKPT_STEM}_last.pt"
 RESULT_YAML = f"{CKPT_STEM}_result.yaml"
-TRAIN_LOG = f"{CKPT_STEM}_train.log"
 TERMS = {
     "training": ("training loss", "training error"),
     "validation": ("validation loss", "validation error"),
@@ -236,9 +235,7 @@ def test_loss_terms_and_gradient_flow():
 
     total = loss.combine(loss_lc, loss_lp, loss_ent)
     expected = (
-        loss.lambda_lc * loss_lc
-        + loss.lambda_lp * loss_lp
-        + loss.lambda_ent * loss_ent
+        loss.lambda_lc * loss_lc + loss.lambda_lp * loss_lp + loss.lambda_ent * loss_ent
     )
     assert torch.allclose(total, expected)
 
@@ -557,6 +554,13 @@ def _run_cli(run_dir, *extra):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _run_log(run_dir):
+    """The lines of the run's `main-<time>.log`, which holds what the run reported."""
+    written = list(run_dir.glob("main-*.log"))
+    assert len(written) == 1, f"expected one run log, got {written}"
+    return written[0].read_text().splitlines()
+
+
 def _plain(value):
     """Plain dicts/lists, so `yaml.safe_dump` can write a config `read_yaml` returned."""
     if isinstance(value, dict):
@@ -617,9 +621,10 @@ def test_train_cli_produces_a_loadable_checkpoint(tmp_path):
     else:
         assert rates[-1] < shipped_lr
 
-    # training must not emit any decode-path artefact
+    # a decode run's result file is the one artefact training must not emit; the
+    # toolchain trace is every run's, so a training run writes it too
     assert not list(tmp_path.glob("result_phy_err_*.yaml"))
-    assert not list(tmp_path.glob("main-*.log"))
+    assert list(tmp_path.glob("main-*.log")), "training wrote no toolchain log"
 
     # The checkpoint must load and actually change the decoder's output. Build from the
     # unmodified yaml: the CLI trained that architecture, not the shrunk test one.
@@ -702,12 +707,8 @@ def test_train_cli_writes_a_result_yaml_indexed_by_epoch(tmp_path):
     assert epochs["best"][i] is True
 
     # the breakdown the yaml drops is still recorded, in the epoch lines of the run's
-    # own log rather than in the toolchain's result format
-    lines = [
-        line
-        for line in (tmp_path / TRAIN_LOG).read_text().splitlines()
-        if "train_loss=" in line
-    ]
+    # log rather than in the toolchain's result format
+    lines = [line for line in _run_log(tmp_path) if "train_loss=" in line]
     assert len(lines) == 3
     assert all(f"{term}=" in line for line in lines for term in MODEL_TERMS)
 
@@ -739,7 +740,7 @@ def test_train_log_records_every_batch_with_its_loss_and_rate(tmp_path):
     assert result.returncode == 0, result.stderr
 
     period = train_batches + val_batches
-    lines = (tmp_path / TRAIN_LOG).read_text().splitlines()
+    lines = _run_log(tmp_path)
     batch_lines = [line for line in lines if "batch " in line and "loss=" in line]
     assert len(batch_lines) == epochs * period
 
@@ -750,9 +751,8 @@ def test_train_log_records_every_batch_with_its_loss_and_rate(tmp_path):
     assert all("lr=" in line for line in batch_lines)
     assert all(f"{term}=" in line for line in batch_lines for term in MODEL_TERMS)
 
-    # the console keeps the epoch summaries only: one batch line per batch would bury
-    # them, so they go to the log file alone
-    assert "batch " not in result.stdout
+    # the run reports through its log, not the console: nothing it wrote is on stdout
+    assert "batch " not in result.stdout and "train_loss=" not in result.stdout
 
     def loss_of(line):
         return float(line.split("loss=")[1].split()[0])
@@ -979,7 +979,6 @@ def test_train_cli_requires_the_loss_yaml(tmp_path):
     assert not (tmp_path / BEST_PT).exists()
 
 
-
 def _make_loss(saq, **overrides):
     """Build the logical_centric loss bound to `saq`, from the shipped loss yaml."""
     from syndrilla.loss import create_loss
@@ -1026,7 +1025,6 @@ def test_decoder_rejects_the_old_lambda_keys():
     """A stale decoder yaml must fail loudly, not silently train with default lambdas."""
     with pytest.raises(ValueError, match="lambda_loss_lc"):
         _make_decoder(SURFACE_MATRIX_YAML, lambda_loss_lc=1.0)
-
 
 
 def _training_setup(**overrides):
@@ -1208,16 +1206,10 @@ def test_the_decoder_decides_which_epoch_the_best_checkpoint_comes_from(tmp_path
     the best total and epoch 3 the best `class_err`. A decoder that scores on the total
     has to keep epoch 2's weights, which is the whole point of the hook.
     """
-    decoder = _EpochDecoder(
-        score=lambda tr, va: va["total"], score_name="val_total"
-    )
-    metrics = _run_epochs(
-        tmp_path, decoder, [(1.0, 0.1), (0.5, 0.4), (0.8, 0.05)]
-    )
+    decoder = _EpochDecoder(score=lambda tr, va: va["total"], score_name="val_total")
+    metrics = _run_epochs(tmp_path, decoder, [(1.0, 0.1), (0.5, 0.4), (0.8, 0.05)])
 
-    kept = torch.load(
-        tmp_path / f"{_run_stem(decoder)}_best.pt", weights_only=True
-    )
+    kept = torch.load(tmp_path / f"{_run_stem(decoder)}_best.pt", weights_only=True)
     assert kept["w"].item() == 2, "the run kept the epoch its decoder did not choose"
     assert metrics.best == pytest.approx(0.5)
 
@@ -1235,13 +1227,9 @@ def test_the_decoder_decides_which_epoch_the_best_checkpoint_comes_from(tmp_path
 def test_a_decoder_declaring_no_policy_selects_on_validation_error(tmp_path):
     """The fallback is what every run did before there was a hook: lowest `class_err`."""
     decoder = _EpochDecoder()
-    metrics = _run_epochs(
-        tmp_path, decoder, [(1.0, 0.1), (0.5, 0.4), (0.8, 0.05)]
-    )
+    metrics = _run_epochs(tmp_path, decoder, [(1.0, 0.1), (0.5, 0.4), (0.8, 0.05)])
 
-    kept = torch.load(
-        tmp_path / f"{_run_stem(decoder)}_best.pt", weights_only=True
-    )
+    kept = torch.load(tmp_path / f"{_run_stem(decoder)}_best.pt", weights_only=True)
     assert kept["w"].item() == 3
     assert metrics.best == pytest.approx(0.05)
 
@@ -1389,9 +1377,7 @@ def test_logical_centric_declares_every_term_it_returns():
     loss = _make_loss(saq)
 
     assert logical_centric.create.term_names == ("lc", "lp", "ent")
-    assert len(loss.terms(decoder(_io_dict(saq, synd, H)), e)) == len(
-        loss.term_names
-    )
+    assert len(loss.terms(decoder(_io_dict(saq, synd, H)), e)) == len(loss.term_names)
 
 
 def _sequence(metrics, batch_index, k=6):
@@ -1611,30 +1597,30 @@ def _train_argv(decoder_yaml, *extra):
 
 
 def _interrupt_after_epoch(run_dir, decoder_yaml, epoch):
-    """Start a training run and SIGINT it once `epoch`'s line has been printed.
+    """Start a training run and SIGINT it once `epoch`'s line reaches the run's log.
 
-    `train_compute_avg` writes the checkpoint before printing the line, so seeing the line
-    means `last.pt` for that epoch is complete on disk.
+    `train_compute_avg` writes the checkpoint before logging the line, so seeing the line
+    means `last.pt` for that epoch is complete on disk. The run reports nowhere else, so
+    the log is what a watcher has to read.
     """
     import signal
+    import time
 
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
     cmd = ["syndrilla", f"-r={run_dir}", *_train_argv(decoder_yaml)]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        env=env,
-    )
-    seen = False
-    for line in proc.stdout:
-        if line.startswith(f"epoch {epoch:4d}/"):
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    seen, deadline = False, time.time() + 300
+    while proc.poll() is None and time.time() < deadline:
+        written = list(run_dir.glob("main-*.log"))
+        # the epoch summary, not the batch lines, which name their epoch too: only the
+        # summary is written after that epoch's checkpoint
+        if written and any(
+            f"epoch {epoch:4d}/" in line and "train_loss=" in line
+            for line in written[0].read_text().splitlines()
+        ):
             seen = True
             proc.send_signal(signal.SIGINT)
             break
-    proc.stdout.read()
-    proc.stdout.close()
+        time.sleep(0.05)
     proc.wait(timeout=300)
     assert seen, f"training never reached epoch {epoch}"
 
@@ -1902,7 +1888,6 @@ def test_best_pt_stays_bare_weights_and_last_pt_still_decodes(tmp_path):
         create_decoder(cfg=cfg, bundle=bundle)
 
 
-
 def test_train_cli_does_not_train_on_a_batch_shape_saq_cannot_learn_from(tmp_path):
     """`-t` on a multi-round measurer must fail rather than train on paired-up shapes.
 
@@ -1977,7 +1962,6 @@ def test_decoder_describes_itself_in_the_resume_fingerprint():
     # and the objective: which loss it is, and the block that weights its terms
     assert merged["loss_function"] == "logical_centric"
     assert merged["loss_lambda_lp"] == loss.lambda_lp
-
 
 
 def test_decoder_reads_its_settings_from_their_own_blocks():
