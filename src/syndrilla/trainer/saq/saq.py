@@ -1,9 +1,18 @@
 import torch
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
-# Upstream's Codes.py GF(2) <-> +-1 conversions, kept here rather than imported from the
-# decoder: the loss stands alone, and the repo inlines its GF(2) algebra per module.
+def _require_number(value, key):
+    """Return a required numeric optimizer setting as a float."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(
+            f"Trainer <saq> requires a numeric <{key}> under the training yaml's "
+            f"`training.optimizer`, got <{value!r}>."
+        )
+    return float(value)
+
+
 def bin_to_sign(x):
     return 1 - 2 * x
 
@@ -24,15 +33,13 @@ def _logical_flipped(L, x):
 
 
 def _diff_GF2_mul(H, x):
-    """Differentiable GF(2) matrix-vector product, in the probability domain.
-    """
+    """Differentiable GF(2) matrix-vector product, in the probability domain."""
     tmp = bin_to_sign(H.unsqueeze(0) * x.unsqueeze(-1))
     return sign_to_bin(torch.prod(tmp, 1))
 
 
 def _parity_llr(H, llr):
-    """LLR of the GF(2) parity of `llr`'s bits over each column's support.
-    """
+    """LLR of the GF(2) parity of `llr`'s bits over each column's support."""
     mask = H.t().unsqueeze(0).to(llr.dtype)  # [1, k, n]
     x = llr.unsqueeze(1)  # [B, 1, n]
 
@@ -46,21 +53,41 @@ def _parity_llr(H, llr):
 
 
 class create:
-    """The three-term logical-centric objective, bound to the decoder it supervises."""
+    """How saq is trained: its three-term objective and the optimizer that descends it."""
+
     term_names = ("lc", "lp", "ent")
 
     def __init__(self, loss_cfg, **kwargs) -> None:
         decoder = kwargs.get("decoder")
         if decoder is None:
             raise ValueError(
-                "Loss <logical_centric> requires the decoder it supervises, passed as the "
-                "<decoder> kwarg of create_loss()."
+                "Loss <saq> requires the decoder it supervises, passed as the "
+                "<decoder> kwarg of create_trainer()."
             )
         self.decoder = getattr(decoder, "decoder", decoder)
         self.cfg = dict(loss_cfg)
         self.lambda_lc = float(loss_cfg.get("lambda_lc", 1.0))
         self.lambda_lp = float(loss_cfg.get("lambda_lp", 0.2))
         self.lambda_ent = float(loss_cfg.get("lambda_ent", 1.0))
+
+    def configure_optimizer(self, optimizer_cfg, parameters, epochs):
+        """Adam plus a cosine schedule over `epochs`, from `training.optimizer`."""
+        if not isinstance(optimizer_cfg, dict) or not optimizer_cfg:
+            raise ValueError(
+                f"Trainer <saq>: <training.optimizer> is a block with <lr>, "
+                f"<weight_decay> and <min_lr>, got <{optimizer_cfg!r}>."
+            )
+        lr = _require_number(optimizer_cfg.get("lr"), "lr")
+        weight_decay = _require_number(
+            optimizer_cfg.get("weight_decay"), "weight_decay"
+        )
+        min_lr = _require_number(optimizer_cfg.get("min_lr"), "min_lr")
+
+        optimizer = torch.optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+        # nothing has run backward yet, so the first step must not find stale gradients
+        optimizer.zero_grad(set_to_none=True)
+        return optimizer, scheduler
 
     def _prepare(self, e):
         """Cast the ground-truth error to the decoder's device/dtype and pack its class."""

@@ -217,12 +217,14 @@ def _train_stem(decoder):
     return f"{decoder.algo}_{decoder.check_type}_{size}"
 
 
-def _train_fingerprint(cfg, decoder, batch_size, error_rate, H_file_name, loss):
+def _train_fingerprint(cfg, batch_size, error_rate, H_file_name, trainer):
     """The settings a resumed training run must still agree with: model, data, schedule."""
-    # the objective's own settings, straight from the block that configured it
+    # the objective's and the optimizer's own settings, straight from the blocks of the
+    # training yaml that configured them
+    loss = trainer.loss
     loss_cfg = getattr(loss, "cfg", {"function": type(loss).__module__})
     return {
-        **decoder.train_fingerprint(),
+        **trainer.train_fingerprint(),
         "epochs": cfg["epochs"],
         "test_batches": cfg["test_batches"],
         "validation_batches": cfg["validation_batches"],
@@ -232,6 +234,7 @@ def _train_fingerprint(cfg, decoder, batch_size, error_rate, H_file_name, loss):
         "physical_error_rate": _yaml_rate(error_rate),
         "H_file_name": H_file_name,
         **{f"loss_{key}": value for key, value in loss_cfg.items()},
+        **{f"optimizer_{key}": value for key, value in trainer.optimizer_cfg.items()},
     }
 
 
@@ -943,7 +946,7 @@ class MetricState:
             self.distribution[i] = self.distribution[i].int().to(self.device)
 
     KEYS = ("total", "class_err")
-    # the schedule the '-tr' yaml must supply under its 'train' key
+    # the schedule the '-tr' yaml must supply under its 'schedule' key
     TRAIN_KEYS = ("epochs", "test_batches", "validation_batches", "error_random_seed")
 
     @classmethod
@@ -952,13 +955,13 @@ class MetricState:
         logger.info(f"Reading training schedule from <{get_path(source)}>.")
         if cfg is None:
             raise ValueError(
-                f"Decoder yaml {source} has no 'train' block. Add one under `decoder` "
-                f"with {', '.join(cls.TRAIN_KEYS)}."
+                f"Training yaml {source} has no 'schedule' block. Add one under "
+                f"`training` with {', '.join(cls.TRAIN_KEYS)}."
             )
         missing = [key for key in cls.TRAIN_KEYS if key not in cfg]
         if missing:
             raise ValueError(
-                f"Decoder yaml {source} is missing under 'decoder.train': "
+                f"Training yaml {source} is missing under 'training.schedule': "
                 f"{', '.join(missing)}."
             )
         for key in cls.TRAIN_KEYS:
@@ -967,7 +970,7 @@ class MetricState:
             floor = 0 if key == "error_random_seed" else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < floor:
                 raise ValueError(
-                    f"Decoder yaml {source} needs <{key}> to be an integer "
+                    f"Training yaml {source} needs <{key}> to be an integer "
                     f">= {floor}, got <{value!r}>."
                 )
         state = cls(0, 0, None)
@@ -983,9 +986,11 @@ class MetricState:
         state.start = time.time()
         state._epoch_start = state.start
         state.batch_size = None
-        state.phase = "train"
         state.lr = None
         state._decoder = None
+        # the run itself, bound by `train_resume_checkpoint`: this half records what the
+        # run produced, and the trainer is what drives it
+        state._trainer = None
         state._fingerprint = None
         state.term_names = ()
         state.keys = cls.KEYS
@@ -1015,20 +1020,29 @@ class MetricState:
         result_yaml,
         device,
         error_model,
-        loss,
+        trainer,
         H_file_name,
     ):
-        """Set the decoder up for this run, resume it if asked, and open the first
+        """Set the run up on this decoder, resume it if asked, and open the first
         batch.
         """
-        decoder.configure_optimizer(self.epochs)
+        # the schedule was validated here, in `train_initial`; the trainer is what runs
+        # to it, so it gets the numbers rather than reading the block a second time
+        trainer.configure(
+            decoder,
+            self.epochs,
+            self.period,
+            self.cfg["test_batches"],
+            self.cfg["error_random_seed"],
+        )
         rate = error_model.rate
         # the decoder and the fingerprint this run's checkpoints are made of
         self._decoder = decoder
+        self._trainer = trainer
         self._fingerprint = _train_fingerprint(
-            self.cfg, decoder, batch_size, rate, H_file_name, loss
+            self.cfg, batch_size, rate, H_file_name, trainer
         )
-        self.train_bind_loss(loss)
+        self.train_bind_loss(trainer.loss)
         params = int(sum(p.numel() for p in decoder.parameters()))
         self.run_meta = {
             "algorithm": decoder.algo,
@@ -1058,15 +1072,15 @@ class MetricState:
             f"training <{decoder.algo}>: params={params:,} "
             f"device={decoder.device} dtype={decoder.dtype}",
             f"error rate {rate}, {self.cfg['test_batches']} x {batch_size} per epoch",
-            f"config: {dict(self.cfg)}",
+            f"schedule: {dict(self.cfg)}, optimizer: {dict(trainer.optimizer_cfg)}",
             resume_line,
         ):
             logger.info(line)
 
-        self.lr = decoder.scheduler.get_last_lr()[0]
+        self.lr = trainer.scheduler.get_last_lr()[0]
         self.batch_size = batch_size
         self._epoch_start = time.time()
-        self.train_set_hyperparameter(start)
+        trainer.begin_batch(start, self.epoch)
         return start
 
     def train_load_checkpoint(self, path, device):
@@ -1091,7 +1105,7 @@ class MetricState:
                 f"run selects on <{score_name}>. The two are not comparable, so the "
                 f"record cannot carry over."
             )
-        self._decoder.load_train_state(state)
+        self._trainer.load_train_state(state)
         self.epoch = state["epoch"]
         self.best = state["best"]
         self.history = list(state["history"])
@@ -1128,27 +1142,6 @@ class MetricState:
                 f"{'; '.join(changed)}."
             )
 
-    def train_set_hyperparameter(self, batch_index):
-        """Open a batch: seed the phase it starts, if it starts one, and enter that
-        phase.
-        """
-        position = batch_index % self.period
-        if position == 0:
-            # no epoch term: that is what makes each epoch train on the same batches
-            torch.manual_seed(self.cfg["error_random_seed"] * 1_000_003)
-        elif position == self.cfg["test_batches"]:
-            # clear of the training seed so validation never replays its errors
-            torch.manual_seed(
-                self.cfg["error_random_seed"] * 1_000_003 + 9_999_991 + self.epoch
-            )
-        self.phase = "train" if position < self.cfg["test_batches"] else "val"
-        if self._decoder is not None:
-            # module mode and the grad switch are one decision: a validation batch that
-            # still built a graph would train on the wrong set
-            self._decoder.train(self.phase == "train")
-            torch.set_grad_enabled(self.phase == "train")
-        return self.phase
-
     def train_update_metric(self, batch_index, terms, class_err):
         """Add one finished batch in, close the epoch if it ended one, open the next."""
         expected = len(self.keys) - 1
@@ -1158,7 +1151,9 @@ class MetricState:
                 f"<{expected}>: `terms()` returns one value per name in `term_names`."
             )
         values = [float(v.detach() if torch.is_tensor(v) else v) for v in terms]
-        phase = self.acc[self.phase]
+        # which phase a batch counts toward is the trainer's: it is the one that opened it
+        phase_name = self._trainer.phase
+        phase = self.acc[phase_name]
         for i, value in enumerate(values):
             phase[i] += value
         phase[-1] += float(class_err)
@@ -1174,7 +1169,7 @@ class MetricState:
         lr = "n/a" if self.lr is None else f"{self.lr:.2e}"
         logger.info(
             f"  batch {position:4d}/{self.period}  epoch {self.epoch:4d}/{self.epochs}  "
-            f"{self.phase:5s}  lr={lr}  "
+            f"{phase_name:5s}  lr={lr}  "
             f"loss={values[0]:.4f}{f' ({breakdown})' if breakdown else ''}  "
             f"err={float(class_err):.4f}"
         )
@@ -1182,12 +1177,12 @@ class MetricState:
         # a whole number of periods closes both phases of an epoch together
         if batch_index % self.period == 0:
             self.train_compute_avg()
-        self.train_set_hyperparameter(batch_index)
+        self._trainer.begin_batch(batch_index, self.epoch)
 
     def train_compute_avg(self):
         """Close an epoch: step the schedule, average both phases, save and log."""
         # once per epoch, not once per batch
-        self._decoder.scheduler.step()
+        self._trainer.scheduler.step()
 
         # each phase's accumulated terms over the batches that phase ran
         def mean(phase, n):
@@ -1250,7 +1245,7 @@ class MetricState:
             )
         torch.save(
             {
-                **self._decoder.train_state(),
+                **self._trainer.train_state(),
                 "epoch": self.epoch,
                 "best": self.best,
                 "history": self.history,
@@ -1264,7 +1259,7 @@ class MetricState:
 
         logger.info(line)
         # after the step: `lr` above was the rate this epoch ran at, this is the next's
-        self.lr = self._decoder.scheduler.get_last_lr()[0]
+        self.lr = self._trainer.scheduler.get_last_lr()[0]
 
     def train_save_output_yaml(self):
         """Write `<stem>_result.yaml`: what the run is, then the run's curve by column."""

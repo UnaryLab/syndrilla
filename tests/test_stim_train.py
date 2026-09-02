@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 from syndrilla.error_model import create_error_model
 from syndrilla.interface import create_interface
-from syndrilla.loss.logical_centric.logical_centric import (
+from syndrilla.trainer.saq.saq import (
     _diff_GF2_mul,
     _parity_llr,
     bin_to_sign,
@@ -26,7 +26,7 @@ TRAIN_ERROR_YAML = "examples/stim/stim_train.error.yaml"
 TRAIN_SYNDROME_YAML = "examples/stim/stim_train.syndrome.yaml"
 TRAIN_DECODER_YAML = "examples/stim/train_stim_saq.decoder.yaml"
 DECODE_ERROR_YAML = "examples/stim/stim_generated.error.yaml"
-LOSS_YAML = "examples/stim/logical_centric.loss.yaml"
+TRAINING_YAML = "examples/stim/train_stim_saq.training.yaml"
 
 # The shipped interface is a distance-3 rotated surface code over 3 rounds. Its detector
 # error model is what the decoder is built from, so checkpoints are named for it.
@@ -198,7 +198,7 @@ class TestTrainCLI:
             f"-i={INTERFACE_YAML}",
             f"-e={TRAIN_ERROR_YAML}",
             f"-s={TRAIN_SYNDROME_YAML}",
-            f"-ls={LOSS_YAML}",
+            f"-tr={_fast_training(tmp_path)}",
             "-bs=256",
         )
         assert result.returncode == 0, result.stderr[-3000:]
@@ -221,7 +221,7 @@ class TestTrainCLI:
             f"-i={INTERFACE_YAML}",
             f"-e={TRAIN_ERROR_YAML}",
             f"-s={TRAIN_SYNDROME_YAML}",
-            f"-ls={LOSS_YAML}",
+            f"-tr={_fast_training(tmp_path)}",
             "-bs=256",
         )
         assert result.returncode == 0, result.stderr[-3000:]
@@ -229,8 +229,8 @@ class TestTrainCLI:
         val_errors = written["training result"]["validation"]["validation error"]
         assert min(val_errors) < 0.25, f"no better than chance: {val_errors}"
 
-    def test_training_needs_a_loss(self, tmp_path):
-        """The interface supplies the data, but the objective is still the run's choice."""
+    def test_training_needs_the_training_yaml(self, tmp_path):
+        """The interface supplies the data, but the run's own settings are still its choice."""
         result = _run_cli(
             tmp_path / "run",
             "-t",
@@ -241,7 +241,7 @@ class TestTrainCLI:
             "-bs=8",
         )
         assert result.returncode != 0
-        assert "-ls" in result.stderr
+        assert "-tr" in result.stderr
 
 
 class TestParityConditioning:
@@ -295,18 +295,26 @@ class TestParityConditioning:
 
 
 def _fast_decoder(tmp_path):
-    """The shipped training config, shrunk to a handful of epochs so tests stay quick."""
+    """The shipped model config, shrunk so tests stay quick."""
     cfg = yaml.safe_load(open(TRAIN_DECODER_YAML))
-    cfg["decoder"]["config"]["train"] = {
+    cfg["decoder"]["config"]["model"] = dict(
+        cfg["decoder"]["config"]["model"], d_model=64, N_dec=2, h=4
+    )
+    path = tmp_path / "fast.decoder.yaml"
+    path.write_text(yaml.safe_dump(cfg))
+    return path
+
+
+def _fast_training(tmp_path):
+    """The shipped training config, shrunk to a handful of epochs so tests stay quick."""
+    cfg = yaml.safe_load(open(TRAINING_YAML))
+    cfg["training"]["schedule"] = {
         "epochs": 4,
         "test_batches": 25,
         "validation_batches": 5,
         "error_random_seed": 42,
     }
-    cfg["decoder"]["config"]["model"] = dict(
-        cfg["decoder"]["config"]["model"], d_model=64, N_dec=2, h=4
-    )
-    path = tmp_path / "fast.decoder.yaml"
+    path = tmp_path / "fast.training.yaml"
     path.write_text(yaml.safe_dump(cfg))
     return path
 

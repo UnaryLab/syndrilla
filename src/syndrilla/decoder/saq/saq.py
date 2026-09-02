@@ -6,19 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from loguru import logger
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from syndrilla.utils import parse_device_dtype
-
-
-def _require_number(value, key):
-    """Return a required numeric decoder setting as a float."""
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(
-            f"saq requires a numeric <{key}> in the decoder config, got <{value!r}>. "
-            f"Write exponent floats as 5.0e-4, not 5e-4: yaml reads 5e-4 as a string."
-        )
-    return float(value)
 
 
 def _clones(module, n):
@@ -161,8 +150,10 @@ class SLTDLayer(nn.Module):
 class create(nn.Module):
     """SAQ decoder exposed through the syndrilla decoder contract."""
 
-    # what `train_state` writes and `load_train_state` requires back
-    TRAIN_STATE_KEYS = ("state_dict", "optimizer", "scheduler")
+    # a learned decoder: `-t` fits these weights, and the run does the fitting. Declared
+    # rather than detected, since a decoder holding `nn.Parameter` index tensors it never
+    # learns -- the bp family does -- would pass any test based on having parameters
+    TRAINABLE = True
     # what `train_score` returns, under the name the run records it by
     TRAIN_SCORE_NAME = "val_class_err"
 
@@ -176,8 +167,10 @@ class create(nn.Module):
             model:     d_model (token width), N_dec (SLTD layers), h (attention heads),
                        dropout, no_mask (>0 disables the topology mask, paper ablation)
             cpnd:      enable (default True, forced off when training), passes (default 1)
-            optimizer: lr / weight_decay / min_lr, read by `configure_optimizer`
             top level: check_type, dtype, device, checkpoint
+
+        The optimizer this decoder trains under is not one of them: it configures the
+        run, so it comes from the training yaml and the `Trainer` builds it.
         """
         super(create, self).__init__()
 
@@ -244,20 +237,24 @@ class create(nn.Module):
             ("dropout", "model"),
             ("no_mask", "model"),
             ("cpnd_passes", "cpnd"),
-            ("lr", "optimizer"),
-            ("weight_decay", "optimizer"),
-            ("min_lr", "optimizer"),
         ):
             if legacy in decoder_cfg:
                 raise ValueError(
                     f"Decoder <saq>: <{legacy}> moved under the decoder yaml's "
                     f"<config.{block}> block. Nest it there rather than at the top level."
                 )
-        for legacy in ("lambda_loss_lc", "lambda_loss_lp", "lambda_loss_ent"):
+        for legacy, moved in (
+            ("lr", "training.optimizer.lr"),
+            ("weight_decay", "training.optimizer.weight_decay"),
+            ("min_lr", "training.optimizer.min_lr"),
+            ("lambda_loss_lc", "training.loss.lambda_lc"),
+            ("lambda_loss_lp", "training.loss.lambda_lp"),
+            ("lambda_loss_ent", "training.loss.lambda_ent"),
+        ):
             if legacy in decoder_cfg:
                 raise ValueError(
-                    f"Decoder <saq>: <{legacy}> moved to the loss yaml as "
-                    f"<{legacy.replace('lambda_loss_', 'lambda_')}>; pass it with -ls."
+                    f"Decoder <saq>: <{legacy}> moved to the training yaml as "
+                    f"<{moved}>; pass it with -tr."
                 )
 
         cpnd_cfg = decoder_cfg.get("cpnd", {})
@@ -292,17 +289,6 @@ class create(nn.Module):
         heads = int(model_cfg.get("h", 16))
         dropout = float(model_cfg.get("dropout", 0.0))
         self.N_dec = n_dec
-
-        # training-only, so validated in configure_optimizer rather than here
-        optimizer_cfg = decoder_cfg.get("optimizer", {})
-        if not isinstance(optimizer_cfg, dict):
-            raise ValueError(
-                f"Decoder <saq>: <config.optimizer> is a block with <lr>, <weight_decay> and "
-                f"<min_lr>, got <{optimizer_cfg!r}>."
-            )
-        self.lr = optimizer_cfg.get("lr")
-        self.weight_decay = optimizer_cfg.get("weight_decay")
-        self.min_lr = optimizer_cfg.get("min_lr")
 
         # stage 1: Initial Embedding Layer
         self.MLP = nn.Sequential(
@@ -339,12 +325,9 @@ class create(nn.Module):
                 nn.init.xavier_uniform_(p)
 
         self.to(device=self.device, dtype=self.dtype)
-        self._load_checkpoint(decoder_cfg.get("checkpoint"))
+        self._load_checkpoint(decoder_cfg.get("checkpoint"), training)
 
         self.algo = "saq"
-        # both built by configure_optimizer, so decoding never carries one it will not use
-        self.optimizer = None
-        self.scheduler = None
         # one feed-forward pass per sample; `num_max_iter` is what `main.py` reads
         self.num_max_iter = 1
         if decoder_cfg.get("max_iter") not in (None, 1):
@@ -419,7 +402,16 @@ class create(nn.Module):
             torch.zeros(1, 1, self.logical_classes, self.m + 1, dtype=torch.bool),
         )
 
-    def _load_checkpoint(self, path):
+    def _load_checkpoint(self, path, training):
+        """Load the weights `checkpoint` names, and record which ones they were."""
+        self.checkpoint = None if training else path
+        if training:
+            if path is not None:
+                logger.warning(
+                    f"saq is being trained, so `checkpoint` <{path}> is ignored; the run "
+                    f"starts from random weights. Resume one with `-tckpt` instead."
+                )
+            return
         if path is None:
             logger.warning(
                 "saq has no `checkpoint`; weights are randomly initialized. That is "
@@ -558,18 +550,6 @@ class create(nn.Module):
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
         return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
 
-    def configure_optimizer(self, epochs):
-        """Adam plus a cosine schedule over `epochs`, from this decoder's own config."""
-        lr = _require_number(self.lr, "lr")
-        weight_decay = _require_number(self.weight_decay, "weight_decay")
-        min_lr = _require_number(self.min_lr, "min_lr")
-
-        self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=lr, weight_decay=weight_decay
-        )
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
-        self.optimizer.zero_grad(set_to_none=True)
-
     def train_score(self, train, val):
         """Score an epoch by the validation logical error: what the decoder is for.
 
@@ -578,57 +558,3 @@ class create(nn.Module):
         one that decodes best.
         """
         return val["class_err"]
-
-    def train_fingerprint(self):
-        """The model half of a resume fingerprint. `MetricState` owns the schedule half."""
-        return {
-            "algo": self.algo,
-            "n": self.n,
-            "m": self.m,
-            "k": self.k,
-            "dtype": str(self.dtype),
-            "device": str(self.device),
-            "lr": self.lr,
-            "weight_decay": self.weight_decay,
-            "min_lr": self.min_lr,
-        }
-
-    def train_state(self):
-        """Everything needed to resume a run, not just to decode one."""
-        if self.optimizer is None:
-            raise ValueError(
-                "saq has no optimizer to save; call configure_optimizer() first."
-            )
-        rng = {"cpu": torch.get_rng_state()}
-        if str(self.device).startswith("cuda"):
-            rng["cuda"] = torch.cuda.get_rng_state_all()
-        return {
-            "state_dict": self.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
-            "rng": rng,
-        }
-
-    def load_train_state(self, state):
-        """Restore what `train_state` saved, onto an already configured optimizer."""
-        if self.optimizer is None:
-            raise ValueError(
-                "saq cannot resume before configure_optimizer(); there is no optimizer "
-                "to restore the saved moments into."
-            )
-        missing = [key for key in self.TRAIN_STATE_KEYS if key not in state]
-        if missing:
-            raise ValueError(
-                f"saq training checkpoint is missing <{', '.join(missing)}>. It saved "
-                f"weights only: it can be decoded from, but a run cannot be resumed."
-            )
-        self.load_state_dict(state["state_dict"])
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.scheduler.load_state_dict(state["scheduler"])
-        rng = state.get("rng")
-        if rng:
-            # map_location puts every saved tensor on this decoder's device; both setters
-            # want the state back on the CPU as a ByteTensor
-            torch.set_rng_state(rng["cpu"].cpu())
-            if "cuda" in rng and str(self.device).startswith("cuda"):
-                torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])

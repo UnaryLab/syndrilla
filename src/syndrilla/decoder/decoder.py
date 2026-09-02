@@ -8,7 +8,7 @@ from loguru import logger
 
 from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, read_yaml
 
-DEFAULT_CANDIDATES = tuple(range(100))  
+DEFAULT_CANDIDATES = tuple(range(100))
 
 
 def _projected_speedup(hists, pct, batch_size):
@@ -233,8 +233,6 @@ MOVED_TO_CONFIG = (
     # saq's blocks, and the weights only a learned decoder loads
     "model",
     "cpnd",
-    "optimizer",
-    "train",
     "checkpoint",
     # relay_bp's schedule
     "legs",
@@ -261,9 +259,30 @@ SHARED_KEYS = (
     "config",
 )
 
+# Settings of the training run rather than of the model it fits, so they left the
+# decoder yaml entirely for the training yaml `-tr` names, mapped here to where each
+# one went. Rejected wherever they still appear, for the same reason as above: a
+# training run silently falling back to a default still produces a checkpoint.
+MOVED_TO_TRAINING = {
+    "optimizer": "training.optimizer",
+    "train": "training.schedule",
+}
+
+
+def _reject_training_keys(cfg: dict, source: str, placement: str):
+    """Refuse a decoder config still carrying the run's own settings."""
+    moved = [key for key in MOVED_TO_TRAINING if key in cfg]
+    if moved:
+        went = ", ".join(f"<{key}> as `{MOVED_TO_TRAINING[key]}`" for key in moved)
+        raise ValueError(
+            f'Decoder config {source} has <{", ".join(moved)}> {placement}; training '
+            f"settings moved to the training yaml passed with `-tr`: {went}."
+        )
+
 
 def _split_config(dec_cfg: dict, algorithms: list, source: str):
     """Return one algorithm-specific config per algorithm, validating placement."""
+    _reject_training_keys(dec_cfg, source, "at the top level")
     misplaced = [key for key in MOVED_TO_CONFIG if key in dec_cfg]
     if misplaced:
         per_algo = " (one entry per algorithm)" if len(algorithms) > 1 else ""
@@ -302,6 +321,7 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
                 f"Decoder config {source} needs every `decoder.config` entry to be a "
                 f"mapping, got <{type(block).__name__}> for <{algo}>."
             )
+        _reject_training_keys(block, source, f"under `decoder.config` for <{algo}>")
         shared = [key for key in SHARED_KEYS if key in block]
         if shared:
             raise ValueError(
@@ -311,30 +331,44 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     return blocks
 
 
-# every call a training run makes on its decoder, in order. The per-batch step is not
-# one of them: the loop steps `self.optimizer`, which `configure_optimizer` installs
-TRAINABLE_STAGES = (
-    "train_fingerprint",
-    "configure_optimizer",
-    "train_state",
-)
-
-
 def is_trainable(decoder):
-    """True if `decoder` implements the whole training protocol."""
-    return all(hasattr(decoder, stage) for stage in TRAINABLE_STAGES)
+    """True if `decoder` is a learned decoder, by its own `TRAINABLE` declaration."""
+    # declared rather than detected: the bp family holds `nn.Parameter` index tensors it
+    # never learns, so anything based on having parameters would call them trainable
+    return bool(getattr(decoder, "TRAINABLE", False))
 
 
 def assert_trainable(decoders):
-    """Raise unless the chain's last decoder implements the whole training protocol."""
+    """Raise unless the chain's last decoder is one a training run can fit."""
     tail = decoders[-1]
     inner = getattr(tail, "decoder", tail)
     if is_trainable(inner):
         return
-    missing = [stage for stage in TRAINABLE_STAGES if not hasattr(inner, stage)]
     raise ValueError(
-        f'Decoder <{getattr(tail, "algo", type(inner).__name__)}> cannot train: it '
-        f'implements none of <{", ".join(missing)}>. `-t` trains the last algorithm.'
+        f'Decoder <{getattr(tail, "algo", type(inner).__name__)}> cannot train: it is '
+        f"not a learned decoder. `-t` trains the last algorithm."
+    )
+
+
+def assert_trained(decoders):
+    """Raise unless every learned decoder in the chain carries the weights it decodes with.
+
+    A decode run reports a logical error rate, and a learned decoder still at its random
+    initialization reports one for random weights: a number that reads like a result and
+    measures nothing. `-t` is the mode that starts from there, so a run that is not `-t`
+    has to be given the weights.
+    """
+    untrained = []
+    for decoder in decoders:
+        inner = getattr(decoder, "decoder", decoder)
+        if is_trainable(inner) and getattr(inner, "checkpoint", None) is None:
+            untrained.append(getattr(decoder, "algo", type(inner).__name__))
+    if not untrained:
+        return
+    raise ValueError(
+        f'Decoder <{", ".join(untrained)}> is learned and was given no weights, so it '
+        f"would decode at chance. Point the decoder yaml's `config.checkpoint` at a "
+        f"trained checkpoint, or train one first with `-t`."
     )
 
 

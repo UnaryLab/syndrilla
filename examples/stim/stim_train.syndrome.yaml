@@ -1,6 +1,3 @@
-# Measurement noise is part of the circuit on this path, so it is swept with the rest of
-# it: `measurement_error_rate` sets the circuit's `before_measure_flip_probability`, and
-# the training sweep in stim_train.error.yaml scales it alongside the other noise keys.
 syndrome:
   measure: stim
   rounds: 3

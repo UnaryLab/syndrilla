@@ -5,17 +5,17 @@ import pyfiglet
 import torch
 from loguru import logger
 
-from syndrilla.decoder import assert_trainable, create_decoder, resolve_configs
+from syndrilla.decoder import assert_trainable, assert_trained, create_decoder
 from syndrilla.error_model import create_error_model
 from syndrilla.interface import create_interface
 from syndrilla.logical_check import create_check
-from syndrilla.loss import create_loss
 from syndrilla.matrix import load_matrices
 from syndrilla.metric import (
     BatchTracker,
     MetricState,
 )
 from syndrilla.syndrome import create_syndrome
+from syndrilla.trainer import create_trainer, read_training_cfg
 from syndrilla.utils import ExtraQueue, bcolors, get_path, parse_device_dtype, read_yaml
 
 
@@ -98,14 +98,13 @@ def parse_commandline_args():
         help="Train the decoder instead of decoding. Writes <decoder>_<check>_<size>{_best.pt,_last.pt,_result.yaml} to --run_dir, beside the run's main-<time>.log.",
     )
     parser.add_argument(
-        "-ls",
-        "--loss_yaml",
+        "-tr",
+        "--training_yaml",
         type=str,
         default=None,
-        help="Path to loss yaml (see examples/alist/logical_centric.loss.yaml).",
+        help="Path to training yaml, carrying the objective, the optimizer and the schedule (see examples/alist/train_saq_hx.training.yaml).",
     )
-    # not '-tc': argparse splits that into '-t -c', so a typo would start a training
-    # run instead of failing. '-tckpt' mirrors the decode-side '-ckpt'.
+
     parser.add_argument(
         "-tckpt",
         "--train_checkpoint",
@@ -169,10 +168,10 @@ def main():
             ("-m", "matrix_yaml"),
             ("-e", "error_yaml"),
             ("-s", "syndrome_yaml"),
-            ("-ls", "loss_yaml") if args.train else ("-c", "logical_yaml"),
+            ("-tr", "training_yaml") if args.train else ("-c", "logical_yaml"),
         ]
     elif args.train:
-        required += [("-ls", "loss_yaml")]
+        required += [("-tr", "training_yaml")]
     missing = [flag for flag, name in required if getattr(args, name) is None]
     if missing:
         mode = "Training" if args.train else "Decoding"
@@ -181,17 +180,13 @@ def main():
     decoder_cfg = read_yaml(get_path(args.decoder_yaml))["decoder"]
 
     if args.train:
-        trained_cfg = resolve_configs(decoder_cfg, f"<{args.decoder_yaml}>")[-1]
+        # read here rather than with the objective below: the seed the schedule carries
+        # has to be set before the decoder is built, since it initializes the weights
+        training_cfg = read_training_cfg(args.training_yaml)
         metrics = MetricState.train_initial(
-            trained_cfg.get("train"), args.run_dir, args.decoder_yaml
+            training_cfg.get("schedule"), args.run_dir, args.training_yaml
         )
         torch.manual_seed(metrics.cfg["error_random_seed"])
-        yaml_ckpt = trained_cfg.get("checkpoint")
-        if args.train_checkpoint is not None and yaml_ckpt:
-            raise ValueError(
-                f"-tckpt <{args.train_checkpoint}> and the decoder yaml's "
-                f"`config.checkpoint` <{yaml_ckpt}> both supply weights; drop the yaml key."
-            )
 
     if args.interface_yaml is not None:
         logger.success(
@@ -222,7 +217,7 @@ def main():
         decoders = interface.decoders
 
         if args.train:
-            loss = create_loss(args.loss_yaml, decoder=decoders[-1])
+            trainer = create_trainer(cfg=training_cfg, decoder=decoders[-1])
     else:
         logger.success(
             "\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
@@ -242,7 +237,7 @@ def main():
         syndrome_generator = create_syndrome(args.syndrome_yaml, training=args.train)
 
         if args.train:
-            loss = create_loss(args.loss_yaml, decoder=decoders[-1])
+            trainer = create_trainer(cfg=training_cfg, decoder=decoders[-1])
 
         logger.success(
             "\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
@@ -301,10 +296,11 @@ def main():
             args.checkpoint_yaml,
             decoder_device,
             error_model,
-            loss,
+            trainer,
             H_file_name,
         )
     else:
+        assert_trained(decoders)
         metrics, num_err, num_batches = MetricState.resume_checkpoint(
             args.checkpoint_yaml,
             num_decoders,
@@ -395,16 +391,16 @@ def main():
                 io_dict = decoders[decoder_idx](io_dict)
 
                 if args.train and decoder_idx == num_decoders - 1:
-                    terms = loss.terms(io_dict, err)
-                    total = loss.combine(*terms)
+                    terms = trainer.loss.terms(io_dict, err)
+                    total = trainer.loss.combine(*terms)
                     if decoders[decoder_idx].training:
                         total.backward()
-                        decoders[decoder_idx].optimizer.step()
-                        decoders[decoder_idx].optimizer.zero_grad(set_to_none=True)
+                        trainer.optimizer.step()
+                        trainer.optimizer.zero_grad(set_to_none=True)
                     metrics.train_update_metric(
                         num_batches,
                         (total, *terms),
-                        loss.class_error(io_dict, err),
+                        trainer.loss.class_error(io_dict, err),
                     )
                     break
                 elapsed = time.time() - start_time

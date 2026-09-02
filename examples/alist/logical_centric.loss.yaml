@@ -1,5 +1,0 @@
-loss:
-  function: logical_centric
-  lambda_lc: 1.0
-  lambda_lp: 0.2
-  lambda_ent: 1.0

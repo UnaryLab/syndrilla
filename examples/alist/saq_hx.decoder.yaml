@@ -1,5 +1,3 @@
-# Decoding config: loads trained weights and runs a normal decode.
-# To train instead, use train_saq_hx.decoder.yaml with `syndrilla -t`.
 decoder:
   algorithm: saq
   check_type: hx
@@ -7,19 +5,14 @@ decoder:
   device:
     device_type: cpu
     device_idx: 0
-  # everything only saq understands, matched to `algorithm` by position
   config:
-    # weights written by a `-t` run, named after the configuration that produced them;
-    # update the path to match the run directory and matrix you trained on
-    checkpoint: tests/test_outputs/saq_hx_n41_best.pt
-    # transformer architecture, read only by the decoder
     model:
       d_model: 128
       N_dec: 6
       h: 16
       dropout: 0.0
       no_mask: 0
-    # stage 4 constraint projection; inference only, so `-t` builds without it
     cpnd:
       enable: true
       passes: 1
+    checkpoint: examples/alist/saq_hx_n41_best.pt

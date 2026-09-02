@@ -15,12 +15,3 @@ decoder:
     cpnd:
       enable: true
       passes: 1
-    optimizer:
-      lr: 5.0e-4
-      weight_decay: 5.0e-8
-      min_lr: 1.0e-6
-    train:
-      epochs: 40
-      test_batches: 100
-      validation_batches: 20
-      error_random_seed: 42
