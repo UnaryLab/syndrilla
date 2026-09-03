@@ -1,0 +1,17 @@
+decoding:
+  algorithm: saq
+  check_type: hx
+  dtype: float32
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    model:
+      d_model: 128
+      N_dec: 4
+      h: 8
+      dropout: 0.0
+      no_mask: 0
+    cpnd:
+      enable: true
+      passes: 1

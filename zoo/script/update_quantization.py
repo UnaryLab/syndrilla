@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+
 import yaml
 
 
@@ -26,7 +27,7 @@ def main():
     run_dir = Path(args.run_dir)
 
     # --- Iterate and update ---
-    for file in run_dir.rglob('*quant*.decoder.yaml'):
+    for file in run_dir.rglob('*quant*.decoding.yaml'):
         if file.is_file():
             print(f'Processing: {file}')
 
@@ -34,9 +35,10 @@ def main():
             with open(file, 'r') as f:
                 data = yaml.safe_load(f)
 
-            # Update fields
-            data['decoder']['int_width'] = args.int_width
-            data['decoder']['frac_width'] = args.frac_width
+            decoder_config = data['decoding'].setdefault('config', {})
+            stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
+            stage['int_width'] = args.int_width
+            stage['frac_width'] = args.frac_width
 
             # Write back
             with open(file, 'w') as f:
@@ -45,7 +47,7 @@ def main():
     sweeping_file = Path('zoo/script/sweeping_configs.yaml')
     with open(sweeping_file, 'r') as f:
         data = yaml.safe_load(f)
-    
+
     print(f'Processing: {sweeping_file}')
     data['decoder'] = [args.decoder]
 

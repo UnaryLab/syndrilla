@@ -1,5 +1,6 @@
-import sys
 import os
+import sys
+
 import torch
 from loguru import logger
 
@@ -9,10 +10,9 @@ sys.path.append(os.getcwd())
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
 from syndrilla.matrix import load_matrices
+from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import parse_device_dtype
-
 
 SURFACE_DIR = 'examples/alist/surface'
 DISTANCE = 3
@@ -23,9 +23,9 @@ def _setup(distance=DISTANCE):
     dec_cfg = {
         'algorithm': ['bp_lottery'],
         'check_type': 'hx',
-        'max_iter': 10,
         'dtype': 'float64',
         'device': {'device_type': 'cpu', 'device_idx': 0},
+        'config': [{'max_iter': 10}],
     }
     mat_cfg = {
         'parity_matrix_hx': {'file_type': 'alist', 'path': f'{SURFACE_DIR}/surface_{distance}_hx.alist'},

@@ -1,41 +1,23 @@
-"""
-bp_lottery_quant_cuda.py — CUDA port of bp_lottery_quant (quantized NMS + sign-flip).
-
-Combines the quantized per-step decode of bp_norm_min_sum_quant_cuda with the simple
-lottery sign-flip applied every iteration (on a quantized Sobol stream). Reuses
-bp_norm_min_sum_cuda's compiled kernels UNCHANGED — quantization (fp2fxp) and the
-sign-flip both run in PyTorch between kernel calls — so at float64 it reproduces
-bp_lottery_quant bit-for-bit.
-
-Implementation reuses both parents via multiple inheritance:
-  * bp_norm_min_sum_quant_cuda — quantized per-step kernel machinery and ``_q``.
-  * bp_lottery_quant            — the simple ``sign_flip`` (depends only on
-    self.H_matrix / self.r / self.i / self.batch_size).
-
-YAML algorithm key: bp_lottery_quant_cuda
-"""
-
 import torch
 from loguru import logger
 
-from syndrilla.utils import fp2fxp
-from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant_cuda import (
-    create as _QuantCuda,
-)
 from syndrilla.decoder.bp_lottery_quant.bp_lottery_quant import (
     create as _LotteryQuantPy,
+)
+from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant_cuda import (
+    create as _QuantCuda,
 )
 
 
 class create(_QuantCuda, _LotteryQuantPy):
     """Quantized lottery NMS on CUDA kernels (per-step path + sign-flip)."""
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         _QuantCuda.__init__(
-            self, decoder_cfg, **kwargs
+            self, decoding_cfg, **kwargs
         )  # quant + kernels; methods from _LotteryQuantPy
 
-        self.random_machine = str(decoder_cfg.get("random_machine", "sobol")).lower()
+        self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
             logger.warning(
                 f"Invalid random_machine <{self.random_machine}>; defaulting to sobol."

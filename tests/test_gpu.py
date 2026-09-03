@@ -1,6 +1,9 @@
-import torch
-import sys, os, time
+import os
+import sys
+import time
+
 import pytest
+import torch
 
 sys.path.append(os.getcwd())
 
@@ -10,12 +13,11 @@ pynvml = pytest.importorskip('pynvml')
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
-from syndrilla.metric import report_metric, save_metric, MetricState, BatchTracker
 from syndrilla.logical_check import create_check
 from syndrilla.matrix import load_matrices
-from syndrilla.vote import create_vote
-from syndrilla.utils import read_yaml, get_path, parse_device_dtype
+from syndrilla.metric import BatchTracker, MetricState
+from syndrilla.syndrome import create_syndrome
+from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 
 def get_gpu_memory_utilization(gpu_index=0):
@@ -33,25 +35,23 @@ def get_gpu_memory_utilization(gpu_index=0):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA not available')
 def test_batch_alist_hx(batch_size=1000, target_error=1000,
-                        run_dir='tests/test_outputs', vote_stage='syndrome'):
-    decoder_yaml = 'examples/alist/bposd_hx.decoder.yaml'
+                        run_dir='tests/test_outputs'):
+    decoding_yaml = 'examples/alist/bposd_hx.decoding.yaml'
     matrix_yaml = 'examples/alist/surface_10.matrix.yaml'
 
-    decoder_cfg = read_yaml(get_path(decoder_yaml))['decoder']
+    decoding_cfg = read_yaml(get_path(decoding_yaml))['decoding']
     matrix_cfg = read_yaml(get_path(matrix_yaml))['matrix']
-    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
-    decoders = create_decoder(cfg=decoder_cfg, bundle=bundle)
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+    decoders = create_decoder(cfg=decoding_cfg, bundle=bundle)
 
     error_model = create_error_model(yaml_path='examples/alist/bsc.error.yaml')
     syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
     logical_check = create_check(yaml_path='examples/alist/lx.check.yaml')
-    voter = create_vote(cfg={'method': 'majority_vote'})
-
     num_decoders = len(decoders)
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
     number_channel = error_model.number_channel
-    check_type = decoder_cfg.get('check_type', 'hx')
+    check_type = decoding_cfg.get('check_type', 'hx')
     shape, _, _, _ = bundle.Hx_matrix.get_index()
     H_matrix = bundle.select(check_type)[3]
 
@@ -80,10 +80,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
         for err, llr, _ in error_dataloader:
             bt.record_error(err)
 
-            rounds = getattr(syndrome_generator, 'rounds', 1)
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            synd = voter.apply(synd, number_channel, rounds=rounds,
-                               vote_stage=vote_stage, current_stage='syndrome')
 
             io_dict = {'synd': synd, 'llr0': llr, 'H_matrix': H_matrix}
 
@@ -96,16 +93,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 for k, v in gpu_stats.items():
                     logger.info(f'GPU decoder_{decoder_idx} {k}: {v}')
 
-                decoder_stage = f'decoder_{decoder_idx}'
-                io_dict['e_v'] = voter.apply(io_dict['e_v'], number_channel, rounds=rounds,
-                                             vote_stage=vote_stage, current_stage=decoder_stage)
-                io_dict['synd'] = voter.apply(io_dict['synd'], number_channel, rounds=rounds,
-                                              vote_stage=vote_stage, current_stage=decoder_stage)
-                for key in ('llr', 'converge', 'iter'):
-                    if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(io_dict[key], rounds=rounds,
-                                                          vote_stage=vote_stage, current_stage=decoder_stage)
-                bt.record_decoder(decoder_idx, io_dict, elapsed)
+                bt.record_metric(decoder_idx, io_dict, elapsed)
 
             has_obs_flips = hasattr(syndrome_generator, 'observable_flips') and syndrome_generator.observable_flips is not None
             check_error = syndrome_generator.observable_flips.to(dtype) if has_obs_flips else bt.e_all
@@ -119,19 +107,19 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
                 bt.e_v_all = [t.unsqueeze(1).expand(-1, number_channel, -1) for t in bt.e_v_all]
                 check = [t.unsqueeze(1).expand(-1, number_channel) for t in check]
             for i in range(num_decoders):
-                batch_result = report_metric(num_max_iter[i], bt.e_all, bt.e_v_all[i], bt.iter_all[i],
-                                             bt.time_iter_all[i], check[i], bt.converge_all[i],
-                                             bt.converge_all[i + 1], i)
-                metrics.accumulate(i, batch_result)
+                batch_result = metrics.report_metric(num_max_iter[i], bt.e_all, bt.e_v_all[i], bt.iter_all[i],
+                                                     bt.time_iter_all[i], check[i], bt.converge_all[i],
+                                                     bt.converge_all[i + 1], i)
+                metrics.update_metric(i, batch_result)
 
             if num_batches % 100 == 0:
                 all_metrics = metrics.get_all_metrics(num_batches, algo_name)
-                save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                            error_model.rate, num_batches, num_err, H_file_name, check_num)
+                metrics.save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
+                                    error_model.rate, num_batches, num_err, H_file_name, check_num)
 
     all_metrics = metrics.get_all_metrics(num_batches, algo_name)
-    save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
-                error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
+    metrics.save_metric(all_metrics, run_dir + '/', batch_size, target_error, str(dtype),
+                        error_model.rate, num_batches, num_err, H_file_name, check_num, 1)
 
 
 if __name__ == '__main__':

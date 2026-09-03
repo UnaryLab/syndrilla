@@ -1,7 +1,10 @@
-from syndrilla.utils import read_yaml, write_yaml
-from collections import OrderedDict
-import os, shutil, copy, itertools, argparse
+import argparse
+import os
+import shutil
+
 from loguru import logger
+
+from syndrilla.utils import read_yaml, write_yaml
 
 
 def clean_dir(base_path: str):
@@ -18,19 +21,22 @@ def generate_decoder(base_path: str, code, check_type, distance, dtype, decoder)
     template_path = 'examples/alist/'
     generated_path = base_path
 
-    configuration_dict = template_path + f'{decoder}_{check_type}.decoder.yaml'
+    configuration_dict = template_path + f'{decoder}_{check_type}.decoding.yaml'
 
-    target_file = os.path.join(generated_path, f'{decoder}_{check_type}.decoder.yaml')
+    target_file = os.path.join(generated_path, f'{decoder}_{check_type}.decoding.yaml')
 
     # Read, modify, and write
     config = read_yaml(configuration_dict)
-    if 'decoder' in config:
-        config['decoder']['dtype'] = dtype
-        config['decoder']['check_type'] = check_type
+    if 'decoding' in config:
+        config['decoding']['dtype'] = dtype
+        config['decoding']['check_type'] = check_type
         if code == 'surface':
-            config['decoder']['max_iter'] = distance*2*(distance-1)+1
+            max_iter = distance*2*(distance-1)+1
         else:
-            config['decoder']['max_iter'] = distance*2*(distance)
+            max_iter = distance*2*(distance)
+        decoder_config = config['decoding'].setdefault('config', {})
+        stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
+        stage['max_iter'] = max_iter
 
     write_yaml(target_file, config)
 
@@ -164,7 +170,7 @@ def main():
                                 generate_error(base_path, probability)
                                 generate_matrix(base_path, code, distance)
                                 generate_checker(base_path, check_type)
-                                
+
 
 if __name__ == '__main__':
     main()

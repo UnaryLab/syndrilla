@@ -1,24 +1,3 @@
-/*
- * union_find_kernel.cu -- standalone CUDA Union-Find decoder for the union_find_cuda
- * extension. Self-contained: depends on NOTHING in union_find.py.
- *
- * One file per decoder kernel, matching bp_kernel.cu / osd0_kernel.cu. The whole
- * algorithm (robin-hood table, lattice build, serial grow/fuse/peel) lives in the
- * portable header union_find_serial.cuh, a line-for-line transliteration of
- * union_find.py's _RobinTable / build_lattice_from_parity / decode_shot. Because that
- * decode is a reference-faithful serial fusion-forest decode, this kernel is bit-exact
- * to decode_shot: bit-for-bit identical vs the C++ chaeyeunpark reference on toric codes, and
- * valid (H c == s) on surface / open-boundary codes.
- *
- * Parallelism is across shots: one thread decodes one shot with its own global-memory
- * scratch. The serial decode is inherently sequential (robin-hood iteration order is
- * load-bearing), so this is correctness-first, not a within-shot-parallel kernel.
- *
- * Two Python entry points:
- *   uf_build_lattice(H)  -- host: build the tsl-order detector graph once, return the
- *                           CSR adjacency + (V, B, M, N). Cached by the Python module.
- *   uf_serial_exact(...) -- device: decode a [B, M] syndrome batch to [B, N] corrections.
- */
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
@@ -29,9 +8,6 @@
 
 #define UF_CHECK(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 
-// ════════════════════════════════════════════════════════════════════════════
-// Device kernel -- one thread per shot, full serial exact decode
-// ════════════════════════════════════════════════════════════════════════════
 __global__ void k_uf_serial_exact(
     const int* __restrict__ synd_all,    // [B, M]
     int*       __restrict__ corr_all,    // [B, N]
@@ -54,13 +30,6 @@ __global__ void k_uf_serial_exact(
     for (int q = 0; q < N; q++) corr[q] = s.corr[q];
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Host entry: build the detector graph (once per parity matrix)
-// ════════════════════════════════════════════════════════════════════════════
-//
-// H is a [M, N] int32 CPU tensor (0/1). Returns the CSR adjacency in tsl order plus
-// the scalar shape. The returned tensors are on CPU; the Python module moves them to
-// the CUDA device and caches them.
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            int64_t, int64_t, int64_t, int64_t>
 uf_build_lattice_ext(torch::Tensor H) {
@@ -95,9 +64,6 @@ uf_build_lattice_ext(torch::Tensor H) {
                            (int64_t)V, (int64_t)B, (int64_t)M, (int64_t)N);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Host entry: decode a syndrome batch (device)
-// ════════════════════════════════════════════════════════════════════════════
 torch::Tensor uf_serial_exact_cuda(
     torch::Tensor synd,      // [B, M] int32 (CUDA)
     torch::Tensor conn_off,  // [V+1]  int32 (CUDA)
@@ -136,9 +102,6 @@ int64_t uf_scratch_ints_ext(int64_t V, int64_t N) {
     return uf_scratch_ints((int)V, (int)N);
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// Python bindings
-// ════════════════════════════════════════════════════════════════════════════
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("uf_build_lattice", &uf_build_lattice_ext,
           "Build the tsl-order detector graph from H; returns CSR adjacency + shape");

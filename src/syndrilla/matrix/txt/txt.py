@@ -1,17 +1,16 @@
-import torch
 import numpy as np
-
+import torch
 from loguru import logger
 
 from syndrilla.utils import get_path
 
 
 class create():
-    def __init__(self, 
-                 matrix_cfg, 
+    def __init__(self,
+                 matrix_cfg,
                  **kwargs) -> None:
         self.device = kwargs['device']
-        assert 'path' in matrix_cfg.keys(), logger.error(f'Missing key <path> in the configuration.')
+        assert 'path' in matrix_cfg.keys(), logger.error('Missing key <path> in the configuration.')
         self.path = get_path(matrix_cfg['path'])
 
 
@@ -26,7 +25,7 @@ class create():
         # ****************************************************************
         shape = matrix.shape
         matrix = torch.tensor(matrix, device = self.device)
-        
+
         degree = torch.max(torch.sum(matrix, 1)).int().item()
 
         row_indices, indices = torch.where(matrix == 1)
@@ -55,17 +54,17 @@ class create():
             V_c_row[row][column] = row
             V_c_col[row][column] = shape[1]
             column += 1
-        
-        logger.info(f'Complete.')
+
+        logger.info('Complete.')
         return shape, V_c_row, V_c_col, matrix
 
     def get_sparse(self):
         logger.info(f'Loading sparse matrix from <{self.path}>.')
         matrix = np.loadtxt(self.path, dtype=float)
         matrix = torch.tensor(matrix, device = self.device)
-        logger.info(f'Complete.')
+        logger.info('Complete.')
         return matrix.to_sparse(sparse_dim=2)
-    
+
     def get_dense(self):
         return np.loadtxt(self.path, dtype=float)
 

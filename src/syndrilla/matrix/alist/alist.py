@@ -1,17 +1,16 @@
-import torch
 import numpy as np
-
+import torch
 from loguru import logger
 
 from syndrilla.utils import get_path
 
 
 class create():
-    def __init__(self, 
-                 matrix_cfg, 
+    def __init__(self,
+                 matrix_cfg,
                  **kwargs) -> None:
         self.device = kwargs['device']
-        assert 'path' in matrix_cfg.keys(), logger.error(f'Missing key <path> in the configuration.')
+        assert 'path' in matrix_cfg.keys(), logger.error('Missing key <path> in the configuration.')
         self.path = get_path(matrix_cfg['path'])
 
 
@@ -27,14 +26,14 @@ class create():
             col_neighbors = []
             for i in range(3):
                 f.readline()
-            
+
             for _ in range(m):
                 neighbors = list(map(int, f.readline().split()))
                 neighbors = [r for r in neighbors if r != 0]
                 col_neighbors.append(neighbors)
 
         matrix = np.zeros((m, n), dtype=int)
-        
+
         # Use the column neighbor lists to fill the matrix.
         for j, neighbors in enumerate(col_neighbors):
             for r in neighbors:
@@ -45,7 +44,7 @@ class create():
         # ****************************************************************
         shape = matrix.shape
         matrix = torch.tensor(matrix, device = self.device)
-        
+
         degree = torch.max(torch.sum(matrix, 1)).int().item()
 
         row_indices, indices = torch.where(matrix == 1)
@@ -74,10 +73,10 @@ class create():
             V_c_row[row][column] = row
             V_c_col[row][column] = shape[1]
             column += 1
-        
-        logger.info(f'Complete.')
+
+        logger.info('Complete.')
         return shape, V_c_row, V_c_col, matrix
-    
+
     def get_dense(self):
         with open(self.path, 'r') as f:
             line = f.readline().strip()
@@ -87,18 +86,18 @@ class create():
             col_neighbors = []
             for i in range(3):
                 f.readline()
-            
+
             for _ in range(m):
                 neighbors = list(map(int, f.readline().split()))
                 neighbors = [r for r in neighbors if r != 0]
                 col_neighbors.append(neighbors)
 
         matrix = np.zeros((m, n), dtype=int)
-        
+
         # Use the column neighbor lists to fill the matrix.
         for j, neighbors in enumerate(col_neighbors):
             for r in neighbors:
                 matrix[j, r-1] = 1
-        
+
         return matrix
 

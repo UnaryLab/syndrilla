@@ -1,0 +1,560 @@
+import copy
+import math
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from loguru import logger
+
+from syndrilla.utils import parse_device_dtype
+
+
+def _clones(module, n):
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(n)])
+
+
+def _rref_gf2(matrix):
+    """Reduced row echelon form over GF(2)."""
+    a = (np.asarray(matrix) % 2).astype(np.uint8)
+    rows, cols = a.shape
+    r = a.copy()
+    t = np.identity(rows, dtype=np.uint8)
+    pivots = []
+    row = 0
+    for col in range(cols):
+        if row == rows:
+            break
+        hit = np.flatnonzero(r[row:, col])
+        if hit.size == 0:
+            continue
+        p = row + hit[0]
+        if p != row:
+            r[[row, p]] = r[[p, row]]
+            t[[row, p]] = t[[p, row]]
+        others = np.flatnonzero(r[:, col])
+        others = others[others != row]
+        if others.size:
+            r[others] ^= r[row]
+            t[others] ^= t[row]
+        pivots.append(col)
+        row += 1
+    return r, t, np.asarray(pivots, dtype=np.int64)
+
+
+def _right_inverse(H_hat):
+    """`B` of shape [n, r] with `H_hat @ B == I_r` over GF(2)."""
+    _, t, pivots = _rref_gf2(H_hat)
+    rows, cols = np.shape(H_hat)
+    if pivots.size != rows:
+        raise ValueError(
+            f"CPND needs [H; L] to have full row rank, but its rank is <{pivots.size}> "
+            f"over <{rows}> rows; the logical operators must be independent."
+        )
+    B = np.zeros((cols, rows), dtype=np.uint8)
+    B[pivots] = t
+    return B
+
+
+def _kernel_basis(H_hat):
+    """Basis of `ker(H_hat)`, one basis vector per column of the returned [n, g] matrix."""
+    r_mat, _, pivots = _rref_gf2(H_hat)
+    n = np.shape(H_hat)[1]
+    free = np.setdiff1d(np.arange(n), pivots)
+    basis = np.zeros((n, free.size), dtype=np.uint8)
+    if free.size:
+        basis[free, np.arange(free.size)] = 1
+        basis[pivots] = r_mat[: pivots.size][:, free]
+    return basis
+
+
+def _logits_to_logical_bits(logits, k):
+    """Class logits [B, 2^k] -> the class's bit pattern [B, k], LSB first."""
+    index = logits.argmax(dim=1)
+    shifts = torch.arange(k, device=index.device)
+    return (index.unsqueeze(1) >> shifts) & 1
+
+
+class MultiHeadedAttention(nn.Module):
+    """Standard multi-head attention; `mask` is True on entries to suppress."""
+
+    def __init__(self, h, d_model, dropout=0.0):
+        super(MultiHeadedAttention, self).__init__()
+        if d_model % h != 0:
+            raise ValueError(f"d_model <{d_model}> must be divisible by h <{h}>.")
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = _clones(nn.Linear(d_model, d_model), 4)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        nbatches = query.size(0)
+        query, key, value = [
+            l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+            for l, x in zip(self.linears, (query, key, value))
+        ]
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            # upstream uses a literal -1e9, which overflows the half dtypes
+            neg = (
+                -1e9
+                if scores.dtype in (torch.float32, torch.float64)
+                else torch.finfo(scores.dtype).min
+            )
+            scores = scores.masked_fill(mask, neg)
+        p_attn = self.dropout(F.softmax(scores, dim=-1))
+        x = torch.matmul(p_attn, value)
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.0):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.gelu(self.w_1(x))))
+
+
+class SublayerConnection(nn.Module):
+    """Pre-norm residual wrapper with a separate norm per stream."""
+
+    def __init__(self, size, dropout):
+        super(SublayerConnection, self).__init__()
+        self.norm_q = nn.LayerNorm(size)
+        self.norm_l = nn.LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer, stream):
+        norm = self.norm_q if stream == "syndrome" else self.norm_l
+        return x + self.dropout(sublayer(norm(x)))
+
+
+class SLTDLayer(nn.Module):
+    """One Syndrome-Logical Transformer Decoder layer."""
+
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(SLTDLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = _clones(SublayerConnection(size, dropout), 2)
+
+    def forward(self, x, mem, mask, stream):
+        x = self.sublayer[0](x, lambda q: self.self_attn(q, mem, mem, mask), stream)
+        return self.sublayer[1](x, self.feed_forward, stream)
+
+
+class create(nn.Module):
+    """SAQ decoder exposed through the syndrilla decoder contract."""
+
+    # a learned decoder: `-t` fits these weights, and the run does the fitting. Declared
+    # rather than detected, since a decoder holding `nn.Parameter` index tensors it never
+    # learns -- the bp family does -- would pass any test based on having parameters
+    TRAINABLE = True
+    # what `train_score` returns, under the name the run records it by
+    TRAIN_SCORE_NAME = "val_class_err"
+
+    def __init__(self, decoding_cfg, **kwargs) -> None:
+        """Initialization for saq decoder.
+
+        Input:
+            decoding_cfg: the information that come from config file (yaml)
+
+        Settings, by the yaml block that carries them:
+            model:     d_model (token width), N_dec (SLTD layers), h (attention heads),
+                       dropout, no_mask (>0 disables the topology mask, paper ablation)
+            cpnd:      enable (default True, forced off when training), passes (default 1)
+            top level: check_type, dtype, device, checkpoint
+
+        The optimizer this decoder trains under is not one of them: it configures the
+        run, so it comes from the training yaml and the `Trainer` builds it.
+        """
+        super(create, self).__init__()
+
+        logger.info("Creating saq decoder.")
+
+        self.device, _ = parse_device_dtype(decoding_cfg)
+        self.dtype = decoding_cfg.get("dtype", "float32")
+        if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
+            logger.warning(
+                f"Invalid input data type <{self.dtype}>, default to <torch.float32>."
+            )
+            self.dtype = "float32"
+        self.dtype = torch.__dict__[self.dtype]
+
+        self.check_type = decoding_cfg.get("check_type", "hx")
+        if self.check_type.lower() not in {"hx", "hz"}:
+            logger.warning(
+                f"Invalid input check type <{self.check_type}>, default to <hx>."
+            )
+            self.check_type = "hx"
+
+        if "code_type" in decoding_cfg:
+            raise ValueError(
+                "Decoder <saq>: <code_type> was removed. Nothing in the decoder branches "
+                "on the code family, so nothing has to declare it; delete the key."
+            )
+
+        bundle = kwargs.get("bundle")
+        if bundle is None:
+            raise ValueError(
+                "saq requires a pre-loaded MatrixBundle via the `bundle` kwarg."
+            )
+        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
+        # a circuit-level DEM's columns are fault mechanisms rather than qubits, which is
+        # what `metric` names the result file by
+        source = (
+            bundle.Hx_matrix if self.check_type.lower() == "hx" else bundle.Hz_matrix
+        )
+        self.from_circuit_dem = getattr(source, "is_circuit_dem", False)
+
+        l_matrix = (
+            bundle.lx_matrix if self.check_type.lower() == "hx" else bundle.lz_matrix
+        )
+        l_matrix = torch.as_tensor(np.asarray(l_matrix))
+
+        self.m, self.n = int(H_shape[0]), int(H_shape[1])
+        self.k = int(l_matrix.shape[0])
+        self.logical_classes = 2**self.k
+        if self.k > 16:
+            raise ValueError(
+                f"saq enumerates 2^k logical classes; k=<{self.k}> is too large."
+            )
+
+        self.register_buffer("V_c_col", V_c_col.to(self.device))
+        self.register_buffer("H_matrix", H_matrix.to(self.device))
+        self.register_buffer(
+            "logic_matrix", l_matrix.t().to(self.device).to(self.dtype)
+        )
+
+        for legacy, block in (
+            ("d_model", "model"),
+            ("N_dec", "model"),
+            ("h", "model"),
+            ("dropout", "model"),
+            ("no_mask", "model"),
+            ("cpnd_passes", "cpnd"),
+        ):
+            if legacy in decoding_cfg:
+                raise ValueError(
+                    f"Decoder <saq>: <{legacy}> moved under the decoding yaml's "
+                    f"<config.{block}> block. Nest it there rather than at the top level."
+                )
+        for legacy, moved in (
+            ("lr", "training.optimizer.lr"),
+            ("weight_decay", "training.optimizer.weight_decay"),
+            ("min_lr", "training.optimizer.min_lr"),
+            ("lambda_loss_lc", "training.loss.lambda_lc"),
+            ("lambda_loss_lp", "training.loss.lambda_lp"),
+            ("lambda_loss_ent", "training.loss.lambda_ent"),
+        ):
+            if legacy in decoding_cfg:
+                raise ValueError(
+                    f"Decoder <saq>: <{legacy}> moved to the training yaml as "
+                    f"<{moved}>; pass it with -tr."
+                )
+
+        cpnd_cfg = decoding_cfg.get("cpnd", {})
+        if not isinstance(cpnd_cfg, dict):
+            raise ValueError(
+                f"Decoder <saq>: <config.cpnd> is a block with <enable> and <passes>, got "
+                f"<{cpnd_cfg!r}>."
+            )
+
+        training = bool(kwargs.get("training", False))
+        cpnd_wanted = bool(cpnd_cfg.get("enable", True))
+        self.use_cpnd = cpnd_wanted and not training
+        self.cpnd_passes = int(cpnd_cfg.get("passes", 1))
+        if self.cpnd_passes < 1:
+            logger.warning(
+                f"Invalid input passes <{self.cpnd_passes}>, default to <1>."
+            )
+            self.cpnd_passes = 1
+        if training and cpnd_wanted:
+            logger.info("saq is being trained; cpnd is inference only and stays off.")
+        if self.use_cpnd:
+            self._build_cpnd(H_matrix, l_matrix)
+
+        model_cfg = decoding_cfg.get("model", {})
+        if not isinstance(model_cfg, dict):
+            raise ValueError(
+                f"Decoder <saq>: <config.model> is a block with <d_model>, <N_dec>, <h>, "
+                f"<dropout> and <no_mask>, got <{model_cfg!r}>."
+            )
+        d_model = int(model_cfg.get("d_model", 128))
+        n_dec = int(model_cfg.get("N_dec", 6))
+        heads = int(model_cfg.get("h", 16))
+        dropout = float(model_cfg.get("dropout", 0.0))
+        self.N_dec = n_dec
+
+        # stage 1: Initial Embedding Layer
+        self.MLP = nn.Sequential(
+            nn.Linear(self.m, 4 * self.m),
+            nn.GELU(),
+            nn.Linear(4 * self.m, self.logical_classes),
+        )
+        self.learnable_embed_S = nn.Parameter(torch.empty(self.m, d_model))
+        self.learnable_embed_L = nn.Parameter(
+            torch.empty(self.logical_classes, d_model)
+        )
+        self.global_tok = nn.Parameter(torch.randn(1, 1, d_model))
+
+        # stage 2: N independent SLTD layers plus the mid-depth re-normalization
+        mhca = MultiHeadedAttention(heads, d_model, dropout)
+        ff = PositionwiseFeedForward(d_model, d_model * 4, dropout)
+        self.layers = _clones(SLTDLayer(d_model, mhca, ff, dropout), n_dec)
+        if n_dec > 1:
+            self.SN_norm2 = nn.LayerNorm(d_model)
+            self.LN_norm2 = nn.LayerNorm(d_model)
+
+        # stage 3 output layer, the final norm of each stream included
+        self.SN_norm = nn.LayerNorm(d_model)
+        self.LN_norm = nn.LayerNorm(d_model)
+        self.proj_e = nn.Linear(d_model, 1)
+        self.proj_l = nn.Linear(d_model, 1)
+        self.out_fc_S = nn.Linear(self.m, self.n)
+        self.out_fc_L = nn.Linear(self.logical_classes, self.logical_classes)
+
+        self._build_masks(H_matrix, no_mask=int(model_cfg.get("no_mask", 0)) > 0)
+
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+        self.to(device=self.device, dtype=self.dtype)
+        self._load_checkpoint(decoding_cfg.get("checkpoint"), training)
+
+        self.algo = "saq"
+        # one feed-forward pass per sample; `num_max_iter` is what `main.py` reads
+        self.num_max_iter = 1
+        if decoding_cfg.get("max_iter") not in (None, 1):
+            logger.warning(
+                f'saq is single-shot; ignoring max_iter <{decoding_cfg.get("max_iter")}>.'
+            )
+
+        logger.info("Complete.")
+
+    def _build_cpnd(self, H_matrix, l_matrix):
+        """Precompute `[H; L]`, its right inverse, and the stabilizer moves."""
+        H_np = H_matrix.detach().cpu().numpy().astype(np.uint8) % 2
+        L_np = l_matrix.detach().cpu().numpy().astype(np.uint8) % 2
+
+        # column pivots of H^T are row pivots of H
+        rows = _rref_gf2(H_np.T)[2]
+        H_hat = np.vstack([H_np[rows], L_np])
+        B = _right_inverse(H_hat)
+        basis = _kernel_basis(H_hat)
+
+        self.register_buffer(
+            "cpnd_rows",
+            torch.as_tensor(rows, dtype=torch.long, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cpnd_H_hat",
+            torch.as_tensor(H_hat, dtype=torch.float32, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cpnd_B",
+            torch.as_tensor(B, dtype=torch.float32, device=self.device),
+            persistent=False,
+        )
+
+        # nullspace_descent support
+        self.cpnd_supports = [
+            torch.as_tensor(
+                np.flatnonzero(basis[:, j]), dtype=torch.long, device=self.device
+            )
+            for j in range(basis.shape[1])
+        ]
+
+        dropped = self.m - len(rows)
+        logger.info(
+            f"CPND ready: dropped <{dropped}> dependent check row(s), "
+            f"[H; L] is <{H_hat.shape[0]}>x<{H_hat.shape[1]}>, "
+            f"<{len(self.cpnd_supports)}> stabilizer moves, <{self.cpnd_passes}> pass(es)."
+        )
+
+    def _build_masks(self, H_matrix, no_mask=False):
+        """Topology mask M_S plus the (unrestricted) logical cross-attention mask."""
+        if no_mask:
+            self.register_buffer("src_mask_SN", None)
+            self.register_buffer("src_mask_LN", None)
+            return
+
+        H = H_matrix.detach().cpu().to(torch.float32)
+        loc = (H @ H.t()) > 0
+        loc.fill_diagonal_(True)
+
+        star = torch.zeros(self.m + 1, self.m + 1, dtype=torch.bool)
+        star[1:, 1:] = loc
+        star[0, :] = True
+        star[:, 0] = True
+
+        self.register_buffer("src_mask_SN", ~star.unsqueeze(0).unsqueeze(0))
+        # suppresses nothing; kept explicit to mirror the paper's formulation
+        self.register_buffer(
+            "src_mask_LN",
+            torch.zeros(1, 1, self.logical_classes, self.m + 1, dtype=torch.bool),
+        )
+
+    def _load_checkpoint(self, path, training):
+        """Load the weights `checkpoint` names, and record which ones they were."""
+        self.checkpoint = None if training else path
+        if training:
+            if path is not None:
+                logger.warning(
+                    f"saq is being trained, so `checkpoint` <{path}> is ignored; the run "
+                    f"starts from random weights. Resume one with `-tckpt` instead."
+                )
+            return
+        if path is None:
+            logger.warning(
+                "saq has no `checkpoint`; weights are randomly initialized. That is "
+                "expected when training; to decode, train the model first."
+            )
+            return
+        state = torch.load(path, map_location=self.device, weights_only=True)
+        if isinstance(state, dict):
+            state = state.get("state_dict", state.get("model", state))
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        if missing:
+            raise ValueError(
+                f"saq checkpoint <{path}> has no weights for <{missing}>. Retrain, or "
+                f"point `checkpoint` at a checkpoint matching this decoding yaml."
+            )
+        if unexpected:
+            logger.warning(f"saq checkpoint <{path}>: unexpected keys <{unexpected}>.")
+        logger.info(f"Loaded saq weights from <{path}>.")
+
+    def forward(self, io_dict):
+        """Single-pass SAQ decoding.
+
+        Input:
+            synd: measured syndrome, [batch, m] in {0, 1}
+
+        Output:
+            e_v: estimated error, [batch, n] in {0, 1}
+            llr: per-qubit posterior LLR (positive => no error), [batch, n]
+            iter: always 1 -- SAQ does not iterate
+            converge: 1 where the estimate reproduces the measured syndrome
+        """
+        logger.info("Starting SAQ decoding pass.")
+
+        syndrome = io_dict["synd"].to(device=self.device, dtype=self.dtype)
+        batch = syndrome.size(0)
+
+        # Initial Embedding Layer
+        out_LP, SN, LN = self.initial_embedding_layer(syndrome)
+
+        # SAQ decoder layer
+        SN, LN = self.SAQ_decoder_layer(SN, LN)
+
+        # output layer
+        l_v, out_L = self.output_layer(SN, LN)
+        e_v = torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
+
+        # only cpnd used
+        if self.use_cpnd:
+            e_v = self.project(e_v, syndrome, out_L)
+            e_v = self.nullspace_descent(e_v, l_v)
+
+        s_est = self.syndrome_estimation(e_v)
+
+        converges = torch.all(s_est == syndrome, dim=1).long()
+        num_iters = torch.ones([batch], device=self.device, dtype=torch.long)
+
+        logger.info("Complete.")
+        logger.info(f"Converged samples: <{int(converges.sum())}>/<{batch}>.")
+        io_dict.update(
+            {
+                "e_v": e_v,
+                "iter": num_iters,
+                "llr": l_v,
+                "converge": converges,
+                "logical_logits": out_L,
+                "logical_prior": out_LP,
+            }
+        )
+        return io_dict
+
+    def initial_embedding_layer(self, syndrome):
+        """Stage 1: Initial Embedding Layer. Takes the measured syndrome in {0, 1}."""
+        syndrome_pm = 1 - 2 * syndrome
+        out_LP = self.MLP(syndrome_pm)
+        SN = self.learnable_embed_S.unsqueeze(0) * syndrome_pm.unsqueeze(-1)
+        LN = self.learnable_embed_L.unsqueeze(0) * out_LP.unsqueeze(-1)
+        SN = torch.cat([self.global_tok.expand(SN.size(0), -1, -1), SN], dim=1)
+        return out_LP, SN, LN
+
+    def SAQ_decoder_layer(self, SN, LN):
+        """Stage 2: SAQ Decoder Layer."""
+        for idx in range(self.N_dec):
+            SN = self.layers[idx](SN, SN, self.src_mask_SN, "syndrome")
+            LN = self.layers[idx](LN, SN, self.src_mask_LN, "logical")
+            if self.N_dec > 1 and idx == self.N_dec // 2:
+                SN = self.SN_norm2(SN)
+                LN = self.LN_norm2(LN)
+        return SN, LN
+
+    def output_layer(self, SN, LN):
+        """Stage 3: Output Layer."""
+        l_v = self.out_fc_S(self.proj_e(self.SN_norm(SN)[:, 1:, :]).squeeze(-1))
+        out_L = self.out_fc_L(self.proj_l(self.LN_norm(LN)).squeeze(-1))
+        return l_v, out_L
+
+    def project(self, e_raw, syndrome, out_L):
+        """Stage 4a: map the hard decision onto the exactly-feasible operator."""
+        logical_bits = _logits_to_logical_bits(out_L, self.k)
+
+        work = torch.float32
+        e = e_raw.to(work)
+        target = torch.cat(
+            [syndrome[:, self.cpnd_rows].to(work), logical_bits.to(work)], dim=1
+        )
+        residual = (target + e @ self.cpnd_H_hat.to(work).t()) % 2
+        e0 = ((residual @ self.cpnd_B.to(work).t()) + e) % 2
+        return e0.to(self.dtype)
+
+    def nullspace_descent(self, e0, l_v):
+        """Stage 4b: lighten the operator without leaving its constraint coset."""
+        weights = l_v.detach()
+        e = e0.to(torch.bool)
+        one = torch.ones((), dtype=weights.dtype, device=weights.device)
+        sign = torch.where(e, -one, one)
+
+        for _ in range(self.cpnd_passes):
+            moved = False
+            for cols in self.cpnd_supports:
+                delta = (sign[:, cols] * weights[:, cols]).sum(dim=1)
+                rows = (delta < 0).nonzero(as_tuple=True)[0]
+                if rows.numel() == 0:
+                    continue
+                moved = True
+                idx = rows.unsqueeze(1)
+                e[idx, cols] = ~e[idx, cols]
+                sign[idx, cols] = -sign[idx, cols]
+            if not moved:
+                break
+
+        return e.to(self.dtype)
+
+    def syndrome_estimation(self, e_v):
+        """`H @ e_v` over GF(2)."""
+        dummy = torch.zeros([e_v.size(0), 1], dtype=e_v.dtype, device=e_v.device)
+        temp_e = torch.cat([e_v, dummy], dim=1)
+        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
+        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
+
+    def train_score(self, train, val):
+        """Score an epoch by the validation logical error: what the decoder is for.
+
+        Validation loss is the surrogate the run descends, so the epoch with the lowest
+        one is not necessarily the epoch that decodes best. The kept checkpoint is the
+        one that decodes best.
+        """
+        return val["class_err"]

@@ -1,0 +1,14 @@
+decoding:
+  algorithm:
+  - bp_lottery_quant
+  - osd_0
+  check_type: hz
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    max_iter: 181
+    random_machine: sobol
+    int_width: 3
+    frac_width: 4

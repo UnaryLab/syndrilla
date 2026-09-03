@@ -81,18 +81,18 @@ class COOMatrixGF2Batch:
         dense = torch.zeros((B, M, N), dtype=torch.bool, device=self.batch_idx.device)
         dense[self.batch_idx, self.row_idx.to(torch.int64), self.col_idx.to(torch.int64)] = self.values.to(torch.bool)
         return dense
-    
+
 
 class create(torch.nn.Module):
     def __init__(self,
-                    decoder_cfg,
+                    decoding_cfg,
                     **kwargs) -> None:
-    
+
         super(create, self).__init__()
-        logger.info(f'Creating osd-0 decoder.')
+        logger.info('Creating osd-0 decoder.')
 
         # set up default device
-        device_cfg = decoder_cfg.get('device', {})
+        device_cfg = decoding_cfg.get('device', {})
         self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
             logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
@@ -102,13 +102,13 @@ class create(torch.nn.Module):
             device_idx = device_cfg.get('device_idx', 0)
             if device_idx >= torch.cuda.device_count():
                 logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device(f'cuda:0')
+                self.device = torch.device('cuda:0')
             else:
                 self.device = torch.device(f'cuda:{device_idx}')
-            
+
         # set up default dtype
-        self.dtype = decoder_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}: 
+        self.dtype = decoding_cfg.get('dtype', 'float64')
+        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
         self.dtype = torch.__dict__[self.dtype]
@@ -117,15 +117,15 @@ class create(torch.nn.Module):
         bundle = kwargs.get('bundle')
         if bundle is None:
             raise ValueError('osd_0 requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
-        check_type = decoder_cfg.get('check_type', 'hx')
+        check_type = decoding_cfg.get('check_type', 'hx')
         H_shape = bundle.select(check_type)[0]
         self.num_max_iter = H_shape[1]
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
 
     def forward(self, io_dict):
-        logger.info(f'Initializing osd-0 decoding.')
+        logger.info('Initializing osd-0 decoding.')
 
         device = io_dict['synd'].device
         not_converged_mask = (io_dict['converge'] == 0)
@@ -133,9 +133,9 @@ class create(torch.nn.Module):
         soft_decision_sub = io_dict['llr'][idx]
         synd_sub = io_dict['synd'][idx]
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
-        logger.info(f'Starting decoding.')
+        logger.info('Starting decoding.')
 
         _, cols_batch = torch.sort(soft_decision_sub, descending=False, stable=True)
 
@@ -155,7 +155,7 @@ class create(torch.nn.Module):
         del OSD_sub_result
         torch.cuda.empty_cache()
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
         ones_converge = torch.ones_like(io_dict['converge'])
         io_dict.update({
@@ -165,7 +165,7 @@ class create(torch.nn.Module):
         })
         return io_dict
 
-    
+
     def LU_decomposition_batch(self, H, cols_batch):
         """
         Perform LU decomposition on GF(2) for a batch of column orderings.
@@ -224,8 +224,6 @@ class create(torch.nn.Module):
             # Step 1: For each batch, find the first valid pivot starting from row i,
             # where the pivot condition is B[b, :, cols[b, k]] == 1 and rinv >= i
 
-            # start_time = time.time()
-            # ----------------------------------------------------------------------------
             # curr_cols: [B, N-i]
             curr_cols = cols_batch_out[:, i:N]  # columns from i to N-1
             B, ni = curr_cols.shape
@@ -237,7 +235,7 @@ class create(torch.nn.Module):
             coo_r = B_batch_sparse.row_idx.to(device)
             coo_c = B_batch_sparse.col_idx.to(device)
             coo_v = B_batch_sparse.values.to(device)
-            
+
             # key: (b * N + c)
             query_j = torch.arange(ni, device=device).repeat(B).to(device)        # [Q]
             query_key = query_b * N + query_c                         # [Q]
@@ -265,7 +263,7 @@ class create(torch.nn.Module):
                 torch.nn.functional.pad(repeats_valid, (1, 0))[:-1], dim=0).repeat_interleave(repeats_valid)
             coo_idx = offsets + range_increments  # [M]
 
-            r_idx = coo_r_sorted[coo_idx] 
+            r_idx = coo_r_sorted[coo_idx]
             b_idx = query_b[q_idx_expanded]
             j_idx = query_j[q_idx_expanded]
 
@@ -282,7 +280,7 @@ class create(torch.nn.Module):
 
             rinv_expand = rinv_batch.unsqueeze(1).expand(B, ni, rinv_batch.shape[1])  # [B, ni, N]
             candidate_mask &= (rinv_expand >= i)
-            
+
             del rinv_expand
             del b_idx, j_idx, r_idx
             torch.cuda.empty_cache()
@@ -305,13 +303,12 @@ class create(torch.nn.Module):
             # Write results
             pivot_row = torch.full((B,), -1, dtype=torch.long, device=device)
             pivot_col = torch.full((B,), -1, dtype=torch.long, device=device)
-            
+
             pivot_col = cols_batch_out[B_idx_full, min_col_vals]  # [B]
             pivot_row = min_row_vals  # [B]
             # Step 2: swap cols[i] <-> pivot_col
             old_col_i = cols_batch_out[:, i].clone()
 
-            # col_i_cinv = cinv_batch[torch.arange(B), old_col_i]
             pivot_cinv = cinv_batch[B_idx_full, pivot_col]
 
             # swap cols
@@ -338,7 +335,6 @@ class create(torch.nn.Module):
             rinv_batch[B_idx_full, pivot_row] = i
 
             # B_idx: [B, M], M_idx: [B, M], pivot_col: [B]
-            # start_time = time.time()
             pivot_col_expand = pivot_col.view(B, 1).expand(B, M)       # [B, M]
             B_idx_flat = B_idx.reshape(-1)  # [B*M]
             M_idx_flat = M_idx.reshape(-1)  # [B*M]
@@ -355,7 +351,7 @@ class create(torch.nn.Module):
             del valid_rows, min_rows, row_found_mask, valid_col_indices, valid_col_vals
             del min_col_vals, min_col_idx, min_row_vals
             torch.cuda.empty_cache()
-            
+
             coo_tuples = torch.stack([
             coo_b,
             coo_r,
@@ -400,7 +396,7 @@ class create(torch.nn.Module):
             B_batch_sparse.row_idx = coo_r
             B_batch_sparse.col_idx = coo_c
             B_batch_sparse.values = coo_v
-            
+
             # find index
             eq_b, eq_m = torch.nonzero(eq_mask, as_tuple=True)
             gt_b, gt_m = torch.nonzero(gt_mask, as_tuple=True)
@@ -437,7 +433,6 @@ class create(torch.nn.Module):
             U_batch_sparse.col_idx   = torch.cat([U_batch_sparse.col_idx.to(device), U_c])
             U_batch_sparse.values    = torch.cat([U_batch_sparse.values.to(device), U_v])
 
-            # ----------------------------------------------------------------
             del pivot_row, pivot_col, pivot_col_expand
             del coo_b, coo_r, coo_c, coo_v
             del rinv_r, gt_mask, eq_mask, lt_mask
@@ -554,7 +549,7 @@ class create(torch.nn.Module):
         osd0_decoding = self.mod2sparse_backward_sub_batch(U, cols, forward_b)
 
         return osd0_decoding
-    
+
 
     def gf2_rank(self, matrix):
         """
@@ -591,7 +586,7 @@ class create(torch.nn.Module):
                 rank += 1
 
         return rank
- 
+
 
     def print_row_ones(matrix: torch.Tensor):
         """
@@ -609,7 +604,7 @@ class create(torch.nn.Module):
             else:
                 ones_list = ones_idx.tolist()
                 logger.info(f"{row_idx}: {', '.join(map(str, ones_list))}")
-    
+
 
     def H_to_sparse(self, H_dense):
         """
@@ -621,7 +616,7 @@ class create(torch.nn.Module):
         """
         if H_dense.dim() != 2:
             logger.warning('Input must be a 2D tensor.')
-        
+
         n_row, _ = H_dense.shape
         sparse_H = [
             torch.nonzero(H_dense[i], as_tuple=False).squeeze(-1).tolist()
@@ -633,7 +628,7 @@ class create(torch.nn.Module):
     def tuple_hash(self, t):
         # Assume B < 65536, M < 65536, N < 65536
         return (t[:, 0].to(torch.int64) << 32) | (t[:, 1].to(torch.int64) << 16) | t[:, 2].to(torch.int64)
-    
+
 
     def apply_xor_sparse(self, coo_b, coo_r, coo_c, coo_v, gt_mask, pivot_row, pivot_row_tensor):
         device = coo_b.device
@@ -657,7 +652,7 @@ class create(torch.nn.Module):
         base = 1_000_000
         def tuple_hash(b, r, c):
             return b * base * base + r * base + c
-        
+
         old_key = tuple_hash(coo_b, coo_r, coo_c)
         new_key = tuple_hash(new_b, new_r, new_c)
 

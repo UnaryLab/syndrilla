@@ -1,15 +1,13 @@
-import yaml
 import subprocess
-import re
-import csv
-import os
+
+import yaml
 
 
 def modify_yaml(file_path, changes):
     """
     Load a YAML file, apply the given changes, and write them back.
     changes is a dict like:
-        { 'decoder.int_width': 3, 'decoder.frac_width': 4 }
+        { 'decoder.config.int_width': 3, 'decoder.config.frac_width': 4 }
     """
     with open(file_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -28,7 +26,7 @@ def modify_yaml(file_path, changes):
 
 def main(batch_size, target_error):
     # Paths to your YAML files (adjust to your actual paths)
-    decoder_yaml = 'examples/alist/lottery_bp_quant_hz.decoder.yaml'
+    decoding_yaml = 'examples/alist/lottery_bp_quant_hz.decoding.yaml'
     error_yaml   = 'examples/alist/bsc.error.yaml'
 
     # Define error rates
@@ -51,10 +49,10 @@ def main(batch_size, target_error):
 
                 # 1) Modify the decoder YAML
                 modify_yaml(
-                    file_path=decoder_yaml,
+                    file_path=decoding_yaml,
                     changes={
-                        'decoder.int_width':  int_w,
-                        'decoder.frac_width': frac_w
+                        'decoder.config.int_width':  int_w,
+                        'decoder.config.frac_width': frac_w
                     }
                 )
 
@@ -70,7 +68,7 @@ def main(batch_size, target_error):
                 cmd = [
                     'syndrilla',
                     '-r=tests/test_outputs',
-                    f'-d={decoder_yaml}',
+                    f'-d={decoding_yaml}',
                     f'-e={error_yaml}',
                     '-c=examples/alist/lz.check.yaml',
                     '-s=examples/alist/perfect.syndrome.yaml',

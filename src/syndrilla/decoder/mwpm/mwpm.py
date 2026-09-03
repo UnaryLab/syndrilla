@@ -1,39 +1,3 @@
-"""mwpm.py -- native (pymatching-free) Minimum-Weight Perfect Matching decoder.
-
-Self-contained: this decoder reimplements PyMatching v2's decode *steps* natively (no
-pymatching, no networkx) and wraps them in the Syndrilla decoder contract. The matching
-engine is a faithful clean-room transcription of PyMatching's sparse blossom (radix-heap
-event queue, growing-region flooder, alternating-tree blossom matcher, and the
-shortest-path-from-middle path reconstruction); the whole engine is inlined below.
-
-    build matching graph -> sparse-blossom growing-region flood -> minimum-weight perfect
-    matching with a boundary -> reconstruct qubit flips (flood observable mask for <=64
-    qubits, otherwise a shortest-path search) exactly as PyMatching does.
-
-Because the flooder reproduces PyMatching's internal event ordering, the correction is
-**bit-for-bit identical to PyMatching** on every shot -- not merely an equal-weight
-representative -- including PyMatching's tie-breaking on the degenerate (tied) syndromes
-that dominate graphlike surface codes. See the ``test_mwpm_vs_pymatching`` suite for the
-bit-exactness validation (e-diff == 0). The detector-graph construction
-(``MatchingGraph`` / ``build_matching_graph``) is self-contained in this module.
-
-The forward pass supports **batched** syndromes: it consumes ``io_dict['synd']``
-``[B, M]`` and decodes each shot with the native matcher, producing ``[B, N]``.
-(The blossom itself is inherently sequential and is not vectorised across the batch.)
-
-    forward(io_dict) consumes io_dict['synd']  ([B, M])
-                     produces io_dict['e_v']   ([B, N]) correction,
-                              io_dict['converge'] ([B], always 1 -- MWPM always returns
-                                  a valid correction),
-                              io_dict['iter']   ([B], defect count, >= 1 -- informational),
-                              io_dict['llr']    ([B, N], sign-encoded so a downstream
-                                  hard-decision / OSD stage stays consistent).
-
-The GPU-resident variant lives in ``mwpm_cuda.py`` (subclass; same native matching).
-
-YAML algorithm key: mwpm
-"""
-
 import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor
@@ -44,13 +8,6 @@ import torch
 from loguru import logger
 
 
-# --------------------------------------------------------------------------- #
-# Detector-graph construction (self-contained; no external decoder dependency).
-# A graphlike parity-check matrix H ([M, N]) becomes a graph whose nodes are the
-# M checks plus one shared boundary node (index M), and whose edges are the qubit
-# columns (weight-1 columns become boundary edges). Consumed by NativeMatcher's
-# ``from_graph`` path and to size the nominal iteration cap.
-# --------------------------------------------------------------------------- #
 @dataclass
 class MatchingGraph:
     """Detector graph built from a graphlike parity-check matrix H of shape [M, N].
@@ -139,19 +96,10 @@ def build_matching_graph(H) -> MatchingGraph:
     )
 
 
-# =========================================================================== #
-# Inlined sparse-blossom engine: a faithful, pymatching-free transcription of
-# PyMatching v2 (radix-heap queue + tracker, growing-region GraphFlooder,
-# alternating-tree Mwpm matcher, SearchFlooder path reconstruction) exposing
-# NativeMatcher. See this module's docstring and repro.md for the rationale.
-# =========================================================================== #
 SIZE_MAX = -1  # sentinel for "no index"
 INF = 1 << 62
 
 
-# --------------------------------------------------------------------------- #
-# radix_heap_queue<false>  (faithful: LIFO within bucket 0, bit_width bucketing)
-# --------------------------------------------------------------------------- #
 class RadixHeapQueue:
     def __init__(self):
         self.bit_buckets = [[] for _ in range(64 + 1)]
@@ -202,9 +150,6 @@ class RadixHeapQueue:
         self._num = 0
 
 
-# --------------------------------------------------------------------------- #
-# QueuedEventTracker (faithful)
-# --------------------------------------------------------------------------- #
 class QueuedEventTracker:
     def __init__(self):
         self.desired_time = 0
@@ -253,9 +198,6 @@ class Event:
         self.node = node
 
 
-# --------------------------------------------------------------------------- #
-# SearchDetectorNode
-# --------------------------------------------------------------------------- #
 class SearchNode:
     __slots__ = (
         "neighbors",
@@ -325,9 +267,6 @@ def build_search_graph(H, W=2):
     return nodes
 
 
-# --------------------------------------------------------------------------- #
-# SearchFlooder
-# --------------------------------------------------------------------------- #
 class SearchFlooder:
     BOUNDARY = 1
     DETECTOR_NODE = 0
@@ -533,9 +472,6 @@ class MwpmEvent:
         return e
 
 
-# --------------------------------------------------------------------------- #
-# VaryingCT: distance(t) = slope*t + yint, slope in {-1,0,+1}
-# --------------------------------------------------------------------------- #
 class Varying:
     __slots__ = ("slope", "yint")
 
@@ -585,9 +521,6 @@ class Varying:
 ZERO_FROZEN = Varying(0, 0)
 
 
-# --------------------------------------------------------------------------- #
-# Small structs
-# --------------------------------------------------------------------------- #
 class CompressedEdge:
     __slots__ = ("loc_from", "loc_to", "obs_mask")
 
@@ -629,9 +562,6 @@ def unstable_erase(vec, pred):
             i += 1
 
 
-# --------------------------------------------------------------------------- #
-# DetectorNode (main graph)
-# --------------------------------------------------------------------------- #
 class DetectorNode:
     __slots__ = (
         "idx",
@@ -704,9 +634,6 @@ class DetectorNode:
         self.node_event_tracker.clear()
 
 
-# --------------------------------------------------------------------------- #
-# GraphFillRegion
-# --------------------------------------------------------------------------- #
 class GraphFillRegion:
     __slots__ = (
         "blossom_parent",
@@ -782,9 +709,6 @@ class GraphFillRegion:
         self.do_op_for_each_descendant_and_self(op)
 
 
-# --------------------------------------------------------------------------- #
-# AltTreeNode / AltTreeEdge
-# --------------------------------------------------------------------------- #
 class AltTreeEdge:
     __slots__ = ("alt_tree_node", "edge")
 
@@ -913,9 +837,6 @@ class AltTreeNode:
         return orphan_edges, pruned
 
 
-# --------------------------------------------------------------------------- #
-# GraphFlooder
-# --------------------------------------------------------------------------- #
 class GraphFlooder:
     def __init__(self, nodes):
         self.graph_nodes = nodes
@@ -1175,9 +1096,6 @@ class GraphFlooder:
                 return notification
 
 
-# --------------------------------------------------------------------------- #
-# MatchingResult
-# --------------------------------------------------------------------------- #
 class MatchingResult:
     __slots__ = ("obs_mask", "weight")
 
@@ -1191,9 +1109,6 @@ class MatchingResult:
         return self
 
 
-# --------------------------------------------------------------------------- #
-# Mwpm matcher
-# --------------------------------------------------------------------------- #
 class Mwpm:
     def __init__(self, flooder, search_flooder=None):
         self.flooder = flooder
@@ -1493,9 +1408,6 @@ class Mwpm:
         self.shatter_blossom_and_extract_match_edges(region, match_edges)
 
 
-# --------------------------------------------------------------------------- #
-# Build main graph + top-level decode
-# --------------------------------------------------------------------------- #
 def build_main_graph(H, W=2):
     H = np.asarray(H).astype(np.uint8)
     M, N = H.shape
@@ -1522,9 +1434,7 @@ def build_main_graph(H, W=2):
     return nodes
 
 
-# --------------------------------------------------------------------------- #
 # Public entry point: NativeMatcher (bit-exact PyMatching from_check_matrix(H) decode)
-# --------------------------------------------------------------------------- #
 def _parse_H(H):
     """(M, N, boundary_edges, normal_edges) from a dense parity-check matrix."""
     H = np.asarray(H).astype(np.uint8)
@@ -1610,10 +1520,6 @@ class NativeMatcher:
     def from_graph(cls, g):
         return cls(*_parse_graph(g))
 
-    # ---- the sparse-blossom algorithm, as three phases ---------------------
-    # These are the named steps `create.forward` calls to spell out the MWPM
-    # skeleton (the way BP's forward calls v2c -> vn_update -> cn_update).
-    # `decode` below composes the same three, so the pool path stays identical.
     def seed_regions(self, detection_events):
         """Phase 1 -- build a fresh flood graph and grow a region at each defect."""
         nodes = _build_nodes(
@@ -1695,9 +1601,7 @@ class NativeMatcher:
         return self.extract_correction(nodes, mwpm, detection_events)
 
 
-# =========================================================================== #
 # Framework-facing decode helpers (bit-exact to PyMatching).
-# =========================================================================== #
 def decode_single_full(g, syndrome):
     """Decode one syndrome (``[M]`` uint8) natively, bit-identically to PyMatching.
 
@@ -1727,16 +1631,6 @@ def decode_single(g, syndrome, return_rounds=False):
     return correction
 
 
-# =========================================================================== #
-# Multiprocessing workers -- shot-parallel decode across CPU cores.
-#
-# The blossom core is pure-Python and never touches torch/GPU, so it is GIL-bound:
-# threads give no speedup and only separate processes parallelise the shot loop.
-# Each worker rebuilds its own NativeMatcher once from H (via the pool initializer),
-# so nothing heavy is pickled per shot and it works under both `fork` and `spawn`.
-# Shots are independent and written back by index, so the batched output stays
-# bit-for-bit identical to the sequential path.
-# =========================================================================== #
 _MP_MATCHER = None  # per-worker NativeMatcher, set by _mp_worker_init
 
 
@@ -1749,18 +1643,14 @@ def _mp_worker_decode(syndrome_row):
     return _MP_MATCHER.decode(syndrome_row)
 
 
-# =========================================================================== #
-# The Syndrilla decoder module.
-# =========================================================================== #
 class create(torch.nn.Module):
     """Native exact-weight MWPM decoder consuming one of the bundle's Hx/Hz matrices."""
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__()
         logger.info("Creating MWPM decoder.")
 
-        # ---- device (mirrors the other decoders' resolution) -------------------
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         self.device = device_cfg.get(
             "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -1784,15 +1674,13 @@ class create(torch.nn.Module):
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
-        # ---- dtype -------------------------------------------------------------
-        self.dtype = decoder_cfg.get("dtype", "float64")
+        self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(f"Invalid dtype <{self.dtype}>, default to float64.")
             self.dtype = "float64"
         self.dtype = torch.__dict__[self.dtype]
 
-        # ---- check type & matrix bundle ---------------------------------------
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(f"Invalid check type <{self.check_type}>, default to hx.")
             self.check_type = "hx"
@@ -1812,13 +1700,9 @@ class create(torch.nn.Module):
         # The bit-exact native sparse-blossom matcher (built once, reused per shot).
         self.matcher = NativeMatcher.from_check_matrix(H_np)
 
-        # ---- shot-parallel decode across CPU processes -------------------------
-        # The blossom is pure-Python (GIL-bound), so the per-shot loop is split
-        # across processes, not threads. `num_workers <= 1` keeps the sequential
-        # path; small batches stay sequential to skip pool overhead.
         self._H_np = H_np
-        self._num_workers = int(decoder_cfg.get("num_workers", os.cpu_count() or 1))
-        self._mp_min_batch = int(decoder_cfg.get("mp_min_batch", 64))
+        self._num_workers = int(decoding_cfg.get("num_workers", os.cpu_count() or 1))
+        self._mp_min_batch = int(decoding_cfg.get("mp_min_batch", 64))
         self._pool = None
 
         self.algo = "mwpm"
@@ -1839,10 +1723,6 @@ class create(torch.nn.Module):
         if self._num_workers <= 1 or B < self._mp_min_batch:
             return None
         if self._pool is None:
-            # Prefer `fork` (Linux default, and the GPU-box target): workers inherit
-            # the matcher via copy-on-write and need no `__main__` guard. Fall back to
-            # the platform default (spawn) where fork is unavailable; the initializer
-            # rebuilds the matcher from H so that path stays correct too.
             try:
                 ctx = mp.get_context("fork")
             except ValueError:
@@ -1870,14 +1750,6 @@ class create(torch.nn.Module):
 
         synd_np = (synd.detach().cpu().numpy() != 0).astype(np.uint8)  # [B, M]
 
-        # Decode each shot with the sparse-blossom MWPM algorithm. Per shot the
-        # skeleton is three phases:
-        #   1. seed a growing region at every defect (`seed_regions`)
-        #   2. process collision events until none remain (`run_flood`)
-        #   3. read the matched edges out into a correction (`extract_correction`)
-        # The blossom core is pure-Python (GIL-bound), so large batches fan that
-        # per-shot loop across CPU processes; the sequential path below spells out
-        # the same three phases in-line (each worker's `decode` composes them too).
         pool = self._get_pool(B)
         if pool is not None:
             chunksize = max(1, B // (self._num_workers * 4))
@@ -1904,7 +1776,7 @@ class create(torch.nn.Module):
         # hard-decision `<=0 -> 1` stays consistent; MWPM carries no real LLR).
         llr = (1.0 - 2.0 * e_v_t).to(device=dev, dtype=dt)
         converge = torch.ones(B, dtype=torch.int64, device=dev)
-        # Report at least one iteration: metric.report_metric histograms (iter - 1),
+        # Report at least one iteration: MetricState.report_metric histograms (iter - 1),
         # which must stay non-negative (a trivial all-zero syndrome matches 0 defects).
         iters_t = torch.from_numpy(iters).clamp(min=1).to(device=dev)
 

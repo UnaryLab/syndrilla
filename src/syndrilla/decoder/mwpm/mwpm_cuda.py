@@ -1,29 +1,3 @@
-"""mwpm_cuda.py -- CUDA port of the native (pymatching-free) sparse-blossom MWPM decoder.
-
-The compute path is a real CUDA kernel (``mwpm_kernel.cu``), NOT the CPU blossom: one CUDA
-thread decodes one syndrome shot, faithfully reproducing ``mwpm.py``'s deterministic
-sparse-blossom event ordering so the correction is **bit-for-bit identical** to
-``mwpm.py`` (``e-diff == 0``), with the batch as the parallel axis for speedup.
-
-Scope: the GPU runs the flood + matching for all ``N <= 64*_OBSW`` (``_OBSW`` 64-bit words;
-4 -> N<=256, surface d<=11). Correction extraction mirrors ``mwpm.py``'s own branch on N:
-for ``N <= 64`` the flood-accumulated ``obs_mask`` IS the correction; for ``N > 64`` the
-obs_mask picks a different (equal-weight) degenerate representative than PyMatching, so the
-kernel instead emits its match edges and this module reconstructs the explicit shortest
-qubit paths with ``mwpm.py``'s ``SearchFlooder`` (``_corr_from_match_edges``) -- the only
-path that is byte-for-byte identical to ``mwpm.py`` (``e-diff == 0``) at large distance.
-For ``N > 64*_OBSW`` -- and for any shot whose per-thread arena overflows (``err != 0``) --
-this module falls back to the exact CPU decoder in ``mwpm.py``, so the output is always correct.
-
-Subclasses the pure-PyTorch ``mwpm.create`` for __init__ (device/dtype/bundle + the
-one-time graph build and the ``NativeMatcher`` used for the CPU fallback), then overrides
-forward() to launch the kernel.
-
-YAML algorithm key: dispatched as ``mwpm`` on a ``cuda`` device -- the factory
-(_create_one_decoder in decoder/decoder.py) picks this file because it is named
-``mwpm_cuda.py``; there is no separate algorithm key.
-"""
-
 import os
 
 import numpy as np
@@ -31,7 +5,6 @@ import torch
 from loguru import logger
 
 from syndrilla.decoder.mwpm.mwpm import create as _MwpmPy
-
 
 _KERNEL = None  # compiled once per process
 
@@ -110,8 +83,8 @@ def _build_csr(matcher):
 class create(_MwpmPy):
     """MWPM decoder running the bit-exact CUDA blossom kernel (one thread per shot)."""
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)  # device/dtype/bundle + graph + matcher
+    def __init__(self, decoding_cfg, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)  # device/dtype/bundle + graph + matcher
         if not torch.cuda.is_available():
             raise RuntimeError("mwpm_cuda requires a CUDA GPU.")
         self._kernel = _load_kernel()
@@ -119,16 +92,11 @@ class create(_MwpmPy):
         self.M = self.matcher.M
         self.N = self.matcher.N
         self._use_kernel = self.N <= 64 * _OBSW
-        # Parity-check matrix (dense [M, N] uint8) for on-device output validation:
-        # a correct MWPM correction e satisfies H @ e == syndrome (mod 2). We use this to
-        # detect any shot the kernel completed "successfully" but wrongly (a latent bug in
-        # a rare multi-blossom path) and re-decode just those on the exact CPU blossom.
         self._H_np = np.asarray(self.H_matrix.detach().cpu().numpy()).astype(np.uint8)
         if not self._use_kernel:
             logger.warning(
-                f"mwpm_cuda: num_observables N={self.N} > 64*OBSW={64 * _OBSW} -- the "
-                "obs_mask kernel path is too narrow; falling back to the exact CPU blossom "
-                "for every shot. (Raise _OBSW here and OBSW in mwpm_kernel.cu together.)"
+                f"mwpm_cuda: N={self.N} > 64*OBSW={64 * _OBSW}; falling back to the CPU "
+                "blossom. (Raise _OBSW here and OBSW in mwpm_kernel.cu together.)"
             )
         off, nbr, obs = _build_csr(self.matcher)
         dev = self.device
@@ -215,13 +183,6 @@ class create(_MwpmPy):
                         e_v[bi] = self._corr_from_match_edges(
                             mef[bi], met[bi], menum[bi]
                         )
-            # A shot needs the exact CPU redo if EITHER:
-            #  (1) the kernel could not complete it (arena overflow, err != 0), OR
-            #  (2) its correction fails the syndrome check H @ e != s (mod 2). This is a pure
-            #      safety net for an invalid matching; it does NOT catch a valid-but-different
-            #      degenerate representative. That degeneracy was the old N>64 e-diff source
-            #      and is now removed at the root by the match-edge/SearchFlooder path above,
-            #      so a bit-exact correction no longer relies on this check firing.
             bad_err = np.nonzero(err != 0)[0]
             pred = (e_v.astype(np.int64) @ self._H_np.T.astype(np.int64)) & 1  # [B, M]
             bad_inv = np.nonzero((pred.astype(np.uint8) != synd_np).any(axis=1))[0]

@@ -1,34 +1,3 @@
-"""union_find.py -- reference-faithful Union-Find decoder for toric/graphlike codes.
-
-Union-Find (Delfosse-Nickerson, arXiv:1709.06218) is the unweighted syndrome-validation +
-peeling decoder. This module provides the Syndrilla decoder:
-
-  * ``create(decoder_cfg, bundle=...)`` -- the Syndrilla ``nn.Module`` decoder consuming
-    ``io_dict`` (algorithm key ``union_find``). Its runtime decode is a serial (per-shot)
-    grow -> fuse -> peel that reproduces the *exact spanning (fusion) forest* of the C++
-    reference (chaeyeunpark/UnionFind): on a toric (all weight-2) matrix it yields the
-    bit-for-bit identical correction; on a graphlike code with open
-    boundaries (surface / planar codes) it decodes validly (``H @ c == synd``) using a
-    boundary vertex and a boundary-rooted peel. See ``decode_shot`` below.
-
-The lattice is built by ``build_lattice_from_parity``, a clean-room port of the reference's
-``LatticeFromParity.hpp`` that reproduces the ``tsl::robin_map`` iteration order exactly
-(``_RobinTable``, edge hash ``u ^ (v<<1)``, power-of-two growth from 0, max-load-factor
-0.5, robin-hood insertion, backward-shift erase) so edge indexing matches the reference.
-It loads the two code families differently: toric adds no boundary vertex (byte-identical
-to the reference); surface (weight-1 columns) appends one boundary vertex at id M. Columns
-of weight > 2 (non-graphlike) are rejected.
-
-Why a serial decode: matching the reference bit-for-bit comes from the *spanning tree* the
-peel operates on, not from the peel order -- the reference peels its fusion forest (the
-edges that merged clusters during growth), so reproducing that forest requires the serial
-grow/fuse. A batched, loop-free decode builds a different (BFS) spanning tree of the same
-grown cluster: valid and logical-error-rate-matched, but with differing correction bits. The C++ reference
-``UnionFindPy.Decoder`` is used only in the tests as the bit-exact oracle (toric only).
-
-YAML algorithm key: union_find
-"""
-
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
@@ -45,17 +14,6 @@ def _make_edge(u: int, v: int) -> Edge:
     return (u, v) if u < v else (v, u)
 
 
-# =========================================================================== #
-# _RobinTable: faithful replica of tsl::robin_set / robin_map *iteration order*.
-#
-# We only need the order in which keys are visited (not the mapped values, tracked
-# separately), so a single open-addressing table suffices. Mirrors robin-map commit
-# 622443f: power_of_two_growth_policy<2>, DEFAULT_MAX_LOAD_FACTOR 0.5, initial buckets
-# 0, robin-hood insertion (steal from the rich), backward-shift erase, in-bucket-order
-# rehash reinsertion. std::hash is identity on integers (libc++/libstdc++), so vertex
-# keys hash to themselves and Edge keys to ``u ^ (v<<1)`` (see std::hash<Edge>).
-# Each bucket is ``None`` (empty) or ``[dist_from_ideal, key]``.
-# =========================================================================== #
 def _round_up_pow2(value: int) -> int:
     if value == 0:
         return 1
@@ -73,7 +31,6 @@ class _RobinTable:
         self.size = 0
         self.buckets: List[Optional[list]] = []  # length mask+1 (0 => empty table)
 
-    # ---- growth / rehash ---------------------------------------------------
     def _rehash_impl(self, count: int) -> None:
         if count == 0:
             new_mask, new_buckets = 0, []
@@ -124,7 +81,6 @@ class _RobinTable:
             dist += 1
         self.buckets[ib] = [dist, key]
 
-    # ---- public ops --------------------------------------------------------
     def contains(self, key) -> bool:
         if not self.buckets:
             return False
@@ -218,9 +174,7 @@ def _edge_hash(e: Edge) -> int:
     return e[0] ^ (e[1] << 1)  # std::hash<Edge>: h1 ^ (h2 << 1), h identity
 
 
-# =========================================================================== #
 # Lattice (transformation of LatticeFromParity.hpp)
-# =========================================================================== #
 @dataclass
 class Lattice:
     """Detector lattice built from a graphlike parity matrix H ([M, N])."""
@@ -305,9 +259,7 @@ def build_lattice_from_parity(H) -> Lattice:
     )
 
 
-# =========================================================================== #
 # Reference-faithful serial decode (grow -> fuse -> peel over the fusion forest).
-# =========================================================================== #
 def _find_root(root_of, v):
     """Union-find find with path compression (reference ``find_root``)."""
     tmp = root_of[v]
@@ -378,7 +330,6 @@ def decode_shot(lattice: Lattice, syndrome) -> np.ndarray:
     for v in syndrome_vertices:
         synd_vec[v] = 1
 
-    # ---- syndrome validation: grow / fuse ---------------------------------
     max_rounds = N + 2  # growth is monotone; converges in <= N rounds
     for _round in range(max_rounds):
         active = [r for r in odd_roots.keys() if r not in touch_bd]
@@ -434,11 +385,6 @@ def decode_shot(lattice: Lattice, syndrome) -> np.ndarray:
                 if (r2 in touch_bd) or (r1 in touch_bd):
                     touch_bd.add(r1)
 
-    # ---- peeling (LIFO leaf-rake over the fusion forest) ------------------
-    # Rooted at the boundary vertex B: B is never chosen as the degree-1 leaf, so
-    # every real check is satisfied and an unpaired defect in a boundary-touching
-    # cluster is absorbed into B. With B is None (toric) this is exactly the
-    # reference LIFO peel, keeping toric bit-exact.
     vertex_count: Dict[int, int] = {}
     for e in peeling_edges:
         vertex_count[e[0]] = vertex_count.get(e[0], 0) + 1
@@ -464,18 +410,14 @@ def decode_shot(lattice: Lattice, syndrome) -> np.ndarray:
     return correction
 
 
-# =========================================================================== #
-# Syndrilla decoder module (io_dict contract).
-# =========================================================================== #
 class create(torch.nn.Module):
     """Union-Find decoder consuming one of the bundle's Hx/Hz (toric/graphlike) matrices."""
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__()
         logger.info("Creating union-find decoder.")
 
-        # ---- device -----------------------------------------------------------
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         self.device = device_cfg.get(
             "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -499,15 +441,13 @@ class create(torch.nn.Module):
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
-        # ---- dtype ------------------------------------------------------------
-        self.dtype = decoder_cfg.get("dtype", "float64")
+        self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(f"Invalid dtype <{self.dtype}>, default to float64.")
             self.dtype = "float64"
         self.dtype = torch.__dict__[self.dtype]
 
-        # ---- check type & matrix bundle ---------------------------------------
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(f"Invalid check type <{self.check_type}>, default to hx.")
             self.check_type = "hx"
@@ -524,9 +464,6 @@ class create(torch.nn.Module):
         H_np = np.asarray(self.H_matrix.detach().cpu().numpy()).astype(np.uint8)
         self.M, self.N = H_np.shape  # M detector rows, N qubit columns
 
-        # Build the detector graph once (toric: M vertices, no boundary, reference-
-        # identical; surface: +1 boundary vertex at id M). The serial
-        # decode in ``forward`` consumes this lattice per shot.
         self.lattice = build_lattice_from_parity(H_np)
         self.V = self.lattice.num_vertices
         self.boundary = self.lattice.boundary_vertex
@@ -547,9 +484,6 @@ class create(torch.nn.Module):
         self.batch_size = B
         assert M == self.M, f"syndrome width {M} != H rows {self.M}"
 
-        # Serial reference-faithful decode, one shot at a time. ``decode_shot``
-        # reproduces the reference fusion forest (toric: bit-for-bit identical) and handles the
-        # boundary vertex for surface codes.
         synd_np = (synd_in != 0).to(dtype=torch.uint8).detach().cpu().numpy()
         correction = np.zeros((B, self.N), dtype=np.int64)
         for b in range(B):

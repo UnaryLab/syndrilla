@@ -1,5 +1,0 @@
-decoder:
-  algorithm: bp_norm_min_sum
-  check_type: hz
-  max_iter: 50
-  dtype: float64

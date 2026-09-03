@@ -1,10 +1,9 @@
-import sys
 import os
-import math
+import sys
+
 import numpy as np
 import scipy.sparse as sp
 import torch
-import stim
 from ldpc import BpOsdDecoder
 
 sys.path.append(os.getcwd())
@@ -12,9 +11,6 @@ sys.path.append(os.getcwd())
 from syndrilla.interface import create_interface
 
 
-# ----------------------------------------------------------------------------
-# build interface
-# ----------------------------------------------------------------------------
 def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
     return create_interface(
         cfg={
@@ -33,19 +29,16 @@ def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
             'measure': 'stim',
             'rounds': rounds,
         },
-        decoder_cfg={
+        decoding_cfg={
             'algorithm': ['bp_norm_min_sum', 'osd_0'],
             'check_type': 'hx',
-            'max_iter': max_iter,
             'dtype': 'float64',
             'device': {'device_type': 'cpu', 'device_idx': 0},
+            'config': [{'max_iter': max_iter}],  # osd_0 configures nothing
         },
     )
 
 
-# ----------------------------------------------------------------------------
-# syndrilla decode (through interface pipeline)
-# ----------------------------------------------------------------------------
 def decode_syndrilla(iface, n_shots, batch_size=500):
     error_model = iface.error_model
     syndrome_generator = iface.syndrome_generator
@@ -89,9 +82,6 @@ def decode_syndrilla(iface, n_shots, batch_size=500):
     return syndromes, obs_flips, predictions
 
 
-# ----------------------------------------------------------------------------
-# reference ldpc decode
-# ----------------------------------------------------------------------------
 def decode_reference(H, priors, det_data, max_iter=100):
     bp_osd = BpOsdDecoder(
         H,
@@ -111,12 +101,9 @@ def decode_reference(H, priors, det_data, max_iter=100):
     return out
 
 
-# ----------------------------------------------------------------------------
-# main test
-# ----------------------------------------------------------------------------
 def test_stim_bposd(distance=3, rounds=1, p=0.05,
                     n_shots=100000, max_iter=100):
-    print(f'\n=== Stim BPOSD comparison ===')
+    print('\n=== Stim BPOSD comparison ===')
     print(f'  surface_code rotated_memory_z, distance={distance}, rounds={rounds}, p={p}')
 
     # ---- 1. create interface ----

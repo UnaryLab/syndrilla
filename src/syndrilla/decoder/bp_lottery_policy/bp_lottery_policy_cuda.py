@@ -1,27 +1,8 @@
-"""
-bp_lottery_policy_cuda.py — CUDA port of bp_lottery_policy.
-
-Same per-iteration BP math as bp_norm_min_sum, plus the configurable lottery
-sign-flip *policy* (one of seven strategies) applied every iteration. Like
-bp_lottery_cuda it reuses bp_norm_min_sum_cuda's compiled per-step kernels for the
-BP steps and runs the sign-flip in PyTorch between iterations (a per-iteration host
-op the fused kernel cannot express).
-
-Implementation reuses BOTH parents directly via multiple inheritance:
-  * bp_norm_min_sum_cuda   — device/dtype/kernels/adjacency setup + the per-step
-    kernel entry points (self._ext.*).
-  * bp_lottery_policy       — the seven sign_flip_* methods and policy validation,
-    which depend only on self.H_matrix / self.r / self.i / self.batch_size and so
-    work unchanged once H_matrix is staged on-device here.
-
-YAML algorithm key: bp_lottery_policy_cuda
-"""
-
 import torch
 from loguru import logger
 
-from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _NmsCuda
 from syndrilla.decoder.bp_lottery_policy.bp_lottery_policy import create as _PolicyPy
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _NmsCuda
 
 
 class create(_NmsCuda, _PolicyPy):
@@ -32,22 +13,22 @@ class create(_NmsCuda, _PolicyPy):
         sign_flip_policy: one of bp_lottery_policy's seven policies (default Proposed)
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         # Only the CUDA parent's __init__ runs (kernels, adjacency, V_c_col on
         # device, dtype, N_ext, …). The PyTorch parent contributes methods only.
-        _NmsCuda.__init__(self, decoder_cfg, **kwargs)
+        _NmsCuda.__init__(self, decoding_cfg, **kwargs)
 
         # sign-flip is a per-iteration host op → no fused kernel.
         self._use_fused = False
 
-        self.random_machine = str(decoder_cfg.get("random_machine", "sobol")).lower()
+        self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
             logger.warning(
                 f"Invalid random_machine <{self.random_machine}>; defaulting to sobol."
             )
             self.random_machine = "sobol"
 
-        self.sign_flip_policy = decoder_cfg.get("sign_flip_policy", "Proposed")
+        self.sign_flip_policy = decoding_cfg.get("sign_flip_policy", "Proposed")
         if self.sign_flip_policy not in self._sign_flip_policies:
             logger.warning(
                 f"Invalid sign_flip_policy <{self.sign_flip_policy}>; defaulting to "

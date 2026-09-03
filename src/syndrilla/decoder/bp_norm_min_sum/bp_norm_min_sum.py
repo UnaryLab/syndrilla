@@ -1,5 +1,4 @@
 import torch
-
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
@@ -10,11 +9,11 @@ class create(torch.nn.Module):
     This class creates a bp decoder on a single GPU
     """
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         """
         Initialization for bp decoder
         Input:
-            decoder_cfg: the information that come from config file (yaml)
+            decoding_cfg: the information that come from config file (yaml)
 
         Parameters:
             max_iter: the number of maximum iteration of bp decoder
@@ -30,10 +29,10 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f"Creating bp decoder.")
+        logger.info("Creating bp decoder.")
 
         # set up default device
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         self.device = device_cfg.get(
             "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -54,12 +53,12 @@ class create(torch.nn.Module):
                 logger.warning(
                     f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
                 )
-                self.device = torch.device(f"cuda:0")
+                self.device = torch.device("cuda:0")
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
         # set up default max_iter
-        self.max_iter = decoder_cfg.get("max_iter", 50)
+        self.max_iter = decoding_cfg.get("max_iter", 50)
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
             logger.warning(
                 f"Invalid input maximum iteration <{self.max_iter}>, default to <50>."
@@ -67,7 +66,7 @@ class create(torch.nn.Module):
             self.max_iter = 50
 
         # set up default dtype
-        self.dtype = decoder_cfg.get("dtype", "float64")
+        self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(
                 f"Invalid input data type <{self.dtype}>, default to <torch.float64>."
@@ -77,7 +76,7 @@ class create(torch.nn.Module):
 
         self.batch_size = 1
 
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(
                 f"Invalid input check type <{self.check_type}>, default to <hx>."
@@ -102,10 +101,6 @@ class create(torch.nn.Module):
         # set iteration
         self.i = 0
 
-        # convert to as the parameters in a model. Move the bundle-derived index/mask/matrix
-        # tensors onto the decoder's device: the bundle is loaded on CPU, but forward() builds
-        # its tensors on self.device and ops like scatter_add_ require the index on the SAME
-        # device as the target (plain [] indexing tolerates a CPU index, scatter_add_ does not).
         self.V_c_row = torch.nn.Parameter(
             self.V_c_row.to(self.device), requires_grad=False
         )
@@ -118,14 +113,11 @@ class create(torch.nn.Module):
         self.algo = "bp_norm_min_sum"
         self.num_max_iter = self.max_iter
 
-        # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is
-        # in the config). When active it stops a batch once a learned % has converged
-        # and leaves the rest unconverged for main's extra queue. See decoder.py.
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get("rebatch_speedup"))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get("rebatch_speedup"))
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
     def forward(self, io_dict):
         """Iterative bp (normalized min sum) decoding algorithm
@@ -146,7 +138,7 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f"Initializing bp (normailized min sum) decoding.")
+        logger.info("Initializing bp (normailized min sum) decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
 
@@ -193,9 +185,9 @@ class create(torch.nn.Module):
         self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
         self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
 
-        logger.info(f"Starting decoding iterations.")
+        logger.info("Starting decoding iterations.")
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
@@ -264,7 +256,7 @@ class create(torch.nn.Module):
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
             self.cap.observe(num_iters, self.max_iter, self.batch_size)
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         logger.info(f"Decoding iterations: <{(self.i)}>.")
         io_dict.update(
             {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}

@@ -1,0 +1,6 @@
+error:
+  model: stim_circuit
+  after_clifford_depolarization: 0.003
+  after_reset_flip_probability: 0.003
+  before_round_data_depolarization: 0.003
+  rate: [0.0005, 0.006, 9]

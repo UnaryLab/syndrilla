@@ -1,29 +1,8 @@
-"""union_find_cuda.py -- CUDA Union-Find decoder (self-contained, all-CUDA).
-
-Selected by the decoder factory when ``device.device_type == cuda``. The ENTIRE decode --
-the detector-graph build (tsl-robin order) and the reference-faithful serial
-grow -> fuse -> peel -- runs in the CUDA extension ``cuda/union_find_kernel.cu`` (via
-``cuda/union_find_serial.cuh``, a line-for-line C/CUDA port of ``union_find.py``'s
-``_RobinTable`` / ``build_lattice_from_parity`` / ``decode_shot``). This module is only
-PyTorch glue: it parses config, builds the lattice once through the extension, and runs
-the batched exact kernel per ``forward``.
-
-The kernel is bit-exact to that serial decode: bit-for-bit identical to the C++
-chaeyeunpark reference on toric codes, and valid (``H @ c == s``) on surface /
-open-boundary codes. One thread decodes one shot with its own scratch (the serial decode
-is inherently sequential -- robin-hood iteration order is load-bearing); parallelism is
-across shots. Correctness-first, not a within-shot-parallel kernel.
-
-Nothing here imports ``union_find.py``. CUDA-only (``create`` raises without a GPU).
-"""
-
 import os
 
 import torch
 import torch.nn as nn
 from loguru import logger
-
-# ── Extension loader (mirrors osd_0_cuda / bp_norm_min_sum_cuda) ────────────────
 
 _EXT = None  # module-level cache; compiled once per Python process
 
@@ -88,8 +67,6 @@ def _load_ext():
     return _EXT
 
 
-# ── Decoder class ───────────────────────────────────────────────────────────────
-
 
 class create(nn.Module):
     """
@@ -107,7 +84,7 @@ class create(nn.Module):
     # cap the per-launch scratch tensor (bytes) so large batches chunk instead of OOM
     _SCRATCH_BUDGET_BYTES = 256 * 1024 * 1024
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__()
         logger.info("Creating union_find_cuda decoder.")
 
@@ -116,8 +93,7 @@ class create(nn.Module):
                 "union_find_cuda requires a CUDA-capable GPU. Use union_find for CPU."
             )
 
-        # ── device ────────────────────────────────────────────────────────────
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         device_type = device_cfg.get("device_type", "cuda")
         if device_type != "cuda":
             logger.warning(
@@ -130,19 +106,17 @@ class create(nn.Module):
             device_idx = 0
         self.device = torch.device(f"cuda:{device_idx}")
 
-        # ── dtype ─────────────────────────────────────────────────────────────
-        dtype_str = decoder_cfg.get("dtype", "float64")
+        dtype_str = decoding_cfg.get("dtype", "float64")
         if dtype_str not in {"float16", "bfloat16", "float32", "float64"}:
             logger.warning(f"Invalid dtype '{dtype_str}'; defaulting to float64.")
             dtype_str = "float64"
         self.dtype = torch.__dict__[dtype_str]
 
-        self.check_type = decoder_cfg.get("check_type", "hx").lower()
+        self.check_type = decoding_cfg.get("check_type", "hx").lower()
         if self.check_type not in {"hx", "hz"}:
             logger.warning(f"Invalid check_type='{self.check_type}'; defaulting to hx.")
             self.check_type = "hx"
 
-        # ── matrix bundle -> detector graph (built once in the extension) ─────
         bundle = kwargs.get("bundle")
         if bundle is None:
             raise ValueError(
@@ -172,7 +146,6 @@ class create(nn.Module):
         bytes_per_shot = max(1, self._scratch_ints * 4)
         self._max_chunk = max(1, self._SCRATCH_BUDGET_BYTES // bytes_per_shot)
 
-        # ── metadata expected by the framework ────────────────────────────────
         self.algo = "union_find"
         self.num_max_iter = self.N + 1
         self.batch_size = 1
@@ -180,8 +153,6 @@ class create(nn.Module):
             f"union_find_cuda decoder ready ({self.device}, V={self.V}, N={self.N}, "
             f"boundary={'yes' if self.boundary >= 0 else 'no'})."
         )
-
-    # ── Forward pass ────────────────────────────────────────────────────────────
 
     def forward(self, io_dict: dict) -> dict:
         dev = self.device

@@ -1,8 +1,0 @@
-decoder:
-  algorithm: bp_norm_min_sum
-  check_type: hx
-  max_iter: 181
-  dtype: float64
-  device:
-    device_type: cuda
-    device_idx: 0

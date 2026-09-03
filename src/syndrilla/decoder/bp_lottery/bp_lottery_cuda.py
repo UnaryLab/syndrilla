@@ -1,24 +1,3 @@
-"""
-bp_lottery_cuda.py — BP Normalized Min-Sum "lottery" decoder backed by CUDA kernels.
-
-CUDA port of bp_lottery (pure PyTorch). The per-iteration BP math is identical to
-bp_norm_min_sum, so this subclasses bp_norm_min_sum_cuda and reuses its compiled
-modular kernels (init_messages / vn_update / cn_update / llr_update /
-hard_decision / syndrome_est / convergence_update) unchanged. The only addition is
-the lottery "sign-flip" heuristic: after `flip_start_iter`, each iteration picks
-one variable node attached to a random unsatisfied check and flips its posterior
-LLR sign, nudging stuck samples toward a valid syndrome.
-
-That sign-flip is a per-iteration HOST operation that mutates l_v between BP steps,
-so — unlike bp_norm_min_sum_cuda — this decoder cannot use the single-launch fused
-kernel (which has no host break point mid-loop). It always runs the PER-STEP
-kernels, doing the sign-flip in PyTorch between iterations. The BP kernels still
-replace the eager-PyTorch ops, and at float64 the result matches bp_lottery
-bit-for-bit (the sign-flip math is the same PyTorch, fed bit-identical l_v/s_est).
-
-YAML algorithm key: bp_lottery_cuda
-"""
-
 import torch
 from loguru import logger
 
@@ -33,21 +12,21 @@ class create(_BaseCuda):
         flip_start_iter: int (default 4)                 first iteration that flips
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)
 
         # The sign-flip is a host op between BP steps; the fused kernel cannot
         # express it, so always take the per-step kernel path.
         self._use_fused = False
 
         # lottery knobs
-        self.random_machine = str(decoder_cfg.get("random_machine", "sobol")).lower()
+        self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
             logger.warning(
                 f"Invalid random_machine <{self.random_machine}>; defaulting to sobol."
             )
             self.random_machine = "sobol"
-        self.flip_start_iter = int(decoder_cfg.get("flip_start_iter", 4))
+        self.flip_start_iter = int(decoding_cfg.get("flip_start_iter", 4))
 
         # Dense [M, N] parity-check matrix on-device for the sign-flip scoring
         # (bp_norm_min_sum_cuda keeps only V_c_col; the sign-flip needs the matrix).
@@ -58,7 +37,6 @@ class create(_BaseCuda):
         self.algo = "bp_lottery"
         logger.info("bp_lottery_cuda decoder ready (per-step path + sign-flip).")
 
-    # ── Forward pass ──────────────────────────────────────────────────────────
     def forward(self, io_dict: dict) -> dict:
         """Per-step CUDA BP decode with the lottery sign-flip between iterations.
 
@@ -163,7 +141,6 @@ class create(_BaseCuda):
         )
         return io_dict
 
-    # ── lottery sign-flip (verbatim math from bp_lottery, on H_dense) ──────────
     def sign_flip_cn_rand_new(self, syndrome, s_est, l_v):
         """Flip one variable node's LLR sign per stuck sample.
 

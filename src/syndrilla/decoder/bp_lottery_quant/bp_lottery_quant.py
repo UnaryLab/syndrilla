@@ -1,9 +1,8 @@
 import torch
-
 from loguru import logger
 
-from syndrilla.utils import fp2fxp
 from syndrilla.decoder.decoder import RebatchSpeedup
+from syndrilla.utils import fp2fxp
 
 
 class create(torch.nn.Module):
@@ -11,12 +10,12 @@ class create(torch.nn.Module):
     This class creates a lotterybp decoder on a single GPU
     """
     def __init__(self,
-                 decoder_cfg,
+                 decoding_cfg,
                  **kwargs) -> None:
         """
         Initialization for lotterybp decoder
         Input:
-            decoder_cfg: the information that come from config file (yaml)
+            decoding_cfg: the information that come from config file (yaml)
 
         Parameters:
             max_iter: the number of maximum iteration of lotterybp decoder
@@ -32,10 +31,10 @@ class create(torch.nn.Module):
 
         super(create, self).__init__()
 
-        logger.info(f'Creating lotterybp decoder.')
+        logger.info('Creating lotterybp decoder.')
 
         # set up default device
-        device_cfg = decoder_cfg.get('device', {})
+        device_cfg = decoding_cfg.get('device', {})
         self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
             logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
@@ -45,32 +44,32 @@ class create(torch.nn.Module):
             device_idx = device_cfg.get('device_idx', 0)
             if device_idx >= torch.cuda.device_count():
                 logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device(f'cuda:0')
+                self.device = torch.device('cuda:0')
             else:
                 self.device = torch.device(f'cuda:{device_idx}')
 
         # set up default max_iter
-        self.max_iter = decoder_cfg.get('max_iter', 50)
+        self.max_iter = decoding_cfg.get('max_iter', 50)
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
             logger.warning(f'Invalid input maximum iteration <{self.max_iter}>, default to <50>.')
             self.max_iter = 50
-        
+
         # set up default dtype
-        self.dtype = decoder_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}: 
+        self.dtype = decoding_cfg.get('dtype', 'float64')
+        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
         self.dtype = torch.__dict__[self.dtype]
 
         self.batch_size = 1
 
-        self.check_type = decoder_cfg.get('check_type', 'hx')
-        if self.check_type.lower() not in {'hx', 'hz'}: 
+        self.check_type = decoding_cfg.get('check_type', 'hx')
+        if self.check_type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
-        self.random_machine = decoder_cfg.get('random_machine', 'sobol')
-        if self.random_machine.lower() not in {'sobol', 'system'}: 
+        self.random_machine = decoding_cfg.get('random_machine', 'sobol')
+        if self.random_machine.lower() not in {'sobol', 'system'}:
             logger.warning(f'Invalid input machine type <{self.random_machine}>, default to <sobol>.')
             self.random_machine = 'sobol'
 
@@ -84,28 +83,25 @@ class create(torch.nn.Module):
         self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
-        
+
         # set iteration
         self.i = 0
-        
+
         # convert to as the parameters in a model
         self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
-        self.intwidth = decoder_cfg.get('int_width', 3)
-        self.fracwidth = decoder_cfg.get('frac_width', 4)
+        self.intwidth = decoding_cfg.get('int_width', 3)
+        self.fracwidth = decoding_cfg.get('frac_width', 4)
 
         self.algo = 'bp_lottery_quant'
         self.num_max_iter = self.max_iter
 
-        # opt-in adaptive iteration speedup (no-op unless an `rebatch_speedup` block is
-        # in the config). When active it stops a batch once a learned % has converged
-        # and leaves the rest unconverged for main's extra queue. See decoder.py.
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get('rebatch_speedup'))
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
 
 
     def forward(self, io_dict):
@@ -127,19 +123,19 @@ class create(torch.nn.Module):
 
             s_est:  estimated syndrome for c-th code node at i-th iteration
         """
-        logger.info(f'Initializing lotterybp (normailized min sum) decoding.')
+        logger.info('Initializing lotterybp (normailized min sum) decoding.')
         syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
-        
+
         self.batch_size, _ = syndrome.size()
-        
+
         torch.set_default_dtype(self.dtype)
 
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
-        N_extended = self.H_shape[1] + 1 
+        N_extended = self.H_shape[1] + 1
         l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
         e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
         s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
-        
+
         # add dummy column
         dummy_column = torch.full([self.batch_size,1], float('inf'), dtype=self.dtype, device=self.device)
         u_init = torch.cat((fp2fxp(io_dict['llr0'].to(self.device).to(self.dtype), self.intwidth, self.fracwidth), dummy_column), dim=1)
@@ -148,7 +144,7 @@ class create(torch.nn.Module):
         num_iters = torch.full([self.batch_size], -1, device=self.device)
         converges = torch.full([self.batch_size], 0, device=self.device)
 
-        # set up initialization for all parameters for decoding process 
+        # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
         message = torch.zeros_like(self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
@@ -162,14 +158,14 @@ class create(torch.nn.Module):
             if self.dtype in {'float32', 'float64'}:
                 self.r = sobol.draw(self.max_iter).to(self.device).to(self.dtype)
                 self.r = fp2fxp(self.r, self.intwidth, self.fracwidth)
-            else: 
+            else:
                 self.r = sobol.draw(self.max_iter, dtype=torch.float32).to(self.device).to(self.dtype)
                 self.r = fp2fxp(self.r, self.intwidth, self.fracwidth)
-            
-        
-        logger.info(f'Complete.')
 
-        logger.info(f'Starting decoding iterations.')
+
+        logger.info('Complete.')
+
+        logger.info('Starting decoding iterations.')
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
@@ -234,7 +230,7 @@ class create(torch.nn.Module):
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
             self.cap.observe(num_iters, self.max_iter, self.batch_size)
 
-        logger.info(f'Complete.')
+        logger.info('Complete.')
         logger.info(f'Decoding iterations: <{(self.i)}>.')
         io_dict.update({
             'e_v': e_out,
@@ -272,7 +268,7 @@ class create(torch.nn.Module):
 
     def cn_update(self, a_v2c):
         base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype) 
+        exponent = torch.tensor(-(self.i), dtype=self.dtype)
 
         # Compute the power in PyTorch:
         beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
@@ -282,7 +278,7 @@ class create(torch.nn.Module):
         sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=2, keepdim=True)
         Q_sign = self.syndrome_neg * sign_prod
-        
+
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
         sorted, _ = torch.sort(abs_a_v2c, dim=2)
@@ -344,31 +340,31 @@ class create(torch.nn.Module):
 
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
         return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0)
-    
+
 
     def sign_flip(self, syndrome, s_est, l_v):
         synd_diff = (syndrome + s_est)%2.0
-        
-        temp_ls = torch.matmul(synd_diff.float(), self.H_matrix.unsqueeze(0).float()) 
+
+        temp_ls = torch.matmul(synd_diff.float(), self.H_matrix.unsqueeze(0).float())
         temp_ls = temp_ls.squeeze(0)
 
-        total_ones = temp_ls.sum(dim=1).to(self.dtype) 
+        total_ones = temp_ls.sum(dim=1).to(self.dtype)
 
         valid_mask = total_ones > 0
-        
+
         if self.random_machine.lower() == 'system':
             r = torch.rand(self.batch_size, device=self.device, dtype=self.dtype)
-        elif self.random_machine.lower() == 'sobol': 
+        elif self.random_machine.lower() == 'sobol':
             r = self.r[(self.i-1)].repeat(self.batch_size)
 
         target = torch.zeros_like(total_ones).to(self.dtype)
-        
+
         target[valid_mask] = torch.floor(r[valid_mask] * (total_ones[valid_mask] - 1))
         target = target.unsqueeze(1)
         cumsum_x = torch.cumsum(temp_ls, dim=1)
         mask = cumsum_x >= target + 1
         selected_indices = torch.argmax(mask.float(), dim=1)
-        
+
         l_v[valid_mask, selected_indices[valid_mask]] *= -1.0
         return l_v
-    
+

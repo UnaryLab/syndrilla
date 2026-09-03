@@ -2,7 +2,7 @@ import numpy as np
 from loguru import logger
 
 from syndrilla.interface.stim.stim import get_stim_circuit
-from syndrilla.matrix.matrix import dense_to_index_format, STIM_CIRCUIT_CACHE
+from syndrilla.matrix.matrix import STIM_CIRCUIT_CACHE, dense_to_index_format
 
 
 def _build_dem_matrices(circuit):
@@ -23,7 +23,7 @@ def _build_dem_matrices(circuit):
     priors = []
     err_idx = 0
     for inst in dem.flattened():
-        if inst.type != 'error':
+        if inst.type != "error":
             continue
         priors.append(inst.args_copy()[0])
         for tgt in inst.targets_copy():
@@ -46,37 +46,42 @@ def _build_dem_matrices(circuit):
     result = (H, obs_mat, np.asarray(priors, dtype=np.float64))
     STIM_CIRCUIT_CACHE[key] = result
     logger.info(
-        f'DEM extraction complete: '
-        f'detectors={num_detectors}, observables={num_observables}, errors={num_errors}'
+        f"DEM extraction complete: "
+        f"detectors={num_detectors}, observables={num_observables}, errors={num_errors}"
     )
     return result
 
 
-class create():
+class create:
     """
     Stim DEM matrix loader. Conforms to the same interface as alist/npz/txt
     loaders: exposes `path`, `get_index()`, and `get_dense()`.
     """
 
+    # Read by decoders that mean something different on a circuit-level DEM than on a
+    # code's parity-check matrix: here a column is a circuit fault mechanism, not a
+    # qubit, so a code family and a distance cannot be measured off the shape.
+    is_circuit_dem = True
+
     def __init__(self, matrix_cfg, **kwargs) -> None:
-        self.device = kwargs['device']
+        self.device = kwargs["device"]
 
-        circuit_str = matrix_cfg.get('circuit', None)
+        circuit_str = matrix_cfg.get("circuit", None)
         circuit = get_stim_circuit(circuit_str=circuit_str)
-        self.path = '<inline-stim-circuit>'
+        self.path = "<inline-stim-circuit>"
 
-        self.target = matrix_cfg.get('target', 'check').lower()
-        if self.target not in ('check', 'observable'):
+        self.target = matrix_cfg.get("target", "check").lower()
+        if self.target not in ("check", "observable"):
             raise ValueError(
                 f"stim matrix loader 'target' must be 'check' or 'observable', got <{self.target}>."
             )
 
         H, obs_mat, priors = _build_dem_matrices(circuit)
-        self._dense_np = H if self.target == 'check' else obs_mat
+        self._dense_np = H if self.target == "check" else obs_mat
         self.priors = priors
 
     def get_index(self):
-        logger.info(f'Building index for stim {self.target} matrix from <{self.path}>.')
+        logger.info(f"Building index for stim {self.target} matrix from <{self.path}>.")
         return dense_to_index_format(self._dense_np, self.device)
 
     def get_dense(self):

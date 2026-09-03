@@ -1,9 +1,0 @@
-decoder:
-  algorithm: bp_branch_assisted
-  check_type: hx
-  max_iter: 181
-  max_b_iter: 181
-  dtype: float64
-  device:
-    device_type: cuda
-    device_idx: 0

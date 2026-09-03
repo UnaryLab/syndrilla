@@ -1,0 +1,15 @@
+decoding:
+  algorithm: bp_sf
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    max_iter: 181
+    # syndrome-flipping (SF) post-processing on samples BP leaves unconverged
+    sf:
+      topk: 20      # number of most-oscillating bits used as flip candidates
+      w_min: 0      # minimum flip weight
+      w_max: 2      # maximum flip weight
+      n_sample: 200 # max combinations sampled per weight

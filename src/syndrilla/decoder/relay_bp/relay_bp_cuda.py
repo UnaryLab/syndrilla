@@ -1,48 +1,23 @@
-"""
-relay_bp_cuda.py — CUDA port of relay_bp (relay BP with memory legs).
-
-Relay BP runs an ensemble of full BP "legs"; the first leg is standard normalized
-min-sum and later legs add a per-variable memory bias and a per-leg alpha schedule.
-Each leg's inner BP recursion is the SAME min-sum as bp_norm_min_sum, so this reuses
-bp_norm_min_sum_cuda's compiled per-step kernels UNCHANGED, with the relay-specific
-pieces (memory bias, alpha, leg/solution bookkeeping) in PyTorch:
-
-  * cn_update kernel with beta = compute_alpha()  (per-leg/iteration scalar),
-  * llr_update kernel with `bias` passed in place of u_init, so the marginal
-    l_v = bias + Σ c2v is produced directly,
-  * vn_update kernel to form the next leg-message l_v[V_c_col] - c2v.
-
-At float64 this reproduces relay_bp bit-for-bit. The per-iteration host work (bias,
-convergence bookkeeping) rules out the fused kernel; the per-step path is used.
-
-Subclasses the pure-PyTorch relay_bp for its __init__ (all relay knobs) and the
-compute_alpha / bias_update / create_memory_strengths helpers, then bolts on the
-CUDA kernel machinery from bp_norm_min_sum_cuda.
-
-YAML algorithm key: relay_bp_cuda
-"""
-
 import torch
 import torch.nn as nn
 from loguru import logger
 
-from syndrilla.decoder.relay_bp.relay_bp import create as _RelayPy
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import (
-    _load_ext,
     _build_vn_adj,
+    _load_ext,
 )
+from syndrilla.decoder.relay_bp.relay_bp import create as _RelayPy
 
 
 class create(_RelayPy):
     """relay_bp on CUDA kernels (per-step path). Accepts every relay_bp key."""
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)  # all relay params + helper methods
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)  # all relay params + helper methods
 
         if not torch.cuda.is_available():
             raise RuntimeError("relay_bp_cuda requires a CUDA GPU.")
 
-        # ── CUDA kernel machinery (mirrors bp_norm_min_sum_cuda.__init__) ───────
         self._ext = _load_ext()
         self.N = self.H_shape[1]
         self.N_ext = self.N + 1

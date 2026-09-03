@@ -1,0 +1,6 @@
+decoding:
+  algorithm: [union_find]
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu

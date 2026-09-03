@@ -1,22 +1,22 @@
-import torch, math, yaml
-import sys, os, time
+import os
+import sys
+import time
+
 import numpy as np
-from loguru import logger
+import torch
 from ldpc import BpOsdDecoder
+from loguru import logger
 
 sys.path.append(os.getcwd())
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
 from syndrilla.syndrome import create_syndrome
-from syndrilla.metric import report_metric, compute_avg_metrics
-from syndrilla.logical_check import create_check
-from syndrilla.utils import dataset
 
 
 def test_batch_alist_hx(batch_size=1000, target_error=1000):
-    decoders = create_decoder(yaml_path='examples/alist/bposd_hx.decoder.yaml')
-    
+    decoders = create_decoder(yaml_path='examples/alist/bposd_hx.decoding.yaml')
+
     num_decoders = len(decoders)
     for decoder in decoders:
         decoder.eval()
@@ -38,10 +38,10 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
 
     num_err = 0
     num_batches = 0
-    
+
     e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
-    
+
     converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders+1)]
     iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
     time_iter_all = [[] for _ in range(num_decoders)]
@@ -50,19 +50,19 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
 
     # create syndrome
     syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
-        
+
     while num_err <= target_error:
         # create error
         e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
         e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
-        
+
         converge_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders+1)]
         iter_all = [torch.empty((0), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
         time_iter_all = [[] for _ in range(num_decoders)]
 
         zero_qubits = torch.zeros([batch_size, shape[1]], dtype=dtype)
         error_vector, error_dataloader = error_model.inject_error(zero_qubits, batch_size)
-        
+
         num_batches += 1
 
         avg_error_rate = torch.mean(torch.sum(error_vector, 1) / shape[1])
@@ -87,11 +87,11 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
                 io_dict = decoders[decoder_idx](io_dict)
 
                 time_iter_all[decoder_idx].append(time.time() - start_time)
-                
+
                 e_v_all[decoder_idx] = torch.cat((e_v_all[decoder_idx], io_dict['e_v']), dim=0)
                 iter_all[decoder_idx] = torch.cat((iter_all[decoder_idx], io_dict['iter']))
                 converge_all[decoder_idx] = torch.cat((converge_all[decoder_idx], torch.ones_like(io_dict['converge'])), dim=0)
-                
+
                 converge_all[decoder_idx+1] = torch.cat((converge_all[decoder_idx+1], io_dict['converge']), dim=0)
                 decoder_idx += 1
 
@@ -104,13 +104,13 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
                 e_v_all[decoder_idx] = torch.cat((e_v_all[decoder_idx], io_dict['e_v']), dim=0)
                 iter_all[decoder_idx] = torch.cat((iter_all[decoder_idx], io_dict['iter']))
                 converge_all[decoder_idx+1] = torch.cat((converge_all[decoder_idx+1], io_dict['converge']), dim=0)
-                decoder_idx += 1       
+                decoder_idx += 1
 
                 # comparing result with bposd repo
                 cbposd = []
                 for i in range(batch_size):
                     decoding = bp_osd.decode(io_dict['synd'][i].cpu().numpy())
-                    are_equal = np.array_equal(decoding, e_v_all[1][i].cpu().numpy()) 
+                    are_equal = np.array_equal(decoding, e_v_all[1][i].cpu().numpy())
                     cbposd.append(are_equal)
                 logger.info(f'comparing to bposd the e_v result is not the same for {sum(not val for val in cbposd)} in {batch_size} number of test cases.')
 

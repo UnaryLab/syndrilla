@@ -3,7 +3,6 @@ import math
 import random
 
 import torch
-
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
@@ -51,13 +50,13 @@ class create(torch.nn.Module):
         re-run BP, and on convergence flip those bits back in the estimate.
     """
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         super(create, self).__init__()
 
-        logger.info(f"Creating bp_sf decoder.")
+        logger.info("Creating bp_sf decoder.")
 
         # set up default device
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         self.device = device_cfg.get(
             "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -78,12 +77,12 @@ class create(torch.nn.Module):
                 logger.warning(
                     f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
                 )
-                self.device = torch.device(f"cuda:0")
+                self.device = torch.device("cuda:0")
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
         # set up default max_iter
-        self.max_iter = decoder_cfg.get("max_iter", 50)
+        self.max_iter = decoding_cfg.get("max_iter", 50)
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
             logger.warning(
                 f"Invalid input maximum iteration <{self.max_iter}>, default to <50>."
@@ -91,7 +90,7 @@ class create(torch.nn.Module):
             self.max_iter = 50
 
         # set up default dtype
-        self.dtype = decoder_cfg.get("dtype", "float64")
+        self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(
                 f"Invalid input data type <{self.dtype}>, default to <torch.float64>."
@@ -101,7 +100,7 @@ class create(torch.nn.Module):
 
         self.batch_size = 1
 
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(
                 f"Invalid input check type <{self.check_type}>, default to <hx>."
@@ -137,8 +136,7 @@ class create(torch.nn.Module):
         self.algo = "bp_sf"
         self.num_max_iter = self.max_iter
 
-        # -------- syndrome-flipping (SF) post-processing parameters --------
-        sf_cfg = decoder_cfg.get("sf", decoder_cfg)
+        sf_cfg = decoding_cfg.get("sf", decoding_cfg)
         self.w_min = int(sf_cfg.get("w_min", 0))
         self.w_max = int(sf_cfg.get("w_max", 0))
         self.n_sample = int(sf_cfg.get("n_sample", 0))
@@ -152,10 +150,6 @@ class create(torch.nn.Module):
             logger.warning("SF enabled (w_max>0) but topk<=0; defaulting topk to 20.")
             self.topk = 20
 
-        # When SF is enabled, the BP iteration cap is fixed to the number of data
-        # qubits N (= number of H columns), so a faithful BP-SF run iterates at most
-        # once per data qubit. SF-rescued samples report this pass-1 cap (deviation #4
-        # in repro.md), so the reported max iteration equals N.
         if self.w_max > 0:
             N = self.H_shape[1]
             if self.max_iter != N:
@@ -166,9 +160,6 @@ class create(torch.nn.Module):
             self.max_iter = N
             self.num_max_iter = self.max_iter
 
-        # BP-SF does not use the adaptive iteration cap (the SF retry replaces the
-        # deferred-tail mechanism); keep the attributes so the shared loop in main
-        # and metric stays happy.
         self.cap = RebatchSpeedup.from_cfg(None)
         self.cap_bypass = False
         self.cap_active_last = False
@@ -180,7 +171,7 @@ class create(torch.nn.Module):
     def forward(self, io_dict):
         """Decode a batch: normalized-min-sum BP, then SF post-processing on the
         samples BP left unconverged."""
-        logger.info(f"Initializing bp_sf decoding.")
+        logger.info("Initializing bp_sf decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
         llr0 = io_dict["llr0"].to(dtype=self.dtype).to(self.device)
@@ -198,7 +189,7 @@ class create(torch.nn.Module):
                 syndrome, llr0, e_out, l_out, converges, num_iters, osc
             )
 
-        logger.info(f"Complete.")
+        logger.info("Complete.")
         io_dict.update(
             {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
         )
@@ -310,10 +301,6 @@ class create(torch.nn.Module):
         # per-sample candidate bit indices, highest oscillation first: [U, topk]
         cand = torch.argsort(osc[unconv], dim=1, descending=True)[:, :topk]
 
-        # weight-ordered candidate-slot combinations, as a membership mask [C, topk].
-        # `sample_n_choose_k` (the reference's random sampler) is called once per weight,
-        # so the combo set and its ordering are identical to the loop version; each combo
-        # becomes a variable-length row of slot indices.
         combos = [
             torch.tensor(list(slots), dtype=torch.long, device=self.device)
             for w in range(self.w_min, self.w_max + 1)
@@ -361,17 +348,12 @@ class create(torch.nn.Module):
         row_flip.scatter_(1, cand, combo_mask[sel])
         chosen_e = torch.where(row_flip > 0, 1.0 - chosen_e, chosen_e)
 
-        # num_iters keeps the pass-1 BP cost (== max_iter for these samples); the SF
-        # retry is post-processing, so it is not counted as BP iterations (its cost
-        # shows up in wall-clock time, not the iteration histogram).
         g = unconv[has]
         e_out[g] = chosen_e[has]
         l_out[g] = chosen_l[has]
         converges[g] = 1
 
-    # ------------------------------------------------------------------ #
     # BP message-passing primitives (identical to bp_norm_min_sum)
-    # ------------------------------------------------------------------ #
     def v2c(self, l_v):
         return l_v[:, self.V_c_col]
 

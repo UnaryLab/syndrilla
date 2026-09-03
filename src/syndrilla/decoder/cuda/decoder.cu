@@ -1,23 +1,9 @@
-// decoder.cu — shared CUDA kernels used across decoder types (not specific to any
-// one BP variant, unlike bp_kernel.cu).
-//
-// Currently exposes `iter_histogram`: the iter_speedup warm-up histogram that
-// IterSpeedup.observe (decoder/decoder.py) uses to bin per-sample BP stop
-// iterations on-device instead of via torch.bincount. It is compiled as its own
-// extension (decoder_cuda_ext) and loaded lazily by decoder.py, so EVERY decoder
-// that uses the adaptive cap shares the same kernel, with a torch.bincount fallback
-// for CPU decoders. New cross-decoder device utilities belong here too.
-
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>   // at::cuda::getCurrentCUDAStream()
 
 #define THREADS 256
 static inline int grid1d(int n) { return (n + THREADS - 1) / THREADS; }
 
-// Bin per-sample stop iterations into [0, num_bins): one thread per sample, a single
-// atomicAdd into the matching bucket, values clamped into range so the result is
-// always exactly num_bins long (the cap's pooled accumulator needs a fixed size).
-// atomicAdd on int64 goes through the unsigned-long-long overload.
 __global__ void k_iter_histogram(
     const int64_t* __restrict__ iters,  // [B]         per-sample stop iteration
     int64_t*       __restrict__ hist,   // [num_bins]  output counts (pre-zeroed)

@@ -1,16 +1,22 @@
+import argparse
+import time
+
+import pyfiglet
 import torch
-import os, time
-import pyfiglet, argparse
 from loguru import logger
-from syndrilla.utils import bcolors, read_yaml, get_path, parse_device_dtype, ExtraQueue
-from syndrilla.decoder import create_decoder
+
+from syndrilla.decoder import assert_trainable, assert_trained, create_decoder
 from syndrilla.error_model import create_error_model
-from syndrilla.syndrome import create_syndrome
-from syndrilla.metric import report_metric, save_metric, MetricState, BatchTracker
-from syndrilla.matrix import load_matrices
-from syndrilla.logical_check import create_check
 from syndrilla.interface import create_interface
-from syndrilla.vote import create_vote
+from syndrilla.logical_check import create_check
+from syndrilla.matrix import load_matrices
+from syndrilla.metric import (
+    BatchTracker,
+    MetricState,
+)
+from syndrilla.syndrome import create_syndrome
+from syndrilla.trainer import create_trainer, read_training_cfg
+from syndrilla.utils import ExtraQueue, bcolors, get_path, parse_device_dtype, read_yaml
 
 
 def parse_commandline_args():
@@ -25,10 +31,10 @@ def parse_commandline_args():
         "--run_dir",
         type=str,
         default="tests/test_outputs",
-        help="Run directory to store outputs.",
+        help="Run directory to store outputs, for both decoding and training.",
     )
     parser.add_argument(
-        "-d", "--decoder_yaml", type=str, default=None, help="Path to decoder yaml."
+        "-d", "--decoding_yaml", type=str, default=None, help="Path to decoding yaml."
     )
     parser.add_argument(
         "-e", "--error_yaml", type=str, default=None, help="Path to error model yaml."
@@ -48,7 +54,7 @@ def parse_commandline_args():
         "--checkpoint_yaml",
         type=str,
         default=None,
-        help="Path to checkpoint result yaml to resume from.",
+        help="Path to checkpoint result yaml to resume from. With -t, the training run's <stem>_result.yaml, which is resumed alongside its -tckpt.",
     )
     parser.add_argument(
         "-bs",
@@ -61,8 +67,15 @@ def parse_commandline_args():
         "-te",
         "--target_error",
         type=int,
-        default=100,
-        help="Total number of errors to stop decoding.",
+        default=None,
+        help="Total number of errors to stop decoding, default 1000 unless -tb is given. Ignored with -t.",
+    )
+    parser.add_argument(
+        "-tb",
+        "--target_batch",
+        type=int,
+        default=None,
+        help="Target number of batches to stop decoding, instead of an error target. Wins over -te, with a warning, if both are given; ignored with -t.",
     )
     parser.add_argument(
         "-m", "--matrix_yaml", type=str, default=None, help="Path to matrix yaml."
@@ -77,24 +90,27 @@ def parse_commandline_args():
     parser.add_argument(
         "-l", "--log_level", type=str, default="INFO", help="Level of logger."
     )
+
     parser.add_argument(
-        "-dr",
-        "--rounds",
-        type=int,
-        default=1,
-        help="Number of syndrome measurement rounds (majority vote when > 1).",
+        "-t",
+        "--train",
+        action="store_true",
+        help="Train the decoder instead of decoding. Writes <decoder>_<check>_<size>{_best.pt,_last.pt,_result.yaml} to --run_dir, beside the run's main-<time>.log.",
     )
     parser.add_argument(
-        "-vs",
-        "--vote_stage",
+        "-tr",
+        "--training_yaml",
         type=str,
         default=None,
-        help="Where to apply majority vote. If not set, no voting is invoked "
-        "(syndromes/decoder outputs keep the rounds dimension). "
-        '"syndrome" = vote on syndromes then decode, '
-        '"decoder_N" = vote after decoder N (0-based), '
-        "remaining decoders run once on voted result. "
-        "e.g. decoder_0, decoder_1, decoder (= last).",
+        help="Path to training yaml, carrying the objective, the optimizer and the budget (see examples/alist/train_saq_hx.training.yaml).",
+    )
+
+    parser.add_argument(
+        "-tckpt",
+        "--train_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a run's *.pt, to continue that run where it stopped.",
     )
 
     return parser.parse_args()
@@ -103,7 +119,7 @@ def parse_commandline_args():
 def main():
     args = parse_commandline_args()
 
-    # set up output log
+    # set up output log: the same trace either mode writes, every module in it
     logger.remove()
     output_log = args.run_dir + "/main" + "-" + str(time.time()) + ".log"
     logger.add(output_log, level=args.log_level)
@@ -118,53 +134,116 @@ def main():
     )
     print(bcolors.UNDERLINE + bcolors.Green + ascii_banner + bcolors.ENDC)
 
+    if args.train_checkpoint is not None and not args.train:
+        raise ValueError(
+            "-tckpt resumes a training run, so it needs -t. To decode from a "
+            "checkpoint, put its path under the decoding yaml's `checkpoint` key."
+        )
+
+    if args.train and (args.checkpoint_yaml is None) != (args.train_checkpoint is None):
+        given, missing = (
+            ("-tckpt", "-ckpt <run>_result.yaml")
+            if args.checkpoint_yaml is None
+            else ("-ckpt", "-tckpt <run>_last.pt")
+        )
+        raise ValueError(
+            f"Resuming a training run takes both of its checkpoints, but {given} was "
+            f"given without {missing}. Both were printed by the run that wrote them."
+        )
+
+    if not args.train:
+        if args.target_batch is not None and args.target_error is not None:
+            logger.warning(
+                f"-te <{args.target_error}> and -tb <{args.target_batch}> are two "
+                f"different stop conditions; running to the batch target and "
+                f"dropping -te."
+            )
+            args.target_error = None
+        if args.target_batch is None and args.target_error is None:
+            args.target_error = 1000  # default to target error
+
+    required = [("-d", "decoding_yaml")]
+    if args.interface_yaml is None:
+        required += [
+            ("-m", "matrix_yaml"),
+            ("-e", "error_yaml"),
+            ("-s", "syndrome_yaml"),
+            ("-tr", "training_yaml") if args.train else ("-c", "logical_yaml"),
+        ]
+    elif args.train:
+        required += [("-tr", "training_yaml")]
+    missing = [flag for flag, name in required if getattr(args, name) is None]
+    if missing:
+        mode = "Training" if args.train else "Decoding"
+        raise ValueError(f"{mode} requires {' '.join(missing)}.")
+
+    decoding_cfg = read_yaml(get_path(args.decoding_yaml))["decoding"]
+
+    if args.train:
+        # read here rather than with the objective below: the seed the budget carries
+        # has to be set before the decoder is built, since it initializes the weights
+        training_cfg = read_training_cfg(args.training_yaml)
+        metrics = MetricState.train_initial(
+            training_cfg.get("budget"), args.run_dir, args.training_yaml
+        )
+        torch.manual_seed(metrics.cfg["error_random_seed"])
+
     if args.interface_yaml is not None:
         logger.success(
-            f"\n----------------------------------------------\nStep 1: Create interface\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 1: Create interface\n----------------------------------------------"
         )
         interface = create_interface(
             args.interface_yaml,
             error_yaml=args.error_yaml,
             syndrome_yaml=args.syndrome_yaml,
-            decoder_yaml=args.decoder_yaml,
+            decoding_yaml=args.decoding_yaml,
+            training=args.train,
         )
         logger.success(
-            f"\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
         )
         error_model = interface.error_model
         logger.success(
-            f"\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
         )
         syndrome_generator = interface.syndrome_generator
         logger.success(
-            f"\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
         )
+        # the interface leaves this None when training, which reads its loss straight
+        # off the decoder output and never checks a logical error
         logical_check = interface.logical_check
         bundle = interface.matrix_bundle
         decoders = interface.decoders
+
+        if args.train:
+            trainer = create_trainer(cfg=training_cfg, decoder=decoders[-1])
     else:
         logger.success(
-            f"\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
         )
-        decoder_cfg = read_yaml(get_path(args.decoder_yaml))["decoder"]
         matrix_cfg = read_yaml(get_path(args.matrix_yaml))["matrix"]
-        bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
-        decoders = create_decoder(cfg=decoder_cfg, bundle=bundle)
+        bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+        decoders = create_decoder(cfg=decoding_cfg, bundle=bundle, training=args.train)
 
         logger.success(
-            f"\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
         )
-        error_model = create_error_model(args.error_yaml)
+        error_model = create_error_model(args.error_yaml, training=args.train)
 
         logger.success(
-            f"\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 3: Create syndrome measurer\n----------------------------------------------"
         )
-        syndrome_generator = create_syndrome(args.syndrome_yaml)
+        syndrome_generator = create_syndrome(args.syndrome_yaml, training=args.train)
+
+        if args.train:
+            trainer = create_trainer(cfg=training_cfg, decoder=decoders[-1])
 
         logger.success(
-            f"\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
+            "\n----------------------------------------------\nStep 4: Create logical error checker\n----------------------------------------------"
         )
-        logical_check = create_check(args.logical_yaml)
+        # training never checks logical errors: it reads its loss straight off the decoder output, so the checker is never built
+        logical_check = None if args.train else create_check(args.logical_yaml)
 
     error_model.rounds = getattr(syndrome_generator, "rounds", 1)
 
@@ -172,15 +251,16 @@ def main():
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
 
-    voter = create_vote(cfg={"method": "majority_vote"})
-
     number_channel = error_model.number_channel
-    if args.decoder_yaml is not None:
-        check_type = read_yaml(get_path(args.decoder_yaml))["decoder"].get(
-            "check_type", "hx"
+    expected_channel = 2 if getattr(decoders[0], "_base_synd_ndim", 2) == 3 else 1
+    if number_channel != expected_channel:
+        # the interface path builds the error model itself, so there may be no -e to name
+        source = args.error_yaml or f"<{args.interface_yaml}>'s error model"
+        raise ValueError(
+            f"Error model <{source}> has <{number_channel}> channel(s), but "
+            f"decoder <{decoders[0].algo}> decodes <{expected_channel}>. "
         )
-    else:
-        check_type = "hx"
+    check_type = decoding_cfg.get("check_type", "hx")
     shape, _, _, _ = bundle.Hx_matrix.get_index()
     H_matrix = bundle.select(check_type)[3]
 
@@ -196,35 +276,6 @@ def main():
     check_num = bundle.get_check_num(check_type, number_channel)
 
     num_err = 0
-    num_batches = 0
-
-    # initialize metric state
-    metrics = MetricState(num_decoders, number_channel, decoder_device)
-
-    logger.success(
-        f"\n----------------------------------------------\nStep 5: Check checkpoint file\n----------------------------------------------"
-    )
-    # To check whether there is a resume yaml
-    if args.checkpoint_yaml is not None:
-        if not os.path.isfile(args.checkpoint_yaml):
-            raise FileNotFoundError(
-                f"Checkpoint file not found: {args.checkpoint_yaml}"
-            )
-        metrics, ckpt_meta = MetricState.from_checkpoint(
-            args.checkpoint_yaml, number_channel, decoder_device
-        )
-        metrics.validate_checkpoint(
-            ckpt_meta,
-            args.batch_size,
-            args.target_error,
-            dtype,
-            error_model.rate,
-            H_file_name,
-        )
-        num_err = ckpt_meta["num_err"]
-        num_batches = ckpt_meta["batch_count"]
-    else:
-        logger.info(f"No input Checkpoint file.")
 
     inner0 = getattr(decoders[0], "decoder", decoders[0])
     cap_on = getattr(inner0, "cap", None) is not None
@@ -232,19 +283,70 @@ def main():
         logger.warning("rebatch_speedup supports rounds==1 only; disabling the cap.")
         cap_on = False
 
+    logger.success(
+        "\n----------------------------------------------\nStep 5: Check checkpoint file\n----------------------------------------------"
+    )
+
+    if args.train:
+        assert_trainable(decoders)
+        num_batches = metrics.train_resume_checkpoint(
+            decoders[-1],
+            args.batch_size,
+            args.train_checkpoint,
+            args.checkpoint_yaml,
+            decoder_device,
+            error_model,
+            trainer,
+            H_file_name,
+        )
+    else:
+        assert_trained(decoders)
+        metrics, num_err, num_batches = MetricState.resume_checkpoint(
+            args.checkpoint_yaml,
+            num_decoders,
+            number_channel,
+            decoder_device,
+            args.batch_size,
+            args.target_error,
+            dtype,
+            error_model.rate,
+            H_file_name,
+            args.target_batch,
+        )
+
     queue = ExtraQueue(
         args.batch_size, args.target_error, decoder_device
     )  # deferred (hard) samples
 
-    while num_err <= args.target_error or (cap_on and queue.nonempty):
-        logger.success(
-            f"\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
+    if args.train:
+        max_batches = metrics.total_batches
+    else:
+        max_batches = (
+            args.target_batch if args.target_batch is not None else float("inf")
         )
-        bt = BatchTracker(num_decoders, number_channel, shape, dtype, decoder_device)
+    # a -tb run has no error target, so only max_batches ends it
+    error_budget = float("inf") if args.target_error is None else args.target_error
+
+    def budget_left():
+        """Is there room to generate a fresh batch under this run's stop condition?"""
+        return num_batches < max_batches and num_err <= error_budget
+
+    # once the budget is spent, the loop keeps running to drain deferred samples
+    while budget_left() or (cap_on and queue.nonempty):
+        logger.success(
+            "\n----------------------------------------------\nStep 6: Generate error\n----------------------------------------------"
+        )
+        bt = (
+            None
+            if args.train
+            else BatchTracker(
+                num_decoders, number_channel, shape, dtype, decoder_device
+            )
+        )
 
         # predict_pct offload scheduler: decide WHEN to re-decode the deferred queue
         do_flush, flushing = queue.should_flush(num_err)
-        use_extra = cap_on and do_flush
+        use_extra = cap_on and (do_flush or not budget_left())
         if cap_on:
             inner0.cap_bypass = use_extra
         if use_extra:
@@ -267,76 +369,46 @@ def main():
 
         num_err_before_batch = num_err
         for err, llr, _ in error_dataloader:
-            bt.record_error(err)
-            vote_recorded = False
+            if bt is not None:
+                bt.record_error(err)
 
             logger.success(
-                f"\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------"
             )
             synd = syndrome_generator.measure_syndrome(err, decoders[0])
-            rounds = getattr(syndrome_generator, "rounds", 1)
-            synd = voter.apply(
-                synd,
-                number_channel,
-                rounds=rounds,
-                vote_stage=args.vote_stage,
-                current_stage="syndrome",
-            )
 
             llr0 = llr
             if hasattr(syndrome_generator, "adjust_llr0"):
                 llr0 = syndrome_generator.adjust_llr0(llr0)
-            if not vote_recorded and voter.last_sample_count > 0:
-                metrics.accumulate_vote(
-                    voter.last_match_counts,
-                    voter.last_sample_count,
-                    voter.last_voted_stage,
-                    voter.last_rounds,
-                )
-                vote_recorded = True
 
             io_dict = {"synd": synd, "llr0": llr0, "H_matrix": H_matrix}
 
             logger.success(
-                f"\n----------------------------------------------\nStep 8: Decode\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 8: Decode\n----------------------------------------------"
             )
             for decoder_idx in range(num_decoders):
                 start_time = time.time()
                 io_dict = decoders[decoder_idx](io_dict)
-                elapsed = time.time() - start_time
 
-                decoder_stage = f"decoder_{decoder_idx}"
-                io_dict["e_v"] = voter.apply(
-                    io_dict["e_v"],
-                    number_channel,
-                    rounds=rounds,
-                    vote_stage=args.vote_stage,
-                    current_stage=decoder_stage,
-                )
-                if not vote_recorded and voter.last_sample_count > 0:
-                    metrics.accumulate_vote(
-                        voter.last_match_counts,
-                        voter.last_sample_count,
-                        voter.last_voted_stage,
-                        voter.last_rounds,
+                if args.train and decoder_idx == num_decoders - 1:
+                    terms = trainer.loss.terms(io_dict, err)
+                    total = trainer.loss.combine(*terms)
+                    if decoders[decoder_idx].training:
+                        total.backward()
+                        trainer.optimizer.step()
+                        trainer.optimizer.zero_grad(set_to_none=True)
+                    metrics.train_update_metric(
+                        num_batches,
+                        (total, *terms),
+                        trainer.loss.class_error(io_dict, err),
                     )
-                    vote_recorded = True
-                io_dict["synd"] = voter.apply(
-                    io_dict["synd"],
-                    number_channel,
-                    rounds=rounds,
-                    vote_stage=args.vote_stage,
-                    current_stage=decoder_stage,
-                )
-                for key in ("llr", "converge", "iter"):
-                    if key in io_dict and io_dict[key].ndim > 1:
-                        io_dict[key] = voter.select_round(
-                            io_dict[key],
-                            rounds=rounds,
-                            vote_stage=args.vote_stage,
-                            current_stage=decoder_stage,
-                        )
-                bt.record_decoder(decoder_idx, io_dict, elapsed)
+                    break
+                elapsed = time.time() - start_time
+                if bt is not None:
+                    bt.record_metric(decoder_idx, io_dict, elapsed)
+
+            if args.train:
+                continue  # Steps 9-11 check logical errors, which training does not
 
             cap_keep = None
             if cap_on and getattr(inner0, "cap_active_last", False):
@@ -346,7 +418,7 @@ def main():
                 bt.keep_samples(cap_keep)
 
             logger.success(
-                f"\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------"
             )
 
             has_obs_flips = (
@@ -368,12 +440,14 @@ def main():
                 )
             num_err += int(torch.sum(check[num_decoders - 1]))
             logger.info(
-                f"number of errors at the current batch {num_err}/{args.target_error}"
+                f"batch count {num_batches}/{args.target_batch}"
+                if args.target_batch is not None
+                else f"number of errors at the current batch {num_err}/{args.target_error}"
             )
 
             # report and accumulate metrics
             logger.success(
-                f"\n----------------------------------------------\nStep 10: Aggregate metrics\n----------------------------------------------"
+                "\n----------------------------------------------\nStep 10: Aggregate metrics\n----------------------------------------------"
             )
             if number_channel == 1:
                 bt.e_v_all = [
@@ -381,7 +455,7 @@ def main():
                 ]
                 check = [t.unsqueeze(1).expand(-1, number_channel) for t in check]
             for i in range(num_decoders):
-                batch_result = report_metric(
+                batch_result = metrics.report_metric(
                     num_max_iter[i],
                     bt.e_all,
                     bt.e_v_all[i],
@@ -392,16 +466,14 @@ def main():
                     bt.converge_all[i + 1],
                     i,
                 )
-                metrics.accumulate(i, batch_result)
+                metrics.update_metric(i, batch_result)
 
             if num_batches % 100 == 0:
                 logger.success(
-                    f"\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
+                    "\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
                 )
-                all_metrics = metrics.get_all_metrics(
-                    num_batches, algo_name, collect_rebatch_info()
-                )
-                save_metric(
+                all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
+                metrics.save_metric(
                     all_metrics,
                     args.run_dir + "/",
                     args.batch_size,
@@ -412,7 +484,7 @@ def main():
                     num_err,
                     H_file_name,
                     check_num,
-                    vote_info=metrics.get_vote_info(),
+                    target_batch=args.target_batch,
                 )
                 logger.success(f"Saved log to <{output_log}>.")
                 logger.success(f"Saved metric results to <{args.run_dir}>.")
@@ -420,11 +492,18 @@ def main():
         if use_extra:  # measure density from the FIRST extra batch, then freeze
             queue.freeze_density(num_err - num_err_before_batch, n)
 
+    if args.train:
+        logger.success(
+            "\n----------------------------------------------\nStep 9: Save final checkpoints and result yaml\n----------------------------------------------"
+        )
+        metrics.train_save_checkpoint()
+        return
+
     logger.success(
-        f"\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------"
+        "\n----------------------------------------------\nStep 12: Save final log\n----------------------------------------------"
     )
     all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
-    save_metric(
+    metrics.save_metric(
         all_metrics,
         args.run_dir + "/",
         args.batch_size,
@@ -436,7 +515,7 @@ def main():
         H_file_name,
         check_num,
         1,
-        vote_info=metrics.get_vote_info(),
+        target_batch=args.target_batch,
     )
     logger.success(f"Saved log to <{output_log}>.")
     logger.success(f"Saved metric results to <{args.run_dir}>.")
