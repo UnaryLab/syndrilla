@@ -81,7 +81,7 @@ Below is an example command that runs a simulation using the BPOSD decoder:
 
 ```command
 syndrilla -r=tests/test_outputs 
-          -d=examples/alist/bposd_hx.decoder.yaml 
+          -d=examples/alist/bposd_hx.decoding.yaml 
           -e=examples/alist/bsc.error.yaml 
           -c=examples/alist/lx.check.yaml 
           -s=examples/alist/perfect.syndrome.yaml 
@@ -95,7 +95,7 @@ Following is a table for detailed explaination on each command line arguments:
 | Argument | Description                                  | Example                                           |
 |----------|----------------------------------------------|---------------------------------------------------|
 | `-r`     | Path to store outputs                        | `-r=tests/test_outputs`                           |
-| `-d`     | Path to decoder YAML file                    | `-d=examples/alist/bposd_hx.decoder.yaml`    |
+| `-d`     | Path to decoding YAML file                    | `-d=examples/alist/bposd_hx.decoding.yaml`    |
 | `-e`     | Path to error model YAML file                | `-e=examples/alist/bsc.error.yaml`                |
 | `-c`     | Path to check matrix YAML file               | `-c=examples/alist/lx.check.yaml`                 |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/alist/perfect.syndrome.yaml`         |
@@ -117,7 +117,7 @@ Adding ```-t``` trains the decoder given by ```-d``` instead of decoding with it
 ```command
 syndrilla -t 
           -r=tests/test_outputs 
-          -d=examples/alist/train_saq_hx.decoder.yaml 
+          -d=examples/alist/train_saq_hx.decoding.yaml 
           -m=examples/alist/surface_5.matrix.yaml 
           -e=examples/alist/bsc_train.error.yaml 
           -s=examples/alist/perfect.syndrome.yaml 
@@ -126,7 +126,7 @@ syndrilla -t
 ```
 
 The weights kept are the epoch the decoder scores best, the lowest validation logical error for ```saq```, named in the result YAML under ```selection metric```.
-A learned decoder therefore ships as two YAMLs of one architecture: ```train_saq_hx.decoder.yaml``` names no weights and is the one ```-t``` fits, and ```saq_hx.decoder.yaml``` adds the ```config.checkpoint``` key naming trained weights, so the normal command above evaluates them.
+A learned decoder therefore ships as two YAMLs of one architecture: ```train_saq_hx.decoding.yaml``` names no weights and is the one ```-t``` fits, and ```saq_hx.decoding.yaml``` adds the ```config.checkpoint``` key naming trained weights, so the normal command above evaluates them.
 Each mode is held to its own file: a run without ```-t``` is refused if a learned decoder names no weights, since it would decode at chance and still report a logical error rate, and ```-t``` ignores the key rather than warm-starting from it (that is what ```-tckpt``` does, optimizer and schedule included).
 See [Trainer module](docs/trainer.md) for the training loop, its configuration, its outputs, and how an interrupted run is resumed.
 
@@ -244,11 +244,11 @@ The following table details all matrix formats Syndrilla supports. (Using differ
 
 
 #### 2.4. Decoder module
-The decoder YAML file defines all configuration parameters associated with the decoder.
-An example decoder configuration file is provided in ```bposd_hx.decoder.yaml```:
+The decoding YAML file defines all configuration parameters associated with the decoder.
+An example decoder configuration file is provided in ```bposd_hx.decoding.yaml```:
 
 ```
-decoder:
+decoding:
   algorithm: [bp_norm_min_sum, osd_0]
   check_type: hx
   dtype: float64
@@ -262,20 +262,20 @@ decoder:
 The following table details the configuration parameters used in the decoder module YAML file.
 | Key                   | Description                                                                  | Example                                            |
 |------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------|
-| `decoder.algorithm`    | List of decoding algorithms used                                            | `[bp_norm_min_sum, osd_0]`                         |
-| `decoder.check_type`   | Type of parity-check matrix used                                            | `hx` or `hz`                                       |
-| `decoder.device.device_type`       | Type of the device where the decoding will happen                                       | `cpu` or `cuda`                                       |
-| `decoder.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
-| `decoder.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
-| `decoder.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device                | `false`                                            |
-| `decoder.rebatch_speedup`| (optional) Adaptive batch-shrinking cap; see [Decoder module](docs/decoder.md) | `{kl_eps: 0.001}`                                |
-| `decoder.config`       | Algorithm-specific settings (e.g. `max_iter`, or a learned decoder's `checkpoint`). A mapping configures the first algorithm; a list gives one entry per entry of `decoder.algorithm` | `max_iter: 181`             |
+| `decoding.algorithm`    | List of decoding algorithms used                                            | `[bp_norm_min_sum, osd_0]`                         |
+| `decoding.check_type`   | Type of parity-check matrix used                                            | `hx` or `hz`                                       |
+| `decoding.device.device_type`       | Type of the device where the decoding will happen                                       | `cpu` or `cuda`                                       |
+| `decoding.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
+| `decoding.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
+| `decoding.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device                | `false`                                            |
+| `decoding.rebatch_speedup`| (optional) Adaptive batch-shrinking cap; see [Decoder module](docs/decoder.md) | `{kl_eps: 0.001}`                                |
+| `decoding.config`       | Algorithm-specific settings (e.g. `max_iter`, or a learned decoder's `checkpoint`). A mapping configures the first algorithm; a list gives one entry per entry of `decoding.algorithm` | `max_iter: 181`             |
 
-The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoder.config`. Written as a plain mapping, as above, it configures the first algorithm, so `max_iter` reaches `bp_norm_min_sum` and `osd_0`, which takes no settings of its own, runs on its defaults. Written as a list it is matched to `decoder.algorithm` by position, which is how a chain configures a stage other than its first. A key written at the top level that belongs under `decoder.config`, or the reverse, is rejected with a message naming the block it belongs in. See [Decoder module](docs/decoder.md) for the full rule.
+The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoding.config`. Written as a plain mapping, as above, it configures the first algorithm, so `max_iter` reaches `bp_norm_min_sum` and `osd_0`, which takes no settings of its own, runs on its defaults. Written as a list it is matched to `decoding.algorithm` by position, which is how a chain configures a stage other than its first. A key written at the top level that belongs under `decoding.config`, or the reverse, is rejected with a message naming the block it belongs in. See [Decoder module](docs/decoder.md) for the full rule.
 
-An AI decoder trained with ```-t``` takes no run settings from this block: its optimizer and epoch schedule configure the run rather than the model, so they live in the training YAML passed with ```-tr```, under ```training.optimizer``` and ```training.schedule```; see [Trainer module](docs/trainer.md). The decoder block keeps the model itself, and a decode run loads ```decoder.config.checkpoint``` from it, whose key list is in [Decoder module](docs/decoder.md).
+An AI decoder trained with ```-t``` takes no run settings from this block: its optimizer and epoch budget configure the run rather than the model, so they live in the training YAML passed with ```-tr```, under ```training.optimizer``` and ```training.budget```; see [Trainer module](docs/trainer.md). The decoder block keeps the model itself, and a decode run loads ```decoding.config.checkpoint``` from it, whose key list is in [Decoder module](docs/decoder.md).
 
-When `decoder.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This covers every registered decoder except `saq`: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
+When `decoding.device.device_type` is set to `cuda`, every decoder automatically uses its CUDA-kernel implementation if a CUDA-capable GPU is present and the kernel is available; otherwise it falls back to the PyTorch implementation. This covers every registered decoder except `saq`: the BP family plus `osd_0`, `mwpm`, and `union_find`. For `osd_0`, `mwpm`, and `union_find` the CUDA output is bit-for-bit identical to the CPU implementation. Non-NVIDIA accelerators (e.g. AMD ROCm, IBM), where the CUDA kernels do not compile, automatically use the PyTorch implementation. See [Decoder module](docs/decoder.md) for details.
 
 The following table details the different types of decoding algorithms Syndrilla supports. (Using different decoder may need different configuration format, which will be shown on [Decoder module](docs/decoder.md).)
 
@@ -337,8 +337,8 @@ An example configuration file is provided in ```train_saq_hx.training.yaml```:
 
 ```
 training:
+  algorithm: saq
   loss:
-    function: saq
     lambda_lc: 1.0
     lambda_lp: 0.2
     lambda_ent: 1.0
@@ -346,7 +346,7 @@ training:
     lr: 5.0e-4
     weight_decay: 5.0e-8
     min_lr: 1.0e-6
-  schedule:
+  budget:
     epochs: 100
     test_batches: 200
     validation_batches: 20
@@ -356,15 +356,15 @@ training:
 The following table provides a detailed explanation of the configuration parameters used in the trainer module YAML file.
 | Key              | Description                                                   | Example                   |
 |------------------|---------------------------------------------------------------|---------------------------|
-| `training.loss.function`| Objective that supervises the run, naming a module under `syndrilla/trainer/` | `saq` |
-| `training.loss.*`| That objective's own settings; `saq` weights its three terms | `lambda_lp: 0.2` |
+| `training.algorithm`| Training algorithm, naming a module under `syndrilla/trainer/`; it brings the objective and the optimizer | `saq` |
+| `training.loss.*`| That algorithm's objective settings; `saq` weights its three terms | `lambda_lp: 0.2` |
 | `training.optimizer.*`| Settings the `Trainer` builds the run's optimizer from; it fits Adam with `lr`, `weight_decay` and `min_lr` | `lr: 5.0e-4` |
-| `training.schedule.epochs`| Number of epochs to run                                  | `100`                     |
-| `training.schedule.test_batches`| Training batches per epoch                         | `200`                     |
-| `training.schedule.validation_batches`| Validation batches per epoch, drawn clear of the training set | `20`      |
-| `training.schedule.error_random_seed`| Seeds the error stream, so every epoch trains on the same batches | `42`       |
+| `training.budget.epochs`| Number of epochs to run                                  | `100`                     |
+| `training.budget.test_batches`| Training batches per epoch                         | `200`                     |
+| `training.budget.validation_batches`| Validation batches per epoch, drawn clear of the training set | `20`      |
+| `training.budget.error_random_seed`| Seeds the error stream, so every epoch trains on the same batches | `42`       |
 
-Each block has one reader: `loss` the trainer module, `optimizer` the decoder being trained, `schedule` the metric module. See [Trainer module](docs/trainer.md) for the training loop and its outputs.
+Each block has one reader: `loss` and `optimizer` the algorithm's own trainer module, `budget` the metric module. See [Trainer module](docs/trainer.md) for the training loop and its outputs.
 
 #### 2.8. Metric module
 This module does not take any YAML file as inputs, it will report default metrics as output, which will be described in the output.
@@ -488,7 +488,7 @@ If previous run is terminated by accident, the simulation can resume by setting 
 
 ```command
 syndrilla -r=tests/test_outputs 
-          -d=examples/alist/bposd_hx.decoder.yaml 
+          -d=examples/alist/bposd_hx.decoding.yaml 
           -m=examples/alist/surface_10.matrix.yaml 
           -e=examples/alist/bsc.error.yaml 
           -c=examples/alist/lx.check.yaml 

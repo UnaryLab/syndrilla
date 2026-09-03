@@ -31,7 +31,7 @@ def make_interface_from_circuit(circuit):
             "device": {"device_type": "cpu", "device_idx": 0},
             "dtype": "float64",
         },
-        decoder_cfg={},
+        decoding_cfg={},
         error_cfg={"number_channel": 1},
         syndrome_cfg={"measure": "stim", "rounds": 1},
     )

@@ -44,7 +44,7 @@ def make_interface(rounds=1, measurement_error_rate=0.0):
             "code": "surface_code:rotated_memory_x",
             "distance": 3,
         },
-        decoder_cfg={
+        decoding_cfg={
             "dtype": "float64",
             "device": {"device_type": "cpu", "device_idx": 0},
         },
@@ -94,7 +94,7 @@ def make_decoders():
 
 def make_2ch_components():
     """Create 2-channel (depol + bp4) components — all from config dicts."""
-    decoder_cfg = {
+    decoding_cfg = {
         "algorithm": "bp4",
         "dtype": "float64",
         "device": {"device_type": "cpu", "device_idx": 0},
@@ -119,8 +119,8 @@ def make_2ch_components():
             "path": "examples/alist/surface/surface_10_lz.alist",
         },
     }
-    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
-    decoders = create_decoder(cfg=decoder_cfg, bundle=bundle)
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+    decoders = create_decoder(cfg=decoding_cfg, bundle=bundle)
 
     error_model = create_error_model(
         cfg={

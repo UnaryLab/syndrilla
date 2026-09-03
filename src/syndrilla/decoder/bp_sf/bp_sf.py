@@ -50,13 +50,13 @@ class create(torch.nn.Module):
         re-run BP, and on convergence flip those bits back in the estimate.
     """
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         super(create, self).__init__()
 
         logger.info("Creating bp_sf decoder.")
 
         # set up default device
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         self.device = device_cfg.get(
             "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -82,7 +82,7 @@ class create(torch.nn.Module):
                 self.device = torch.device(f"cuda:{device_idx}")
 
         # set up default max_iter
-        self.max_iter = decoder_cfg.get("max_iter", 50)
+        self.max_iter = decoding_cfg.get("max_iter", 50)
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
             logger.warning(
                 f"Invalid input maximum iteration <{self.max_iter}>, default to <50>."
@@ -90,7 +90,7 @@ class create(torch.nn.Module):
             self.max_iter = 50
 
         # set up default dtype
-        self.dtype = decoder_cfg.get("dtype", "float64")
+        self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(
                 f"Invalid input data type <{self.dtype}>, default to <torch.float64>."
@@ -100,7 +100,7 @@ class create(torch.nn.Module):
 
         self.batch_size = 1
 
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(
                 f"Invalid input check type <{self.check_type}>, default to <hx>."
@@ -136,7 +136,7 @@ class create(torch.nn.Module):
         self.algo = "bp_sf"
         self.num_max_iter = self.max_iter
 
-        sf_cfg = decoder_cfg.get("sf", decoder_cfg)
+        sf_cfg = decoding_cfg.get("sf", decoding_cfg)
         self.w_min = int(sf_cfg.get("w_min", 0))
         self.w_max = int(sf_cfg.get("w_max", 0))
         self.n_sample = int(sf_cfg.get("n_sample", 0))

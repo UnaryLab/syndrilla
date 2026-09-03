@@ -29,7 +29,7 @@ def build_interface(distance=3, rounds=1, p=0.05, max_iter=100):
             'measure': 'stim',
             'rounds': rounds,
         },
-        decoder_cfg={
+        decoding_cfg={
             'algorithm': ['bp_norm_min_sum', 'osd_0'],
             'check_type': 'hx',
             'dtype': 'float64',

@@ -218,13 +218,15 @@ def _train_stem(decoder):
 
 
 def _train_fingerprint(cfg, batch_size, error_rate, H_file_name, trainer):
-    """The settings a resumed training run must still agree with: model, data, schedule."""
+    """The settings a resumed training run must still agree with: model, data, budget."""
     # the objective's and the optimizer's own settings, straight from the blocks of the
     # training yaml that configured them
     loss = trainer.loss
-    loss_cfg = getattr(loss, "cfg", {"function": type(loss).__module__})
+    loss_cfg = getattr(loss, "cfg", {})
     return {
         **trainer.train_fingerprint(),
+        # which training algorithm ran, named above the blocks that configure it
+        "trainer_algorithm": trainer.algorithm or type(loss).__module__,
         "epochs": cfg["epochs"],
         "test_batches": cfg["test_batches"],
         "validation_batches": cfg["validation_batches"],
@@ -946,27 +948,27 @@ class MetricState:
             self.distribution[i] = self.distribution[i].int().to(self.device)
 
     KEYS = ("total", "class_err")
-    # the schedule the '-tr' yaml must supply under its 'schedule' key
+    # the budget the '-tr' yaml must supply under its 'budget' key
     TRAIN_KEYS = ("epochs", "test_batches", "validation_batches", "error_random_seed")
 
     @classmethod
     def train_initial(cls, cfg, run_dir, source):
-        """Validate a training schedule and build a state whose training half is live."""
-        logger.info(f"Reading training schedule from <{get_path(source)}>.")
+        """Validate a training budget and build a state whose training half is live."""
+        logger.info(f"Reading training budget from <{get_path(source)}>.")
         if cfg is None:
             raise ValueError(
-                f"Training yaml {source} has no 'schedule' block. Add one under "
+                f"Training yaml {source} has no 'budget' block. Add one under "
                 f"`training` with {', '.join(cls.TRAIN_KEYS)}."
             )
         missing = [key for key in cls.TRAIN_KEYS if key not in cfg]
         if missing:
             raise ValueError(
-                f"Training yaml {source} is missing under 'training.schedule': "
+                f"Training yaml {source} is missing under 'training.budget': "
                 f"{', '.join(missing)}."
             )
         for key in cls.TRAIN_KEYS:
             value = cfg[key]
-            # seed 0 is a valid seed; a zero-length schedule is not
+            # seed 0 is a valid seed; a zero-length budget is not
             floor = 0 if key == "error_random_seed" else 1
             if not isinstance(value, int) or isinstance(value, bool) or value < floor:
                 raise ValueError(
@@ -1026,7 +1028,7 @@ class MetricState:
         """Set the run up on this decoder, resume it if asked, and open the first
         batch.
         """
-        # the schedule was validated here, in `train_initial`; the trainer is what runs
+        # the budget was validated here, in `train_initial`; the trainer is what runs
         # to it, so it gets the numbers rather than reading the block a second time
         trainer.configure(
             decoder,
@@ -1072,7 +1074,7 @@ class MetricState:
             f"training <{decoder.algo}>: params={params:,} "
             f"device={decoder.device} dtype={decoder.dtype}",
             f"error rate {rate}, {self.cfg['test_batches']} x {batch_size} per epoch",
-            f"schedule: {dict(self.cfg)}, optimizer: {dict(trainer.optimizer_cfg)}",
+            f"budget: {dict(self.cfg)}, optimizer: {dict(trainer.optimizer_cfg)}",
             resume_line,
         ):
             logger.info(line)
@@ -1124,7 +1126,7 @@ class MetricState:
         if saved is None:
             raise ValueError(
                 f"<{path}> carries no training fingerprint, so it cannot be resumed from. "
-                f"It holds weights only; use it as the decoder yaml's `checkpoint`."
+                f"It holds weights only; use it as the decoding yaml's `checkpoint`."
             )
         fields = self._fingerprint
         if keys is not None:
@@ -1338,7 +1340,7 @@ class MetricState:
             f"best {_train_score_name(self._decoder)} {self.best:.4f}",
             f"checkpoints: {best_path}, {last_path}",
             f"result: {result_path}",
-            f"add to the decoder yaml to use it: checkpoint: {best_path}",
+            f"add to the decoding yaml to use it: checkpoint: {best_path}",
             f"to continue this run, add to the same command: "
             f"-ckpt {result_path} -tckpt {last_path}",
         ):

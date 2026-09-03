@@ -27,7 +27,7 @@ def main():
     run_dir = Path(args.run_dir)
 
     # --- Iterate and update ---
-    for file in run_dir.rglob('*quant*.decoder.yaml'):
+    for file in run_dir.rglob('*quant*.decoding.yaml'):
         if file.is_file():
             print(f'Processing: {file}')
 
@@ -35,7 +35,7 @@ def main():
             with open(file, 'r') as f:
                 data = yaml.safe_load(f)
 
-            decoder_config = data['decoder'].setdefault('config', {})
+            decoder_config = data['decoding'].setdefault('config', {})
             stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
             stage['int_width'] = args.int_width
             stage['frac_width'] = args.frac_width

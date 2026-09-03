@@ -23,7 +23,7 @@ Below is an example command that runs a simulation using the Stim-generated surf
 
 ```command
 syndrilla -r=tests/test_outputs 
-          -d=examples/stim/stim_generated.decoder.yaml 
+          -d=examples/stim/stim_generated.decoding.yaml 
           -i=examples/stim/stim_generated.interface.yaml 
           -e=examples/stim/stim_generated.error.yaml 
           -s=examples/stim/stim_generated.syndrome.yaml 
@@ -36,7 +36,7 @@ Following is a table for detailed explaination on each command line arguments:
 | Argument | Description                                  | Example                                           |
 |----------|----------------------------------------------|---------------------------------------------------|
 | `-r`     | Path to store outputs                        | `-r=tests/test_outputs`                           |
-| `-d`     | Path to decoder YAML file                    | `-d=examples/stim/stim_generated.decoder.yaml`    |
+| `-d`     | Path to decoding YAML file                    | `-d=examples/stim/stim_generated.decoding.yaml`    |
 | `-i`     | Path to interface YAML file                  | `-i=examples/stim/stim_generated.interface.yaml`  |
 | `-e`     | Path to error model YAML file                | `-e=examples/stim/stim_generated.error.yaml`      |
 | `-s`     | Path to syndrome extraction YAML file        | `-s=examples/stim/stim_generated.syndrome.yaml`   |
@@ -50,7 +50,7 @@ Following is a table for detailed explaination on each command line arguments:
 
 ### 2. Input format and configurations
 The stim workflow splits configuration across four modules: interface, decoder, error, and syndrome.
-Each module has its own dedicated YAML configuration file. The decoder YAML is unchanged by the stim path and is documented in [decoder.md](decoder.md); the sections below cover the three that differ.
+Each module has its own dedicated YAML configuration file. The decoding YAML is unchanged by the stim path and is documented in [decoder.md](decoder.md); the sections below cover the three that differ.
 The check and matrix YAML files used in the alist workflow are not needed here, since the stim circuit itself provides the parity-check matrix, logical observables, and LLR priors.
 
 #### 2.1. Interface module
@@ -137,7 +137,7 @@ The circuit's detectors already span every round, so the sampled syndrome carrie
 
 ```command
 syndrilla -t -r=tests/test_outputs \
-    -d=examples/stim/train_stim_saq.decoder.yaml \
+    -d=examples/stim/train_stim_saq.decoding.yaml \
     -i=examples/stim/stim_generated.interface.yaml \
     -e=examples/stim/stim_train.error.yaml \
     -s=examples/stim/stim_train.syndrome.yaml \
@@ -145,11 +145,11 @@ syndrilla -t -r=tests/test_outputs \
     -bs=1024
 ```
 
-The decoder yaml is the training half of the shipped pair, the architecture with no weights ([decoder.md](decoder.md)); `stim_saq.decoder.yaml` is that same model with `config.checkpoint` naming `examples/stim/saq_hx_dem24x221_best.pt`, the weights the run above produced. Those weights were fitted on the noise `stim_train.error.yaml` sweeps, `0.0005` to `0.006`, and decode that circuit at a `0.7%` logical error rate; `stim_generated.error.yaml` runs the same code at `0.1` per gate, two orders of magnitude outside what they were trained on, where they decode at chance like anything else on a distance-3 code at that noise.
+The decoding yaml is the training half of the shipped pair, the architecture with no weights ([decoder.md](decoder.md)); `stim_saq.decoding.yaml` is that same model with `config.checkpoint` naming `examples/stim/saq_hx_dem24x221_best.pt`, the weights the run above produced. Those weights were fitted on the noise `stim_train.error.yaml` sweeps, `0.0005` to `0.006`, and decode that circuit at a `0.7%` logical error rate; `stim_generated.error.yaml` runs the same code at `0.1` per gate, two orders of magnitude outside what they were trained on, where they decode at chance like anything else on a distance-3 code at that noise.
 
 **Where the supervision comes from.** A DEM's error instructions *are* the columns of `H`, so a sampled mechanism vector `e` is the error the decoder is trying to recover, `H @ e` the syndrome it sees, and `L @ e` the observable flip it is scored on. The error model draws `e` and the measurer reads the other two off it, so all three describe one shot.
 
-**Choosing the loss.** `saq` is the same module and the same weights the alist path uses, named under `training.loss` of the `-tr` yaml; the stim path ships its own training YAML partly because `L_Ent` is delicate here, and partly because its schedule is its own. That term takes the parity of the residual over the logical observable's support, a handful of qubits on a code but 36 error mechanisms on the shipped distance-3 circuit, where a probability-domain product underflows to a constant `ln 2` with a gradient of exactly zero. It is computed in the log domain instead (see [trainer.md](trainer.md)), which restores the gradient: measured on the shipped configuration the term then trains, `0.288` down to `0.018`, and the llr's logical parity agrees with the true logical class on `99.4%` of shots against `92.4%`. The end-to-end logical error rate is unchanged, since `L_LC` already supervises the logical class directly and CPND projects onto it.
+**Choosing the loss.** `saq` is the same module and the same weights the alist path uses, named under `training.algorithm` of the `-tr` yaml; the stim path ships its own training YAML partly because `L_Ent` is delicate here, and partly because its schedule is its own. That term takes the parity of the residual over the logical observable's support, a handful of qubits on a code but 36 error mechanisms on the shipped distance-3 circuit, where a probability-domain product underflows to a constant `ln 2` with a gradient of exactly zero. It is computed in the log domain instead (see [trainer.md](trainer.md)), which restores the gradient: measured on the shipped configuration the term then trains, `0.288` down to `0.018`, and the llr's logical parity agrees with the true logical class on `99.4%` of shots against `92.4%`. The end-to-end logical error rate is unchanged, since `L_LC` already supervises the logical class directly and CPND projects onto it.
 
 **Sweeping the noise.** `rate` may be a `[lower, upper, points]` range, the same training-only swept form `bsc` takes, so one run covers a stretch of the curve instead of holding at the level it was trained on. Each point regenerates the circuit with the configured noise keys scaled together, keeping their ratios, and every point must share one `H`: a point whose DEM has a different mechanism set is rejected rather than fed to a decoder built from the base circuit's matrix.
 

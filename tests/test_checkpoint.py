@@ -16,11 +16,11 @@ from syndrilla.metric import BatchTracker, MetricState
 from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
-# (label, decoder_yaml, error_yaml, syndrome_yaml, check_yaml, check_type)
+# (label, decoding_yaml, error_yaml, syndrome_yaml, check_yaml, check_type)
 CONFIGS = [
     (
         "1ch BSC + perfect",
-        "examples/alist/bp_hx.decoder.yaml",
+        "examples/alist/bp_hx.decoding.yaml",
         "examples/alist/bsc.error.yaml",
         "examples/alist/perfect.syndrome.yaml",
         "examples/alist/lx.check.yaml",
@@ -28,7 +28,7 @@ CONFIGS = [
     ),
     (
         "1ch BSC + phenomenological (10 rounds)",
-        "examples/alist/bp_hx.decoder.yaml",
+        "examples/alist/bp_hx.decoding.yaml",
         "examples/alist/bsc.error.yaml",
         "examples/alist/phenomenological.syndrome.yaml",
         "examples/alist/lx.check.yaml",
@@ -36,7 +36,7 @@ CONFIGS = [
     ),
     (
         "2ch depol + perfect (bp4)",
-        "examples/alist/bp4.decoder.yaml",
+        "examples/alist/bp4.decoding.yaml",
         "examples/alist/depol.error.yaml",
         "examples/alist/perfect.syndrome.yaml",
         "examples/alist/lx.check.yaml",
@@ -46,22 +46,22 @@ CONFIGS = [
 
 
 def build_pipeline(
-    decoder_yaml,
+    decoding_yaml,
     error_yaml,
     syndrome_yaml,
     logical_yaml,
     matrix_yaml="examples/alist/surface_11.matrix.yaml",
 ):
-    decoder_cfg = read_yaml(get_path(decoder_yaml))["decoder"]
+    decoding_cfg = read_yaml(get_path(decoding_yaml))["decoding"]
     matrix_cfg = read_yaml(get_path(matrix_yaml))["matrix"]
     if not torch.cuda.is_available():
-        decoder_cfg["device"] = {"device_type": "cpu", "device_idx": 0}
-    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
-    decoders = create_decoder(cfg=decoder_cfg, bundle=bundle)
+        decoding_cfg["device"] = {"device_type": "cpu", "device_idx": 0}
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+    decoders = create_decoder(cfg=decoding_cfg, bundle=bundle)
     error_model = create_error_model(error_yaml)
     syndrome_generator = create_syndrome(syndrome_yaml)
     logical_check = create_check(logical_yaml)
-    return decoders, error_model, syndrome_generator, logical_check, bundle, decoder_cfg
+    return decoders, error_model, syndrome_generator, logical_check, bundle, decoding_cfg
 
 
 def run_one_batch(
@@ -190,7 +190,7 @@ def compare(snap, m_loaded, number_channel, num_decoders):
 
 def run_one_config(
     label,
-    decoder_yaml,
+    decoding_yaml,
     error_yaml,
     syndrome_yaml,
     check_yaml,
@@ -203,13 +203,13 @@ def run_one_config(
 ):
     print("\n========================================================================")
     print(f"CONFIG: {label}")
-    print(f"  decoder_yaml = {decoder_yaml}")
+    print(f"  decoding_yaml = {decoding_yaml}")
     print(f"  error_yaml   = {error_yaml}")
     print(f"  syndrome_yaml= {syndrome_yaml}")
     print("========================================================================")
 
-    decoders, em, sg, lc, bundle, decoder_cfg = build_pipeline(
-        decoder_yaml, error_yaml, syndrome_yaml, check_yaml
+    decoders, em, sg, lc, bundle, decoding_cfg = build_pipeline(
+        decoding_yaml, error_yaml, syndrome_yaml, check_yaml
     )
     nd, dtype, dev = len(decoders), decoders[0].dtype, decoders[0].device
     nc = em.number_channel

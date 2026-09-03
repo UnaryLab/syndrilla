@@ -21,20 +21,20 @@ def generate_decoder(base_path: str, code, check_type, distance, dtype, decoder)
     template_path = 'examples/alist/'
     generated_path = base_path
 
-    configuration_dict = template_path + f'{decoder}_{check_type}.decoder.yaml'
+    configuration_dict = template_path + f'{decoder}_{check_type}.decoding.yaml'
 
-    target_file = os.path.join(generated_path, f'{decoder}_{check_type}.decoder.yaml')
+    target_file = os.path.join(generated_path, f'{decoder}_{check_type}.decoding.yaml')
 
     # Read, modify, and write
     config = read_yaml(configuration_dict)
-    if 'decoder' in config:
-        config['decoder']['dtype'] = dtype
-        config['decoder']['check_type'] = check_type
+    if 'decoding' in config:
+        config['decoding']['dtype'] = dtype
+        config['decoding']['check_type'] = check_type
         if code == 'surface':
             max_iter = distance*2*(distance-1)+1
         else:
             max_iter = distance*2*(distance)
-        decoder_config = config['decoder'].setdefault('config', {})
+        decoder_config = config['decoding'].setdefault('config', {})
         stage = decoder_config[0] if isinstance(decoder_config, list) else decoder_config
         stage['max_iter'] = max_iter
 

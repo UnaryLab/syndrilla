@@ -155,7 +155,7 @@ class create(nn.Module):
           device_idx  : int             (default: 0)
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         nn.Module.__init__(self)
         logger.info("Creating bp_norm_min_sum_cuda decoder.")
 
@@ -165,7 +165,7 @@ class create(nn.Module):
                 "Use bp_norm_min_sum for CPU execution."
             )
 
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         device_type = device_cfg.get("device_type", "cuda")
         if device_type != "cuda":
             logger.warning(
@@ -180,20 +180,20 @@ class create(nn.Module):
             device_idx = 0
         self.device = torch.device(f"cuda:{device_idx}")
 
-        dtype_str = decoder_cfg.get("dtype", "float64")
+        dtype_str = decoding_cfg.get("dtype", "float64")
         valid_dtypes = {"float16", "bfloat16", "float32", "float64"}
         if dtype_str not in valid_dtypes:
             logger.warning(f"Invalid dtype '{dtype_str}'; defaulting to float64.")
             dtype_str = "float64"
         self.dtype = torch.__dict__[dtype_str]
 
-        self.max_iter = decoder_cfg.get("max_iter", 50)
+        self.max_iter = decoding_cfg.get("max_iter", 50)
         if not isinstance(self.max_iter, int) or self.max_iter <= 0:
             logger.warning(f"Invalid max_iter={self.max_iter}; defaulting to 50.")
             self.max_iter = 50
         self.num_max_iter = self.max_iter
 
-        self.check_type = decoder_cfg.get("check_type", "hx").lower()
+        self.check_type = decoding_cfg.get("check_type", "hx").lower()
         if self.check_type not in {"hx", "hz"}:
             logger.warning(f"Invalid check_type='{self.check_type}'; defaulting to hx.")
             self.check_type = "hx"
@@ -238,7 +238,7 @@ class create(nn.Module):
         self.algo = "bp_norm_min_sum"
         self.batch_size = 1  # updated in forward()
 
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get("rebatch_speedup"))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get("rebatch_speedup"))
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 
@@ -248,7 +248,7 @@ class create(nn.Module):
             M_val, D, self.N_ext, self.VD, self.dtype.itemsize
         )
         smem_limit = self._ext.fused_smem_limit()
-        self._use_fused = smem_needed <= smem_limit and not decoder_cfg.get(
+        self._use_fused = smem_needed <= smem_limit and not decoding_cfg.get(
             "force_per_step", False
         )
         if not self._use_fused:

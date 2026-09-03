@@ -84,7 +84,7 @@ class create(nn.Module):
     # cap the per-launch scratch tensor (bytes) so large batches chunk instead of OOM
     _SCRATCH_BUDGET_BYTES = 256 * 1024 * 1024
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__()
         logger.info("Creating union_find_cuda decoder.")
 
@@ -93,7 +93,7 @@ class create(nn.Module):
                 "union_find_cuda requires a CUDA-capable GPU. Use union_find for CPU."
             )
 
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         device_type = device_cfg.get("device_type", "cuda")
         if device_type != "cuda":
             logger.warning(
@@ -106,13 +106,13 @@ class create(nn.Module):
             device_idx = 0
         self.device = torch.device(f"cuda:{device_idx}")
 
-        dtype_str = decoder_cfg.get("dtype", "float64")
+        dtype_str = decoding_cfg.get("dtype", "float64")
         if dtype_str not in {"float16", "bfloat16", "float32", "float64"}:
             logger.warning(f"Invalid dtype '{dtype_str}'; defaulting to float64.")
             dtype_str = "float64"
         self.dtype = torch.__dict__[dtype_str]
 
-        self.check_type = decoder_cfg.get("check_type", "hx").lower()
+        self.check_type = decoding_cfg.get("check_type", "hx").lower()
         if self.check_type not in {"hx", "hz"}:
             logger.warning(f"Invalid check_type='{self.check_type}'; defaulting to hx.")
             self.check_type = "hx"

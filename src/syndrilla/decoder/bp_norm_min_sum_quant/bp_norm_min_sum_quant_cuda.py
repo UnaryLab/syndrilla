@@ -13,11 +13,11 @@ class create(_BaseCuda):
         frac_width : int (default 4)   fractional bits
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)
         self._use_fused = False  # per-iteration host rounding → no fused kernel
-        self.intwidth = decoder_cfg.get("int_width", 3)
-        self.fracwidth = decoder_cfg.get("frac_width", 4)
+        self.intwidth = decoding_cfg.get("int_width", 3)
+        self.fracwidth = decoding_cfg.get("frac_width", 4)
         self.algo = "bp_norm_min_sum_quant"
         logger.info(
             f"bp_norm_min_sum_quant_cuda ready (per-step, Q{self.intwidth}.{self.fracwidth})."

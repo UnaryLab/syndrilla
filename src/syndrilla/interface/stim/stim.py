@@ -60,12 +60,12 @@ class create:
     def __init__(self, interface_cfg, **kwargs) -> None:
         error_cfg = kwargs.get("error_cfg", {})
         syndrome_cfg = kwargs.get("syndrome_cfg", {})
-        decoder_cfg = kwargs.get("decoder_cfg", {})
+        decoding_cfg = kwargs.get("decoding_cfg", {})
         training = kwargs.get("training", False)
 
-        if decoder_cfg:
-            device, dtype = parse_device_dtype(decoder_cfg)
-            device_cfg = decoder_cfg.get(
+        if decoding_cfg:
+            device, dtype = parse_device_dtype(decoding_cfg)
+            device_cfg = decoding_cfg.get(
                 "device", {"device_type": device.type, "device_idx": device.index or 0}
             )
         else:
@@ -162,9 +162,9 @@ class create:
         }
         self.matrix_bundle = load_matrices(self.matrix_cfg, device, dtype)
 
-        if decoder_cfg and "algorithm" in decoder_cfg:
+        if decoding_cfg and "algorithm" in decoding_cfg:
             self.decoders = create_decoder(
-                cfg=decoder_cfg, bundle=self.matrix_bundle, training=training
+                cfg=decoding_cfg, bundle=self.matrix_bundle, training=training
             )
         else:
             self.decoders = None

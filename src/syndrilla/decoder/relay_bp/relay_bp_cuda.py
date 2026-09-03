@@ -12,8 +12,8 @@ from syndrilla.decoder.relay_bp.relay_bp import create as _RelayPy
 class create(_RelayPy):
     """relay_bp on CUDA kernels (per-step path). Accepts every relay_bp key."""
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)  # all relay params + helper methods
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)  # all relay params + helper methods
 
         if not torch.cuda.is_available():
             raise RuntimeError("relay_bp_cuda requires a CUDA GPU.")

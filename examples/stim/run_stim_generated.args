@@ -1,1 +1,1 @@
--r=tests/test_outputs -d=examples/stim/stim_generated.decoder.yaml -i=examples/stim/stim_generated.interface.yaml -e=examples/stim/stim_generated.error.yaml -s=examples/stim/stim_generated.syndrome.yaml -bs=1000 -te=100
+-r=tests/test_outputs -d=examples/stim/stim_generated.decoding.yaml -i=examples/stim/stim_generated.interface.yaml -e=examples/stim/stim_generated.error.yaml -s=examples/stim/stim_generated.syndrome.yaml -bs=1000 -te=100

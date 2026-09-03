@@ -24,7 +24,7 @@ from syndrilla.trainer.saq.saq import (
 INTERFACE_YAML = "examples/stim/stim_generated.interface.yaml"
 TRAIN_ERROR_YAML = "examples/stim/stim_train.error.yaml"
 TRAIN_SYNDROME_YAML = "examples/stim/stim_train.syndrome.yaml"
-TRAIN_DECODER_YAML = "examples/stim/train_stim_saq.decoder.yaml"
+TRAIN_DECODER_YAML = "examples/stim/train_stim_saq.decoding.yaml"
 DECODE_ERROR_YAML = "examples/stim/stim_generated.error.yaml"
 TRAINING_YAML = "examples/stim/train_stim_saq.training.yaml"
 
@@ -175,7 +175,7 @@ class TestRateSweep:
         # stopping earlier on a learned decoder's missing weights
         result = _run_cli(
             tmp_path / "run",
-            "-d=examples/stim/stim_generated.decoder.yaml",
+            "-d=examples/stim/stim_generated.decoding.yaml",
             f"-i={INTERFACE_YAML}",
             f"-e={TRAIN_ERROR_YAML}",
             f"-s={TRAIN_SYNDROME_YAML}",
@@ -297,10 +297,10 @@ class TestParityConditioning:
 def _fast_decoder(tmp_path):
     """The shipped model config, shrunk so tests stay quick."""
     cfg = yaml.safe_load(open(TRAIN_DECODER_YAML))
-    cfg["decoder"]["config"]["model"] = dict(
-        cfg["decoder"]["config"]["model"], d_model=64, N_dec=2, h=4
+    cfg["decoding"]["config"]["model"] = dict(
+        cfg["decoding"]["config"]["model"], d_model=64, N_dec=2, h=4
     )
-    path = tmp_path / "fast.decoder.yaml"
+    path = tmp_path / "fast.decoding.yaml"
     path.write_text(yaml.safe_dump(cfg))
     return path
 
@@ -308,7 +308,7 @@ def _fast_decoder(tmp_path):
 def _fast_training(tmp_path):
     """The shipped training config, shrunk to a handful of epochs so tests stay quick."""
     cfg = yaml.safe_load(open(TRAINING_YAML))
-    cfg["training"]["schedule"] = {
+    cfg["training"]["budget"] = {
         "epochs": 4,
         "test_batches": 25,
         "validation_batches": 5,

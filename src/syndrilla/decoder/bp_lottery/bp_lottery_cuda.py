@@ -12,21 +12,21 @@ class create(_BaseCuda):
         flip_start_iter: int (default 4)                 first iteration that flips
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)
 
         # The sign-flip is a host op between BP steps; the fused kernel cannot
         # express it, so always take the per-step kernel path.
         self._use_fused = False
 
         # lottery knobs
-        self.random_machine = str(decoder_cfg.get("random_machine", "sobol")).lower()
+        self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
             logger.warning(
                 f"Invalid random_machine <{self.random_machine}>; defaulting to sobol."
             )
             self.random_machine = "sobol"
-        self.flip_start_iter = int(decoder_cfg.get("flip_start_iter", 4))
+        self.flip_start_iter = int(decoding_cfg.get("flip_start_iter", 4))
 
         # Dense [M, N] parity-check matrix on-device for the sign-flip scoring
         # (bp_norm_min_sum_cuda keeps only V_c_col; the sign-flip needs the matrix).

@@ -36,13 +36,13 @@ def get_gpu_memory_utilization(gpu_index=0):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA not available')
 def test_batch_alist_hx(batch_size=1000, target_error=1000,
                         run_dir='tests/test_outputs'):
-    decoder_yaml = 'examples/alist/bposd_hx.decoder.yaml'
+    decoding_yaml = 'examples/alist/bposd_hx.decoding.yaml'
     matrix_yaml = 'examples/alist/surface_10.matrix.yaml'
 
-    decoder_cfg = read_yaml(get_path(decoder_yaml))['decoder']
+    decoding_cfg = read_yaml(get_path(decoding_yaml))['decoding']
     matrix_cfg = read_yaml(get_path(matrix_yaml))['matrix']
-    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
-    decoders = create_decoder(cfg=decoder_cfg, bundle=bundle)
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+    decoders = create_decoder(cfg=decoding_cfg, bundle=bundle)
 
     error_model = create_error_model(yaml_path='examples/alist/bsc.error.yaml')
     syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
@@ -51,7 +51,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
     number_channel = error_model.number_channel
-    check_type = decoder_cfg.get('check_type', 'hx')
+    check_type = decoding_cfg.get('check_type', 'hx')
     shape, _, _, _ = bundle.Hx_matrix.get_index()
     H_matrix = bundle.select(check_type)[3]
 

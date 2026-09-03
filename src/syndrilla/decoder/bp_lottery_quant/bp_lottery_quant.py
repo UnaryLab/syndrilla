@@ -10,12 +10,12 @@ class create(torch.nn.Module):
     This class creates a lotterybp decoder on a single GPU
     """
     def __init__(self,
-                 decoder_cfg,
+                 decoding_cfg,
                  **kwargs) -> None:
         """
         Initialization for lotterybp decoder
         Input:
-            decoder_cfg: the information that come from config file (yaml)
+            decoding_cfg: the information that come from config file (yaml)
 
         Parameters:
             max_iter: the number of maximum iteration of lotterybp decoder
@@ -34,7 +34,7 @@ class create(torch.nn.Module):
         logger.info('Creating lotterybp decoder.')
 
         # set up default device
-        device_cfg = decoder_cfg.get('device', {})
+        device_cfg = decoding_cfg.get('device', {})
         self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
             logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
@@ -49,13 +49,13 @@ class create(torch.nn.Module):
                 self.device = torch.device(f'cuda:{device_idx}')
 
         # set up default max_iter
-        self.max_iter = decoder_cfg.get('max_iter', 50)
+        self.max_iter = decoding_cfg.get('max_iter', 50)
         if self.max_iter <= 0 or not isinstance(self.max_iter, int):
             logger.warning(f'Invalid input maximum iteration <{self.max_iter}>, default to <50>.')
             self.max_iter = 50
 
         # set up default dtype
-        self.dtype = decoder_cfg.get('dtype', 'float64')
+        self.dtype = decoding_cfg.get('dtype', 'float64')
         if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
@@ -63,12 +63,12 @@ class create(torch.nn.Module):
 
         self.batch_size = 1
 
-        self.check_type = decoder_cfg.get('check_type', 'hx')
+        self.check_type = decoding_cfg.get('check_type', 'hx')
         if self.check_type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
 
-        self.random_machine = decoder_cfg.get('random_machine', 'sobol')
+        self.random_machine = decoding_cfg.get('random_machine', 'sobol')
         if self.random_machine.lower() not in {'sobol', 'system'}:
             logger.warning(f'Invalid input machine type <{self.random_machine}>, default to <sobol>.')
             self.random_machine = 'sobol'
@@ -91,13 +91,13 @@ class create(torch.nn.Module):
         self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
         self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
 
-        self.intwidth = decoder_cfg.get('int_width', 3)
-        self.fracwidth = decoder_cfg.get('frac_width', 4)
+        self.intwidth = decoding_cfg.get('int_width', 3)
+        self.fracwidth = decoding_cfg.get('frac_width', 4)
 
         self.algo = 'bp_lottery_quant'
         self.num_max_iter = self.max_iter
 
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get('rebatch_speedup'))
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 

@@ -260,12 +260,12 @@ SHARED_KEYS = (
 )
 
 # Settings of the training run rather than of the model it fits, so they left the
-# decoder yaml entirely for the training yaml `-tr` names, mapped here to where each
+# decoding yaml entirely for the training yaml `-tr` names, mapped here to where each
 # one went. Rejected wherever they still appear, for the same reason as above: a
 # training run silently falling back to a default still produces a checkpoint.
 MOVED_TO_TRAINING = {
     "optimizer": "training.optimizer",
-    "train": "training.schedule",
+    "train": "training.budget",
 }
 
 
@@ -288,7 +288,7 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
         per_algo = " (one entry per algorithm)" if len(algorithms) > 1 else ""
         raise ValueError(
             f'Decoder config {source} has <{", ".join(misplaced)}> at the top level; '
-            f"algorithm-specific keys moved into `decoder.config`{per_algo}."
+            f"algorithm-specific keys moved into `decoding.config`{per_algo}."
         )
 
     blocks = dec_cfg.get("config")
@@ -301,8 +301,8 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
     elif isinstance(blocks, list):
         if len(blocks) > n:
             raise ValueError(
-                f"Decoder config {source} has <{len(blocks)}> entries under `decoder.config` "
-                f"but only <{n}> under `decoder.algorithm`; they match by position."
+                f"Decoder config {source} has <{len(blocks)}> entries under `decoding.config` "
+                f"but only <{n}> under `decoding.algorithm`; they match by position."
             )
         # `- ` with nothing after it parses as None; read it as "no settings". A
         # short list leaves the stages past its end on their defaults, but only
@@ -311,28 +311,28 @@ def _split_config(dec_cfg: dict, algorithms: list, source: str):
         blocks = blocks + [{}] * (n - len(blocks))
     else:
         raise ValueError(
-            f"Decoder config {source} needs `decoder.config` to be a mapping or a "
+            f"Decoder config {source} needs `decoding.config` to be a mapping or a "
             f"list of mappings, got <{type(blocks).__name__}>."
         )
 
     for algo, block in zip(algorithms, blocks):
         if not isinstance(block, dict):
             raise ValueError(
-                f"Decoder config {source} needs every `decoder.config` entry to be a "
+                f"Decoder config {source} needs every `decoding.config` entry to be a "
                 f"mapping, got <{type(block).__name__}> for <{algo}>."
             )
-        _reject_training_keys(block, source, f"under `decoder.config` for <{algo}>")
+        _reject_training_keys(block, source, f"under `decoding.config` for <{algo}>")
         shared = [key for key in SHARED_KEYS if key in block]
         if shared:
             raise ValueError(
-                f'Decoder config {source} has <{", ".join(shared)}> under `decoder.config` '
-                f"for <{algo}>; those belong at the top of `decoder`."
+                f'Decoder config {source} has <{", ".join(shared)}> under `decoding.config` '
+                f"for <{algo}>; those belong at the top of `decoding`."
             )
     return blocks
 
 
 def is_trainable(decoder):
-    """True if `decoder` is a learned decoder, by its own `TRAINABLE` declaration."""
+    """True if `decoding` is a learned decoder, by its own `TRAINABLE` declaration."""
     # declared rather than detected: the bp family holds `nn.Parameter` index tensors it
     # never learns, so anything based on having parameters would call them trainable
     return bool(getattr(decoder, "TRAINABLE", False))
@@ -367,13 +367,13 @@ def assert_trained(decoders):
         return
     raise ValueError(
         f'Decoder <{", ".join(untrained)}> is learned and was given no weights, so it '
-        f"would decode at chance. Point the decoder yaml's `config.checkpoint` at a "
+        f"would decode at chance. Point the decoding yaml's `config.checkpoint` at a "
         f"trained checkpoint, or train one first with `-t`."
     )
 
 
 def resolve_configs(dec_cfg: dict, source: str = "dict"):
-    """Return one flat config per algorithm, in `decoder.algorithm` order."""
+    """Return one flat config per algorithm, in `decoding.algorithm` order."""
     algorithms = dec_cfg["algorithm"]
     if isinstance(algorithms, str):
         algorithms = [algorithms]
@@ -382,8 +382,8 @@ def resolve_configs(dec_cfg: dict, source: str = "dict"):
 
 
 def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
-    """Create decoder(s) from a '.decoder.yaml' file or a config dict."""
-    header = "decoder"
+    """Create decoder(s) from a '.decoding.yaml' file or a config dict."""
+    header = "decoding"
     func_name = "algorithm"
 
     if cfg is not None:
@@ -404,7 +404,7 @@ def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
         algorithms = [algorithms]  # wrap single decoder into a list
 
     # Each decoder still receives one flat config, so the decoders themselves keep
-    # reading `decoder_cfg.get(...)` without knowing the block is split.
+    # reading `decoding_cfg.get(...)` without knowing the block is split.
     algo_cfgs = resolve_configs(dec_cfg, source)
 
     MULTI_CHANNEL_DECODERS = {"bp4"}

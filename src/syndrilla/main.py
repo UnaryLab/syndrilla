@@ -34,7 +34,7 @@ def parse_commandline_args():
         help="Run directory to store outputs, for both decoding and training.",
     )
     parser.add_argument(
-        "-d", "--decoder_yaml", type=str, default=None, help="Path to decoder yaml."
+        "-d", "--decoding_yaml", type=str, default=None, help="Path to decoding yaml."
     )
     parser.add_argument(
         "-e", "--error_yaml", type=str, default=None, help="Path to error model yaml."
@@ -102,7 +102,7 @@ def parse_commandline_args():
         "--training_yaml",
         type=str,
         default=None,
-        help="Path to training yaml, carrying the objective, the optimizer and the schedule (see examples/alist/train_saq_hx.training.yaml).",
+        help="Path to training yaml, carrying the objective, the optimizer and the budget (see examples/alist/train_saq_hx.training.yaml).",
     )
 
     parser.add_argument(
@@ -137,7 +137,7 @@ def main():
     if args.train_checkpoint is not None and not args.train:
         raise ValueError(
             "-tckpt resumes a training run, so it needs -t. To decode from a "
-            "checkpoint, put its path under the decoder yaml's `checkpoint` key."
+            "checkpoint, put its path under the decoding yaml's `checkpoint` key."
         )
 
     if args.train and (args.checkpoint_yaml is None) != (args.train_checkpoint is None):
@@ -162,7 +162,7 @@ def main():
         if args.target_batch is None and args.target_error is None:
             args.target_error = 1000  # default to target error
 
-    required = [("-d", "decoder_yaml")]
+    required = [("-d", "decoding_yaml")]
     if args.interface_yaml is None:
         required += [
             ("-m", "matrix_yaml"),
@@ -177,14 +177,14 @@ def main():
         mode = "Training" if args.train else "Decoding"
         raise ValueError(f"{mode} requires {' '.join(missing)}.")
 
-    decoder_cfg = read_yaml(get_path(args.decoder_yaml))["decoder"]
+    decoding_cfg = read_yaml(get_path(args.decoding_yaml))["decoding"]
 
     if args.train:
-        # read here rather than with the objective below: the seed the schedule carries
+        # read here rather than with the objective below: the seed the budget carries
         # has to be set before the decoder is built, since it initializes the weights
         training_cfg = read_training_cfg(args.training_yaml)
         metrics = MetricState.train_initial(
-            training_cfg.get("schedule"), args.run_dir, args.training_yaml
+            training_cfg.get("budget"), args.run_dir, args.training_yaml
         )
         torch.manual_seed(metrics.cfg["error_random_seed"])
 
@@ -196,7 +196,7 @@ def main():
             args.interface_yaml,
             error_yaml=args.error_yaml,
             syndrome_yaml=args.syndrome_yaml,
-            decoder_yaml=args.decoder_yaml,
+            decoding_yaml=args.decoding_yaml,
             training=args.train,
         )
         logger.success(
@@ -223,8 +223,8 @@ def main():
             "\n----------------------------------------------\nStep 1: Create decoder\n----------------------------------------------"
         )
         matrix_cfg = read_yaml(get_path(args.matrix_yaml))["matrix"]
-        bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoder_cfg))
-        decoders = create_decoder(cfg=decoder_cfg, bundle=bundle, training=args.train)
+        bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+        decoders = create_decoder(cfg=decoding_cfg, bundle=bundle, training=args.train)
 
         logger.success(
             "\n----------------------------------------------\nStep 2: Create error model\n----------------------------------------------"
@@ -260,7 +260,7 @@ def main():
             f"Error model <{source}> has <{number_channel}> channel(s), but "
             f"decoder <{decoders[0].algo}> decodes <{expected_channel}>. "
         )
-    check_type = decoder_cfg.get("check_type", "hx")
+    check_type = decoding_cfg.get("check_type", "hx")
     shape, _, _, _ = bundle.Hx_matrix.get_index()
     H_matrix = bundle.select(check_type)[3]
 

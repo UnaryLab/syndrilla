@@ -48,10 +48,10 @@ def main(target_error):
         folder_path = os.path.join(run_dir, subdir)
 
         if 'hx' in subdir:
-            decoder_yaml = os.path.join(folder_path, f'{decoder}_hx.decoder.yaml')
+            decoder_yaml = os.path.join(folder_path, f'{decoder}_hx.decoding.yaml')
             check_yaml = os.path.join(folder_path, 'lx.check.yaml')
         else:
-            decoder_yaml = os.path.join(folder_path, f'{decoder}_hz.decoder.yaml')
+            decoder_yaml = os.path.join(folder_path, f'{decoder}_hz.decoding.yaml')
             check_yaml = os.path.join(folder_path, 'lz.check.yaml')
 
         error_yaml = os.path.join(folder_path, 'bsc.error.yaml')

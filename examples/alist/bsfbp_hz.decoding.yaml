@@ -1,0 +1,11 @@
+decoding:
+  algorithm: bp_branch_assisted
+  check_type: hz
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    max_iter: 181
+    max_b_iter: 181
+    random_machine: sobol

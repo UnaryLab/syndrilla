@@ -83,8 +83,8 @@ def _build_csr(matcher):
 class create(_MwpmPy):
     """MWPM decoder running the bit-exact CUDA blossom kernel (one thread per shot)."""
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)  # device/dtype/bundle + graph + matcher
+    def __init__(self, decoding_cfg, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)  # device/dtype/bundle + graph + matcher
         if not torch.cuda.is_available():
             raise RuntimeError("mwpm_cuda requires a CUDA GPU.")
         self._kernel = _load_kernel()

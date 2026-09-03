@@ -15,7 +15,7 @@ from syndrilla.syndrome import create_syndrome
 
 
 def test_batch_alist_hx(batch_size=1000, target_error=1000):
-    decoders = create_decoder(yaml_path='examples/alist/bposd_hx.decoder.yaml')
+    decoders = create_decoder(yaml_path='examples/alist/bposd_hx.decoding.yaml')
 
     num_decoders = len(decoders)
     for decoder in decoders:

@@ -1,6 +1,6 @@
 training:
+  algorithm: saq
   loss:
-    function: saq
     lambda_lc: 1.0
     lambda_lp: 0.2
     lambda_ent: 1.0
@@ -8,7 +8,7 @@ training:
     lr: 5.0e-4
     weight_decay: 5.0e-8
     min_lr: 1.0e-6
-  schedule:
+  budget:
     epochs: 40
     test_batches: 100
     validation_batches: 20

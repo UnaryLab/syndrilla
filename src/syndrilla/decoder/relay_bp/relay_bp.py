@@ -9,12 +9,12 @@ class create(torch.nn.Module):
     This class creates a bp decoder on a single GPU
     """
     def __init__(self,
-                 decoder_cfg,
+                 decoding_cfg,
                  **kwargs) -> None:
         """
         Initialization for bp decoder
         Input:
-            decoder_cfg: the information that come from config file (yaml)
+            decoding_cfg: the information that come from config file (yaml)
 
         Parameters:
             max_iter: the number of maximum iteration of bp decoder
@@ -40,33 +40,33 @@ class create(torch.nn.Module):
 
         # Defaults match the relay-bp crate's gamma_dist_interval = (-0.24, 0.66),
         # expressed here as center = (low + high) / 2 and width = high - low.
-        self.center = decoder_cfg.get('center', 0.21)
+        self.center = decoding_cfg.get('center', 0.21)
         if not isinstance(self.center, float):
             logger.warning(f'Invalid input center <{self.center}>, default to <0.21>.')
             self.center = 0.21
 
-        self.width = decoder_cfg.get('width', 0.9)
+        self.width = decoding_cfg.get('width', 0.9)
         if not isinstance(self.width, float):
             logger.warning(f'Invalid input width <{self.width}>, default to <0.9>.')
             self.width = 0.9
 
-        self.init_mem_strength = decoder_cfg.get('init_mem_strength', 0.35)
+        self.init_mem_strength = decoding_cfg.get('init_mem_strength', 0.35)
 
-        self.alpha_const = decoder_cfg.get('alpha', 0.0)
+        self.alpha_const = decoding_cfg.get('alpha', 0.0)
         if not isinstance(self.alpha_const, (int, float)) or isinstance(self.alpha_const, bool):
             logger.warning(f'Invalid input alpha <{self.alpha_const}>, default to <0.0>.')
             self.alpha_const = 0.0
         self.alpha_const = float(self.alpha_const)
 
-        self.alpha_scaling = decoder_cfg.get('alpha_scaling', 1.0)
+        self.alpha_scaling = decoding_cfg.get('alpha_scaling', 1.0)
         if not isinstance(self.alpha_scaling, (int, float)) or isinstance(self.alpha_scaling, bool) or self.alpha_scaling <= 0:
             logger.warning(f'Invalid input alpha_scaling <{self.alpha_scaling}>, default to <1.0>.')
             self.alpha_scaling = 1.0
         self.alpha_scaling = float(self.alpha_scaling)
 
         # set up default device. Accept either a `device:` block {device_type, device_idx}
-        # (as main passes via the decoder yaml) or a plain string / torch.device (direct use).
-        device_cfg = decoder_cfg.get('device', {})
+        # (as main passes via the decoding yaml) or a plain string / torch.device (direct use).
+        device_cfg = decoding_cfg.get('device', {})
         if isinstance(device_cfg, dict):
             self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
             device_idx = device_cfg.get('device_idx', 0)
@@ -84,31 +84,31 @@ class create(torch.nn.Module):
                 self.device = torch.device(f'cuda:{device_idx}')
 
         #set up default solution number
-        self.solution = decoder_cfg.get('solution', 5)
+        self.solution = decoding_cfg.get('solution', 5)
         if self.solution <= 0 or not isinstance(self.solution, int):
             logger.warning(f'Invalid input solution number <{self.solution}>, default to <5>.')
             self.solution = 5
 
         #initial iteration count
-        self.iteration_initial = decoder_cfg.get('iteration_initial', 80)
+        self.iteration_initial = decoding_cfg.get('iteration_initial', 80)
         if self.iteration_initial < 0 or not isinstance(self.iteration_initial, int):
             logger.warning(f'Invalid input iteration initial <{self.iteration_initial}>, default to <0>.')
             self.iteration_initial = 80
 
         #set up default iteration count
-        self.iteration_count = decoder_cfg.get('iteration_count', 60)
+        self.iteration_count = decoding_cfg.get('iteration_count', 60)
         if self.iteration_count <= 0 or not isinstance(self.iteration_count, int):
             logger.warning(f'Invalid input iteration count <{self.iteration_count}>, default to <60>.')
             self.iteration_count = 60
 
         # set up default R
-        self.legs = decoder_cfg.get('legs', 20)
+        self.legs = decoding_cfg.get('legs', 20)
         if self.legs <= 0 or not isinstance(self.legs, int):
             logger.warning(f'Invalid input R <{self.legs}>, default to <1>.')
             self.legs = 20
 
         # set up default dtype
-        self.dtype = decoder_cfg.get('dtype', 'float64')
+        self.dtype = decoding_cfg.get('dtype', 'float64')
         if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
@@ -116,12 +116,12 @@ class create(torch.nn.Module):
 
         self.batch_size = 1
 
-        self.type = decoder_cfg.get('type', 'hx')
+        self.type = decoding_cfg.get('type', 'hx')
         if self.type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input type <{self.type}>, default to <hx>.')
             self.type = 'hx'
 
-        self.check_type = decoder_cfg.get('check_type', 'hx')
+        self.check_type = decoding_cfg.get('check_type', 'hx')
         if self.check_type.lower() not in {'hx', 'hz'}:
             logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
             self.check_type = 'hx'
@@ -144,7 +144,7 @@ class create(torch.nn.Module):
         self.algo = 'bp_relay'
         self.num_max_iter = self.iteration_initial + (self.legs - 1) * self.iteration_count
 
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get('rebatch_speedup'))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get('rebatch_speedup'))
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
 

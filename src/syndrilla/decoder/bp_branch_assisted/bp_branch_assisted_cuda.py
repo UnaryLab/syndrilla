@@ -16,9 +16,9 @@ class create(_BranchPy):
     adaptive cap (omit it to run uncapped).
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__(
-            decoder_cfg, **kwargs
+            decoding_cfg, **kwargs
         )  # branch params + helpers (sign_flip, etc.)
 
         if not torch.cuda.is_available():
@@ -42,7 +42,7 @@ class create(_BranchPy):
 
         # pure-PyTorch branch builds no cap; enable the adaptive cap here when an
         # rebatch_speedup block is present (the forward below already honors it).
-        self.cap = RebatchSpeedup.from_cfg(decoder_cfg.get("rebatch_speedup"))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get("rebatch_speedup"))
         self.cap_bypass = False
         self.cap_active_last = False
         if self.cap is None:

@@ -16,10 +16,10 @@ class create(_BpSfPy):
     the ``sf:`` block) plus the optional ``force_per_step: true`` debug knob that
     routes the SF retries through the modular kernels instead of the fused one."""
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         # Build all SF params, H_dense, and the message-passing helpers. The base
         # also resolves self.device to cuda:idx (device_type=cuda in the YAML).
-        super().__init__(decoder_cfg, **kwargs)
+        super().__init__(decoding_cfg, **kwargs)
 
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -49,7 +49,7 @@ class create(_BpSfPy):
             M_val, D, self.N_ext, self.VD, self.dtype.itemsize
         )
         smem_limit = self._ext.fused_smem_limit()
-        self._use_fused = smem_needed <= smem_limit and not decoder_cfg.get(
+        self._use_fused = smem_needed <= smem_limit and not decoding_cfg.get(
             "force_per_step", False
         )
         if not self._use_fused:

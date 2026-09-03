@@ -57,14 +57,17 @@ class create:
 
     term_names = ("lc", "lp", "ent")
 
-    def __init__(self, loss_cfg, **kwargs) -> None:
+    def __init__(self, cfg, **kwargs) -> None:
         decoder = kwargs.get("decoder")
         if decoder is None:
             raise ValueError(
-                "Loss <saq> requires the decoder it supervises, passed as the "
+                "Trainer <saq> requires the decoder it supervises, passed as the "
                 "<decoder> kwarg of create_trainer()."
             )
         self.decoder = getattr(decoder, "decoder", decoder)
+        # the whole `training` block arrives, the way a decoder is handed its own; the
+        # term weights are the part of it the objective reads
+        loss_cfg = cfg.get("loss") or {}
         self.cfg = dict(loss_cfg)
         self.lambda_lc = float(loss_cfg.get("lambda_lc", 1.0))
         self.lambda_lp = float(loss_cfg.get("lambda_lp", 0.2))

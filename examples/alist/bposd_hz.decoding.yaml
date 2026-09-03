@@ -1,0 +1,9 @@
+decoding:
+  algorithm: [bp_norm_min_sum, osd_0]
+  check_type: hz
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    max_iter: 181

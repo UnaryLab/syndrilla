@@ -85,14 +85,14 @@ class COOMatrixGF2Batch:
 
 class create(torch.nn.Module):
     def __init__(self,
-                    decoder_cfg,
+                    decoding_cfg,
                     **kwargs) -> None:
 
         super(create, self).__init__()
         logger.info('Creating osd-0 decoder.')
 
         # set up default device
-        device_cfg = decoder_cfg.get('device', {})
+        device_cfg = decoding_cfg.get('device', {})
         self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
             logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
@@ -107,7 +107,7 @@ class create(torch.nn.Module):
                 self.device = torch.device(f'cuda:{device_idx}')
 
         # set up default dtype
-        self.dtype = decoder_cfg.get('dtype', 'float64')
+        self.dtype = decoding_cfg.get('dtype', 'float64')
         if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
             logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
             self.dtype = 'float64'
@@ -117,7 +117,7 @@ class create(torch.nn.Module):
         bundle = kwargs.get('bundle')
         if bundle is None:
             raise ValueError('osd_0 requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
-        check_type = decoder_cfg.get('check_type', 'hx')
+        check_type = decoding_cfg.get('check_type', 'hx')
         H_shape = bundle.select(check_type)[0]
         self.num_max_iter = H_shape[1]
 

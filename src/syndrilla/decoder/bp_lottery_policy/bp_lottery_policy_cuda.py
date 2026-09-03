@@ -13,22 +13,22 @@ class create(_NmsCuda, _PolicyPy):
         sign_flip_policy: one of bp_lottery_policy's seven policies (default Proposed)
     """
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         # Only the CUDA parent's __init__ runs (kernels, adjacency, V_c_col on
         # device, dtype, N_ext, …). The PyTorch parent contributes methods only.
-        _NmsCuda.__init__(self, decoder_cfg, **kwargs)
+        _NmsCuda.__init__(self, decoding_cfg, **kwargs)
 
         # sign-flip is a per-iteration host op → no fused kernel.
         self._use_fused = False
 
-        self.random_machine = str(decoder_cfg.get("random_machine", "sobol")).lower()
+        self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
             logger.warning(
                 f"Invalid random_machine <{self.random_machine}>; defaulting to sobol."
             )
             self.random_machine = "sobol"
 
-        self.sign_flip_policy = decoder_cfg.get("sign_flip_policy", "Proposed")
+        self.sign_flip_policy = decoding_cfg.get("sign_flip_policy", "Proposed")
         if self.sign_flip_policy not in self._sign_flip_policies:
             logger.warning(
                 f"Invalid sign_flip_policy <{self.sign_flip_policy}>; defaulting to "

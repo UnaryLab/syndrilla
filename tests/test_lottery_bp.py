@@ -8,12 +8,12 @@ sys.path.append(os.getcwd())
 
 
 def test_batch_alist_hz(batch_size=1000, target_error=1000):
-    decoder_yaml = 'examples/alist/lottery_bp_hz.decoder.yaml'
+    decoding_yaml = 'examples/alist/lottery_bp_hz.decoding.yaml'
     logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        f'-d={decoder_yaml}',
+        f'-d={decoding_yaml}',
         '-e=examples/alist/bsc.error.yaml',
         f'-c={logical_check_yaml}',
         '-s=examples/alist/perfect.syndrome.yaml',
@@ -29,12 +29,12 @@ def test_batch_alist_hz(batch_size=1000, target_error=1000):
 
 
 def test_batch_alist_hz_quant(batch_size=1000, target_error=1000):
-    decoder_yaml = 'examples/alist/lottery_bp_quant_hz.decoder.yaml'
+    decoding_yaml = 'examples/alist/lottery_bp_quant_hz.decoding.yaml'
     logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        f'-d={decoder_yaml}',
+        f'-d={decoding_yaml}',
         '-e=examples/alist/bsc.error.yaml',
         f'-c={logical_check_yaml}',
         '-s=examples/alist/perfect.syndrome.yaml',

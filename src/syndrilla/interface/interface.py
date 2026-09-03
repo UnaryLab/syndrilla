@@ -8,7 +8,7 @@ from syndrilla.utils import call_func_from_cfg, call_func_from_yaml, get_path, r
 def create_interface(yaml_path: str = None, cfg: dict = None,
                      error_yaml: str = None, error_cfg: dict = None,
                      syndrome_yaml: str = None, syndrome_cfg: dict = None,
-                     decoder_yaml: str = None, decoder_cfg: dict = None,
+                     decoding_yaml: str = None, decoding_cfg: dict = None,
                      **kwargs):
     """
     Create an interface from a '.interface.yaml' file or a config dict.
@@ -23,13 +23,13 @@ def create_interface(yaml_path: str = None, cfg: dict = None,
     if syndrome_yaml is not None and syndrome_cfg is None:
         full = read_yaml(get_path(syndrome_yaml))
         syndrome_cfg = full.get('syndrome', {})
-    if decoder_yaml is not None and decoder_cfg is None:
-        full = read_yaml(get_path(decoder_yaml))
-        decoder_cfg = full.get('decoder', {})
+    if decoding_yaml is not None and decoding_cfg is None:
+        full = read_yaml(get_path(decoding_yaml))
+        decoding_cfg = full.get('decoding', {})
 
     kwargs['error_cfg'] = error_cfg or {}
     kwargs['syndrome_cfg'] = syndrome_cfg or {}
-    kwargs['decoder_cfg'] = decoder_cfg or {}
+    kwargs['decoding_cfg'] = decoding_cfg or {}
 
     header = 'interface'
     func_name = 'backend'

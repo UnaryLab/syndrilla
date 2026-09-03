@@ -12,12 +12,12 @@ from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 
 def test_error_model():
-    decoder_yaml = "examples/txt/bp_hx.decoder.yaml"
+    decoding_yaml = "examples/txt/bp_hx.decoding.yaml"
     matrix_yaml = "examples/txt/hgp.matrix.yaml"
 
-    decoder_cfg = read_yaml(get_path(decoder_yaml))["decoder"]
+    decoding_cfg = read_yaml(get_path(decoding_yaml))["decoding"]
     matrix_cfg = read_yaml(get_path(matrix_yaml))["matrix"]
-    device, dtype = parse_device_dtype(decoder_cfg)
+    device, dtype = parse_device_dtype(decoding_cfg)
     bundle = load_matrices(matrix_cfg, device, dtype)
 
     shape, _, _, _ = bundle.Hx_matrix.get_index()

@@ -12,12 +12,12 @@ from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant_cuda import (
 class create(_QuantCuda, _LotteryQuantPy):
     """Quantized lottery NMS on CUDA kernels (per-step path + sign-flip)."""
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         _QuantCuda.__init__(
-            self, decoder_cfg, **kwargs
+            self, decoding_cfg, **kwargs
         )  # quant + kernels; methods from _LotteryQuantPy
 
-        self.random_machine = str(decoder_cfg.get("random_machine", "sobol")).lower()
+        self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
             logger.warning(
                 f"Invalid random_machine <{self.random_machine}>; defaulting to sobol."

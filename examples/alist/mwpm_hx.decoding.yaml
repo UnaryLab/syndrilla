@@ -1,0 +1,6 @@
+decoding:
+  algorithm: [mwpm]
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu

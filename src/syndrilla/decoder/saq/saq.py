@@ -157,11 +157,11 @@ class create(nn.Module):
     # what `train_score` returns, under the name the run records it by
     TRAIN_SCORE_NAME = "val_class_err"
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         """Initialization for saq decoder.
 
         Input:
-            decoder_cfg: the information that come from config file (yaml)
+            decoding_cfg: the information that come from config file (yaml)
 
         Settings, by the yaml block that carries them:
             model:     d_model (token width), N_dec (SLTD layers), h (attention heads),
@@ -176,8 +176,8 @@ class create(nn.Module):
 
         logger.info("Creating saq decoder.")
 
-        self.device, _ = parse_device_dtype(decoder_cfg)
-        self.dtype = decoder_cfg.get("dtype", "float32")
+        self.device, _ = parse_device_dtype(decoding_cfg)
+        self.dtype = decoding_cfg.get("dtype", "float32")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(
                 f"Invalid input data type <{self.dtype}>, default to <torch.float32>."
@@ -185,14 +185,14 @@ class create(nn.Module):
             self.dtype = "float32"
         self.dtype = torch.__dict__[self.dtype]
 
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(
                 f"Invalid input check type <{self.check_type}>, default to <hx>."
             )
             self.check_type = "hx"
 
-        if "code_type" in decoder_cfg:
+        if "code_type" in decoding_cfg:
             raise ValueError(
                 "Decoder <saq>: <code_type> was removed. Nothing in the decoder branches "
                 "on the code family, so nothing has to declare it; delete the key."
@@ -238,9 +238,9 @@ class create(nn.Module):
             ("no_mask", "model"),
             ("cpnd_passes", "cpnd"),
         ):
-            if legacy in decoder_cfg:
+            if legacy in decoding_cfg:
                 raise ValueError(
-                    f"Decoder <saq>: <{legacy}> moved under the decoder yaml's "
+                    f"Decoder <saq>: <{legacy}> moved under the decoding yaml's "
                     f"<config.{block}> block. Nest it there rather than at the top level."
                 )
         for legacy, moved in (
@@ -251,13 +251,13 @@ class create(nn.Module):
             ("lambda_loss_lp", "training.loss.lambda_lp"),
             ("lambda_loss_ent", "training.loss.lambda_ent"),
         ):
-            if legacy in decoder_cfg:
+            if legacy in decoding_cfg:
                 raise ValueError(
                     f"Decoder <saq>: <{legacy}> moved to the training yaml as "
                     f"<{moved}>; pass it with -tr."
                 )
 
-        cpnd_cfg = decoder_cfg.get("cpnd", {})
+        cpnd_cfg = decoding_cfg.get("cpnd", {})
         if not isinstance(cpnd_cfg, dict):
             raise ValueError(
                 f"Decoder <saq>: <config.cpnd> is a block with <enable> and <passes>, got "
@@ -278,7 +278,7 @@ class create(nn.Module):
         if self.use_cpnd:
             self._build_cpnd(H_matrix, l_matrix)
 
-        model_cfg = decoder_cfg.get("model", {})
+        model_cfg = decoding_cfg.get("model", {})
         if not isinstance(model_cfg, dict):
             raise ValueError(
                 f"Decoder <saq>: <config.model> is a block with <d_model>, <N_dec>, <h>, "
@@ -325,14 +325,14 @@ class create(nn.Module):
                 nn.init.xavier_uniform_(p)
 
         self.to(device=self.device, dtype=self.dtype)
-        self._load_checkpoint(decoder_cfg.get("checkpoint"), training)
+        self._load_checkpoint(decoding_cfg.get("checkpoint"), training)
 
         self.algo = "saq"
         # one feed-forward pass per sample; `num_max_iter` is what `main.py` reads
         self.num_max_iter = 1
-        if decoder_cfg.get("max_iter") not in (None, 1):
+        if decoding_cfg.get("max_iter") not in (None, 1):
             logger.warning(
-                f'saq is single-shot; ignoring max_iter <{decoder_cfg.get("max_iter")}>.'
+                f'saq is single-shot; ignoring max_iter <{decoding_cfg.get("max_iter")}>.'
             )
 
         logger.info("Complete.")
@@ -425,7 +425,7 @@ class create(nn.Module):
         if missing:
             raise ValueError(
                 f"saq checkpoint <{path}> has no weights for <{missing}>. Retrain, or "
-                f"point `checkpoint` at a checkpoint matching this decoder yaml."
+                f"point `checkpoint` at a checkpoint matching this decoding yaml."
             )
         if unexpected:
             logger.warning(f"saq checkpoint <{path}>: unexpected keys <{unexpected}>.")

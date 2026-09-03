@@ -1,0 +1,9 @@
+decoding:
+  algorithm: bp4
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    max_iter: 181
+    damping_factor: 0.1

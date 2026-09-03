@@ -7,8 +7,8 @@ from syndrilla.decoder.bp4.bp4 import create as _BP4Py
 class create(_BP4Py):
     """Quaternary BP on CUDA. PyTorch-on-CUDA port (custom kernel pending)."""
 
-    def __init__(self, decoder_cfg: dict, **kwargs) -> None:
-        super().__init__(decoder_cfg, **kwargs)
+    def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)
         if not torch.cuda.is_available():
             raise RuntimeError("bp4_cuda requires a CUDA GPU.")
         if str(self.device) == "cpu":

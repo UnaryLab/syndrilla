@@ -8,12 +8,12 @@ sys.path.append(os.getcwd())
 
 
 def test_batch_alist_hx(batch_size=1000, target_error=1000):
-    decoder_yaml = 'examples/alist/bp_hx.decoder.yaml'
+    decoding_yaml = 'examples/alist/bp_hx.decoding.yaml'
     logical_check_yaml = 'examples/alist/lx.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        f'-d={decoder_yaml}',
+        f'-d={decoding_yaml}',
         '-e=examples/alist/bsc.error.yaml',
         f'-c={logical_check_yaml}',
         '-s=examples/alist/perfect.syndrome.yaml',
@@ -29,12 +29,12 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
 
 
 def test_batch_alist_hz(batch_size=1000, target_error=1000):
-    decoder_yaml = 'examples/alist/bp_hz.decoder.yaml'
+    decoding_yaml = 'examples/alist/bp_hz.decoding.yaml'
     logical_check_yaml = 'examples/alist/lz.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        f'-d={decoder_yaml}',
+        f'-d={decoding_yaml}',
         '-e=examples/alist/bsc.error.yaml',
         f'-c={logical_check_yaml}',
         '-s=examples/alist/perfect.syndrome.yaml',
@@ -50,12 +50,12 @@ def test_batch_alist_hz(batch_size=1000, target_error=1000):
 
 
 def test_batch_txt_hx(batch_size=1000, target_error=1000):
-    decoder_yaml = 'examples/txt/bp_hx.decoder.yaml'
+    decoding_yaml = 'examples/txt/bp_hx.decoding.yaml'
     logical_check_yaml = 'examples/txt/lx.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        f'-d={decoder_yaml}',
+        f'-d={decoding_yaml}',
         '-e=examples/txt/bsc.error.yaml',
         f'-c={logical_check_yaml}',
         '-s=examples/txt/perfect.syndrome.yaml',
@@ -72,12 +72,12 @@ def test_batch_txt_hx(batch_size=1000, target_error=1000):
 
 def test_batch_txt_hz(batch_size=1000, target_error=1000):
     # create decoder
-    decoder_yaml = 'examples/txt/bp_hz.decoder.yaml'
+    decoding_yaml = 'examples/txt/bp_hz.decoding.yaml'
     logical_check_yaml = 'examples/txt/lz.check.yaml'
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        f'-d={decoder_yaml}',
+        f'-d={decoding_yaml}',
         '-e=examples/txt/bsc.error.yaml',
         f'-c={logical_check_yaml}',
         '-s=examples/txt/perfect.syndrome.yaml',

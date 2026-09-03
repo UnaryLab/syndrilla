@@ -26,7 +26,7 @@ def modify_yaml(file_path, changes):
 
 def main(batch_size, target_error):
     # Paths to your YAML files (adjust to your actual paths)
-    decoder_yaml = 'examples/alist/bp_hz.decoder.yaml'
+    decoding_yaml = 'examples/alist/bp_hz.decoding.yaml'
     error_yaml   = 'examples/alist/bsc.error.yaml'
 
     # Define error rates
@@ -42,7 +42,7 @@ def main(batch_size, target_error):
 
             # 1) Modify the decoder YAML
             modify_yaml(
-                file_path=decoder_yaml,
+                file_path=decoding_yaml,
                 changes={
                     'decoder.dtype': ftype
                 }
@@ -60,7 +60,7 @@ def main(batch_size, target_error):
             cmd = [
                 'syndrilla',
                 f'-r=zoo/bp_sweeping/bp_{ftype}_surface_10_hz/',
-                f'-d={decoder_yaml}',
+                f'-d={decoding_yaml}',
                 f'-e={error_yaml}',
                 '-c=examples/alist/lz.check.yaml',
                 '-s=examples/alist/perfect.syndrome.yaml',

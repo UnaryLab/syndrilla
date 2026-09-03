@@ -413,11 +413,11 @@ def decode_shot(lattice: Lattice, syndrome) -> np.ndarray:
 class create(torch.nn.Module):
     """Union-Find decoder consuming one of the bundle's Hx/Hz (toric/graphlike) matrices."""
 
-    def __init__(self, decoder_cfg, **kwargs) -> None:
+    def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__()
         logger.info("Creating union-find decoder.")
 
-        device_cfg = decoder_cfg.get("device", {})
+        device_cfg = decoding_cfg.get("device", {})
         self.device = device_cfg.get(
             "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -441,13 +441,13 @@ class create(torch.nn.Module):
             else:
                 self.device = torch.device(f"cuda:{device_idx}")
 
-        self.dtype = decoder_cfg.get("dtype", "float64")
+        self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(f"Invalid dtype <{self.dtype}>, default to float64.")
             self.dtype = "float64"
         self.dtype = torch.__dict__[self.dtype]
 
-        self.check_type = decoder_cfg.get("check_type", "hx")
+        self.check_type = decoding_cfg.get("check_type", "hx")
         if self.check_type.lower() not in {"hx", "hz"}:
             logger.warning(f"Invalid check type <{self.check_type}>, default to hx.")
             self.check_type = "hx"

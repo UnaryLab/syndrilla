@@ -5,9 +5,8 @@ from loguru import logger
 
 from syndrilla.utils import call_func_from_cfg, get_path, read_yaml
 
-BLOCKS = ("loss", "optimizer", "schedule")
+BLOCKS = ("loss", "optimizer", "budget")
 
-# what `Trainer.train_state` writes and `load_train_state` requires back
 TRAIN_STATE_KEYS = ("state_dict", "optimizer", "scheduler")
 
 
@@ -16,23 +15,19 @@ def read_training_cfg(yaml_path: str):
     full_path = get_path(yaml_path)
     cfg = read_yaml(full_path)
     if "training" not in (cfg or {}):
-        raise ValueError(
-            f"Training yaml <{full_path}> has no `training` header. The objective, the "
-            f"optimizer and the schedule all live under it; a file headed `loss:` "
-            f"predates the move and carries only the first of the three."
-        )
+        raise ValueError(f"Training yaml <{full_path}> has no `training` header.")
     return cfg["training"]
 
 
 class Trainer:
-    """The run that fits a decoder: the objective, the optimizer, the schedule."""
+    """The run that fits a decoder: the objective, the optimizer, the budget."""
 
     def __init__(self, cfg: dict, loss) -> None:
         self.cfg = cfg
         self.loss = loss
+        self.algorithm = cfg.get("algorithm")
         self.optimizer_cfg = cfg.get("optimizer") or {}
-        self.schedule = cfg.get("schedule") or {}
-        # all bound by `configure`, so a run that never trains carries none of them
+        self.budget = cfg.get("budget") or {}
         self.decoder = None
         self.model = None
         self.optimizer = None
@@ -58,15 +53,11 @@ class Trainer:
         """Open a batch: seed the phase it starts, and enter that phase."""
         position = batch_index % self.period
         if position == 0:
-            # no epoch term: that is what makes each epoch train on the same batches
             torch.manual_seed(self.seed * 1_000_003)
         elif position == self.test_batches:
-            # clear of the training seed so validation never replays its errors
             torch.manual_seed(self.seed * 1_000_003 + 9_999_991 + epoch)
         self.phase = "train" if position < self.test_batches else "val"
         if self.decoder is not None:
-            # module mode and the grad switch are one decision: a validation batch that
-            # still built a graph would train on the wrong set
             self.decoder.train(self.phase == "train")
             torch.set_grad_enabled(self.phase == "train")
         return self.phase
@@ -107,8 +98,6 @@ class Trainer:
         self.scheduler.load_state_dict(state["scheduler"])
         rng = state.get("rng")
         if rng:
-            # map_location puts every saved tensor on the model's device; both setters
-            # want the state back on the CPU as a ByteTensor
             torch.set_rng_state(rng["cpu"].cpu())
             if "cuda" in rng and str(self.model.device).startswith("cuda"):
                 torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
@@ -132,15 +121,20 @@ def create_trainer(yaml_path: str = None, cfg: dict = None, **kwargs):
                 f"Training config {source} needs `{header}.{block}` to be a mapping, "
                 f"got <{type(value).__name__}>."
             )
-    loss_cfg = cfg.get("loss")
-    if not loss_cfg:
+    if not cfg.get("algorithm"):
         raise ValueError(
-            f"Training config {source} has no `{header}.loss` block. Name the objective "
-            f"there under `function`, with its own settings beside it."
+            f"Training config {source} has no `{header}.algorithm`. Name the training "
+            f"algorithm there; the blocks below it carry its settings."
+        )
+    decoder_algo = getattr(kwargs.get("decoder"), "algo", None)
+    if decoder_algo is not None and decoder_algo.lower() != cfg["algorithm"].lower():
+        raise ValueError(
+            f"Training config {source} trains <{cfg['algorithm']}> but the decoding yaml "
+            f"builds <{decoder_algo}>."
         )
 
     loss = call_func_from_cfg(
-        loss_cfg, header, "function", os.path.dirname(__file__), **kwargs
+        cfg, header, "algorithm", os.path.dirname(__file__), **kwargs
     )
     logger.info("Creating trainer complete.")
     return Trainer(cfg, loss)

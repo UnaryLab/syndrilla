@@ -1,0 +1,7 @@
+decoding:
+  algorithm: bp_branch_assisted
+  check_type: hx
+  dtype: float64
+  config:
+    max_iter: 181
+    max_b_iter: 181

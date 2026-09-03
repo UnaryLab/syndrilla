@@ -9,7 +9,7 @@ def test_bp4(batch_size=10000, target_error=1000):
     cmd = [
         'syndrilla',
         '-r=tests/test_outputs',
-        '-d=examples/alist/bp4.decoder.yaml',
+        '-d=examples/alist/bp4.decoding.yaml',
         '-e=examples/alist/depol.error.yaml',
         '-c=examples/alist/lx.check.yaml',
         '-s=examples/alist/perfect.syndrome.yaml',
