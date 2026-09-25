@@ -1,6 +1,7 @@
 import torch
 from loguru import logger
 
+from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
 
 
@@ -66,22 +67,15 @@ class create(torch.nn.Module):
 
         # set up default device. Accept either a `device:` block {device_type, device_idx}
         # (as main passes via the decoding yaml) or a plain string / torch.device (direct use).
-        device_cfg = decoding_cfg.get('device', {})
-        if isinstance(device_cfg, dict):
-            self.device = device_cfg.get('device_type', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-            device_idx = device_cfg.get('device_idx', 0)
-        else:
-            self.device, device_idx = device_cfg, 0
-        if self.device not in {'cuda', 'cpu', torch.device('cuda'), torch.device('cpu')}:
-            logger.warning(f'Invalid input device <{self.device}>, default to avaliable device in your machine.')
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if self.device == 'cuda':
-            device_idx = device_cfg.get('device_idx', 0)
-            if device_idx >= torch.cuda.device_count():
-                logger.warning(f'Invalid input device index <{device_idx}>, default to avaliable device in your machine.')
-                self.device = torch.device('cuda:0')
-            else:
-                self.device = torch.device(f'cuda:{device_idx}')
+        device_cfg = decoding_cfg.get('device') or {}
+        if not isinstance(device_cfg, dict):
+            try:
+                device = torch.device(device_cfg)
+                device_cfg = {'device_type': device.type, 'device_idx': device.index or 0}
+            except (RuntimeError, TypeError):
+                logger.warning(f'Invalid input device <{device_cfg}>, default to avaliable device in your machine.')
+                device_cfg = {}
+        self.device, _ = parse_device_dtype({**decoding_cfg, 'device': device_cfg})
 
         #set up default solution number
         self.solution = decoding_cfg.get('solution', 5)

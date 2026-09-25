@@ -1,7 +1,7 @@
 import torch
 from loguru import logger
 
-from syndrilla.utils import build_rate_sweep, dataset, draw_shot_rate, is_rate_range
+from syndrilla.utils import build_rate_sweep, dataset, draw_shot_rate, is_rate_range, parse_device_dtype
 
 
 class create:
@@ -20,30 +20,7 @@ class create:
         )
         self.rate = error_model_cfg["rate"]
 
-        device_cfg = error_model_cfg.get("device", {})
-        self.device = device_cfg.get(
-            "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        if self.device not in {
-            "cuda",
-            "cpu",
-            torch.device("cuda"),
-            torch.device("cpu"),
-        }:
-            logger.warning(
-                f"Invalid input device <{self.device}>, default to avaliable device in your machine."
-            )
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if self.device == "cuda":
-            device_idx = device_cfg.get("device_idx", 0)
-            if device_idx >= torch.cuda.device_count():
-                logger.warning(
-                    f"Invalid input device index <{device_idx}>, default to avaliable device in your machine."
-                )
-                self.device = torch.device("cuda:0")
-            else:
-                self.device = torch.device(f"cuda:{device_idx}")
+        self.device, _ = parse_device_dtype(error_model_cfg)
         self.number_channel = 2
 
         self.rate_is_range = is_rate_range(self.rate)

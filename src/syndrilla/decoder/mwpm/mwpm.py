@@ -7,6 +7,8 @@ import numpy as np
 import torch
 from loguru import logger
 
+from syndrilla.utils import parse_device_dtype
+
 
 @dataclass
 class MatchingGraph:
@@ -1650,29 +1652,7 @@ class create(torch.nn.Module):
         super().__init__()
         logger.info("Creating MWPM decoder.")
 
-        device_cfg = decoding_cfg.get("device", {})
-        self.device = device_cfg.get(
-            "device_type", torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        if self.device not in {
-            "cuda",
-            "cpu",
-            torch.device("cuda"),
-            torch.device("cpu"),
-        }:
-            logger.warning(
-                f"Invalid input device <{self.device}>, default to available device."
-            )
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.device == "cuda":
-            device_idx = device_cfg.get("device_idx", 0)
-            if device_idx >= torch.cuda.device_count():
-                logger.warning(
-                    f"Invalid device index <{device_idx}>, default to cuda:0."
-                )
-                self.device = torch.device("cuda:0")
-            else:
-                self.device = torch.device(f"cuda:{device_idx}")
+        self.device, _ = parse_device_dtype(decoding_cfg)
 
         self.dtype = decoding_cfg.get("dtype", "float64")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:

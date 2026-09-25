@@ -253,6 +253,13 @@ _TRAIN_YAML_SETUP = {
 }
 
 
+def _same_setting(key, saved, now):
+    """Whether a fingerprint field matches; device <cuda> and <cuda:0> are the same."""
+    if key == "device":
+        saved, now = ("cuda:0" if v == "cuda" else v for v in (saved, now))
+    return saved == now
+
+
 def _yaml_train_setup(path):
     """Read a training run's `-ckpt` result yaml back as fingerprint fields."""
     with open(path, "r") as f:
@@ -362,7 +369,8 @@ class MetricState:
             average_time_sample = total_time / sample_size
             logger.info(f"Average time per sample: {average_time_sample} seconds.")
 
-            average_time_sample_iter = (average_time_sample / average_iter).item()
+            # a chained decoder invoked on no samples runs 0 iterations
+            average_time_sample_iter = (average_time_sample / average_iter).item() if average_iter else 0.0
             logger.info(f"Average time per iteration: {average_time_sample_iter}")
 
         if torch.isinf(torch.sum(converge)) or torch.isnan(torch.sum(converge)):
@@ -642,10 +650,11 @@ class MetricState:
         all_metrics_results = {}
         total_time_sum = 0.0
         all_check_types = ["hx", "hz"]
-        final_list = []
 
         for i, decoder_metrics in enumerate(out_dict):
             decoder_key = f"decoder_{i}"
+            # decoder_full reports the last decoder in the chain
+            final_list = []
             raw_dist = decoder_metrics["distribution"].int().cpu()
             iteration_count = raw_dist.numpy().tolist()
 
@@ -1136,7 +1145,7 @@ class MetricState:
             f"{key}: checkpoint <{saved[key] if key in saved else 'not recorded'}> "
             f"vs now <{value}>"
             for key, value in fields.items()
-            if saved.get(key) != value
+            if not _same_setting(key, saved.get(key), value)
         ]
         if changed:
             raise ValueError(
