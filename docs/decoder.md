@@ -13,7 +13,7 @@ The following table details the configuration parameters shared by every decodin
 |------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------|
 | `decoding.algorithm`    | List of decoding algorithms used                                            | `[bp_norm_min_sum, osd_0]`                         |
 | `decoding.check_type`   | Type of parity-check matrix used                                            | `hx` or `hz`                                       |
-| `decoding.device.device_type`       | Type of the device where the decoding will happen                                       | `cpu` or `cuda`                                       |
+| `decoding.device.device_type`       | Type of the device where the decoding will happen. Without it, `cuda` if available, else `cpu`. A device that is unknown or unavailable falls back the same way, with a warning. `mps` (Apple GPU) runs the PyTorch module and needs `dtype` other than `float64`; `mps` with `float64` falls back to `cpu`, with a warning. | `cpu`, `cuda` or `mps`                                       |
 | `decoding.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
 | `decoding.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 | `decoding.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device, skipping the fused-CUDA-kernel port | `false`                  |

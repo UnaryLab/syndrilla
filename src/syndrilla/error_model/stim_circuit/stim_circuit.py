@@ -2,7 +2,7 @@ import torch
 from loguru import logger
 
 from syndrilla.interface.stim.stim import get_stim_circuit
-from syndrilla.utils import build_rate_sweep, dataset, is_rate_range
+from syndrilla.utils import build_rate_sweep, dataset, is_rate_range, parse_device_dtype
 
 # Every noise knob `stim.Circuit.generated` accepts. Kept in one place so the sweep
 # scales exactly the keys the circuit was built with and invents none.
@@ -55,24 +55,7 @@ class create:
         circuit = get_stim_circuit(circuit_str=circuit_str)
 
         # device
-        device_cfg = error_model_cfg.get("device", {})
-        self.device = device_cfg.get(
-            "device_type",
-            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        )
-        if self.device not in {
-            "cuda",
-            "cpu",
-            torch.device("cuda"),
-            torch.device("cpu"),
-        }:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.device == "cuda":
-            device_idx = device_cfg.get("device_idx", 0)
-            if device_idx >= torch.cuda.device_count():
-                self.device = torch.device("cuda:0")
-            else:
-                self.device = torch.device(f"cuda:{device_idx}")
+        self.device, _ = parse_device_dtype(error_model_cfg)
 
         self.number_channel = error_model_cfg.get("number_channel", 1)
 

@@ -176,7 +176,7 @@ class create(nn.Module):
 
         logger.info("Creating saq decoder.")
 
-        self.device, _ = parse_device_dtype(decoding_cfg)
+        self.device, _ = parse_device_dtype(decoding_cfg, default_dtype="float32")
         self.dtype = decoding_cfg.get("dtype", "float32")
         if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
             logger.warning(

@@ -25,8 +25,9 @@ The following table details the configuration parameters used in the BSC error Y
 |-----------------------------|------------------------------------------------------------------------------------------------------|------------------|
 | `error.model`               | Type of error model applied to data qubits                                                           | `bsc`            |
 | `error.number_channel`      | Number of error channels (1 for pure bit-flip, 2 for independent X/Z channels)                       | `1` or `2`       |
-| `error.device.device_type`  | Type of the device where the error injection will happen                                             | `cpu` or `cuda`  |
+| `error.device.device_type`  | Type of the device where the error injection will happen. Without it, `cuda` if available, else `cpu`; an unknown or unavailable device falls back the same way, with a warning. `mps` also needs `error.dtype` set to `float16`, `bfloat16` or `float32`; otherwise it falls back to `cpu`, with a warning. | `cpu`, `cuda` or `mps`  |
 | `error.device.device_idx`   | Index of the device where the error injection will happen. Only used when `device_type = cuda`.      | `0`              |
+| `error.dtype`               | Read only to decide device placement: `mps` keeps `float16`, `bfloat16` or `float32`; any other value, including the default `float64`, falls back to `cpu` with a warning. Match the decoder's `dtype`. | `float64`        |
 | `error.rate`                | Physical bit-flip probability applied to each data qubit. A training run may sweep it, see §2         | `0.1`            |
 
 In 1-channel mode, each qubit is flipped independently with probability `rate`, and the LLR prior is `log((1 - rate) / rate)`.
@@ -80,8 +81,9 @@ The following table details the configuration parameters used in the depolarizin
 | Key                         | Description                                                                                     | Example          |
 |-----------------------------|-------------------------------------------------------------------------------------------------|------------------|
 | `error.model`               | Type of error model applied to data qubits                                                      | `depol`          |
-| `error.device.device_type`  | Type of the device where the error injection will happen                                        | `cpu` or `cuda`  |
+| `error.device.device_type`  | Type of the device where the error injection will happen. Without it, `cuda` if available, else `cpu`; an unknown or unavailable device falls back the same way, with a warning. `mps` also needs `error.dtype` set to `float16`, `bfloat16` or `float32`; otherwise it falls back to `cpu`, with a warning. | `cpu`, `cuda` or `mps`  |
 | `error.device.device_idx`   | Index of the device where the error injection will happen. Only used when `device_type = cuda`.| `0`              |
+| `error.dtype`               | Read only to decide device placement: `mps` keeps `float16`, `bfloat16` or `float32`; any other value, including the default `float64`, falls back to `cpu` with a warning. Match the decoder's `dtype`. | `float64`        |
 | `error.rate`                | Total single-qubit depolarizing probability; split equally as X/Y/Z each at `rate/3`. A training run may sweep it, see §2 | `0.05`           |
 
 The Pauli priors passed to the decoder are `(p_I, p_X, p_Y, p_Z) = (1 - rate, rate/3, rate/3, rate/3)`.
@@ -109,7 +111,7 @@ The following table details the configuration parameters used in the stim error 
 | `error.before_round_data_depolarization` | Depolarizing noise applied to data qubits before each syndrome round        | `0.1`            |
 | `error.before_measure_flip_probability`  | (optional) Bit-flip noise applied before each measurement. Not in the shipped example; `syndrome.measurement_error_rate` overrides it, with a warning | `0.1` |
 
-The four noise rates are read by the **interface** when it builds the circuit, not by this error model, which reads only `circuit`, `device`, `number_channel` and an optional `rate`. A stim error YAML is therefore usable only together with `-i`; pointing `-e` at one without `-i` fails. The rates apply only when the circuit is generated from `interface.code`/`interface.distance`: a circuit supplied through `interface.circuit` carries its own noise and these rates are ignored.
+The four noise rates are read by the **interface** when it builds the circuit, not by this error model. The interface also builds this model's own config: the generated `circuit`, `number_channel` and an optional `rate` from the error YAML, and `device` copied from the decoding YAML's `device` block (an `error.device` block is not read). The interface does not forward `error.dtype`, so this model always resolves `float64`: with a decoder on `mps` it stays on `cpu`, with a warning. A stim error YAML is therefore usable only together with `-i`; pointing `-e` at one without `-i` fails. The rates apply only when the circuit is generated from `interface.code`/`interface.distance`: a circuit supplied through `interface.circuit` carries its own noise and these rates are ignored.
 
 For each error mechanism `i` in the DEM with probability `p_i`, the LLR prior passed to the decoder is `log((1 - p_i) / p_i)`, and `inject_error` flips mechanism `i` with probability `p_i`. The draw uses torch rather than stim's own DEM sampler, so it follows the global torch RNG; the two are equivalent, since a DEM's mechanisms are independent Bernoulli draws either way.
 

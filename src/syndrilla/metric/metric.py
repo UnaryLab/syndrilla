@@ -253,6 +253,13 @@ _TRAIN_YAML_SETUP = {
 }
 
 
+def _same_setting(key, saved, now):
+    """Whether a fingerprint field matches; device <cuda> and <cuda:0> are the same."""
+    if key == "device":
+        saved, now = ("cuda:0" if v == "cuda" else v for v in (saved, now))
+    return saved == now
+
+
 def _yaml_train_setup(path):
     """Read a training run's `-ckpt` result yaml back as fingerprint fields."""
     with open(path, "r") as f:
@@ -1138,7 +1145,7 @@ class MetricState:
             f"{key}: checkpoint <{saved[key] if key in saved else 'not recorded'}> "
             f"vs now <{value}>"
             for key, value in fields.items()
-            if saved.get(key) != value
+            if not _same_setting(key, saved.get(key), value)
         ]
         if changed:
             raise ValueError(

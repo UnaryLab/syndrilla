@@ -12,18 +12,50 @@ from loguru import logger
 from yamlordereddictloader import SafeDumper, SafeLoader
 
 
-def parse_device_dtype(cfg):
-    """Resolve (device, dtype) from a decoder/interface cfg dict."""
-    device_cfg = cfg.get("device", {})
-    device_type = device_cfg.get(
-        "device_type", "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    if device_type == "cuda" and torch.cuda.is_available():
-        device = torch.device(f"cuda:{device_cfg.get('device_idx', 0)}")
-    else:
-        device = torch.device("cpu")
-    dtype = torch.__dict__[cfg.get("dtype", "float64")]
-    return device, dtype
+def parse_device_dtype(cfg, default_dtype="float64"):
+    """Resolve (device, dtype) from a module cfg dict holding a <device> block and <dtype>.
+
+    <device_type> is cuda, mps or cpu; without it the device is cuda if available, else
+    cpu. A device that is unknown or unavailable warns and falls back the same way. cuda
+    resolves to cuda:<device_idx>, or cuda:0 with a warning when the index is out of
+    range. mps with float64 warns and falls back to cpu, since mps has no float64. A
+    <dtype> outside float16, bfloat16, float32 and float64 (the set the decoders accept)
+    warns and resolves to float64.
+    """
+    device_cfg = cfg.get("device") or {}
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dtype_name = str(cfg.get("dtype", default_dtype))
+    if dtype_name not in {"float32", "float64", "bfloat16", "float16"}:
+        logger.warning(f"Invalid input data type <{dtype_name}>, default to <torch.float64>.")
+        dtype_name = "float64"
+    dtype = getattr(torch, dtype_name)
+
+    device_type = str(device_cfg.get("device_type", default_device))
+    available = {
+        "cpu": True,
+        "cuda": torch.cuda.is_available(),
+        "mps": torch.backends.mps.is_available(),
+    }
+    if not available.get(device_type, False):
+        logger.warning(
+            f"Invalid or unavailable input device <{device_type}>, default to <{default_device}>."
+        )
+        device_type = default_device
+
+    if device_type == "mps" and dtype == torch.float64:
+        logger.warning("Device <mps> does not support <float64>, default to <cpu>.")
+        device_type = "cpu"
+    if device_type != "cuda":
+        return torch.device(device_type), dtype
+
+    device_idx = device_cfg.get("device_idx", 0)
+    if device_idx >= torch.cuda.device_count():
+        logger.warning(
+            f"Invalid input device index <{device_idx}>, default to <cuda:0>."
+        )
+        device_idx = 0
+    return torch.device(f"cuda:{device_idx}"), dtype
 
 
 def is_rate_range(rate) -> bool:
