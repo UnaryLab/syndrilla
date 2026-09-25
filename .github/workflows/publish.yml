@@ -42,8 +42,8 @@ jobs:
         with:
           # Build with the minimum supported Python so the resulting
           # sdist/wheel can't accidentally use a newer-only syntax
-          # feature. Per `requires-python = ">=3.9"` in pyproject.toml.
-          python-version: "3.9"
+          # feature. Per `requires-python = ">=3.10"` in pyproject.toml.
+          python-version: "3.10"
           cache: pip
 
       - name: Install build backend
