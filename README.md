@@ -433,7 +433,7 @@ decoder_full:
   total time (s): '7.14058201313018799e+01'
   H matrix: /home/ya212494/code/syndrilla/examples/alist/surface/surface_10_hx.alist
   hx:
-    logical error rate: 5.78029411764705681e-01
+    logical error rate: 5.92352941176471030e-03
 ```
 
 The block above is abridged: a real result file also carries `sample count` and `iteration count` for every decoder, and its numbers reflect whichever batch size and error rate the run actually used.
@@ -475,7 +475,7 @@ The following table provides a detailed explanation of the metrics in the output
 | `target error reached`         | Actual number of logical errors observed                       |
 | `data type`                    | Floating point data used                                       |
 | `physical error rate`          | Physical error rate                                            |
-| `logical error rate`           | Logical error rate across all samples             |
+| `logical error rate`           | Logical error rate of the final decoder in the chain across all samples |
 | `total time (s)`               | Total simulation time across all batches in seconds            |
 
 *Note that the time metric here only considers the decoding time.*

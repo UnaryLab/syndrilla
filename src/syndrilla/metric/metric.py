@@ -362,7 +362,8 @@ class MetricState:
             average_time_sample = total_time / sample_size
             logger.info(f"Average time per sample: {average_time_sample} seconds.")
 
-            average_time_sample_iter = (average_time_sample / average_iter).item()
+            # a chained decoder invoked on no samples runs 0 iterations
+            average_time_sample_iter = (average_time_sample / average_iter).item() if average_iter else 0.0
             logger.info(f"Average time per iteration: {average_time_sample_iter}")
 
         if torch.isinf(torch.sum(converge)) or torch.isnan(torch.sum(converge)):
@@ -642,10 +643,11 @@ class MetricState:
         all_metrics_results = {}
         total_time_sum = 0.0
         all_check_types = ["hx", "hz"]
-        final_list = []
 
         for i, decoder_metrics in enumerate(out_dict):
             decoder_key = f"decoder_{i}"
+            # decoder_full reports the last decoder in the chain
+            final_list = []
             raw_dist = decoder_metrics["distribution"].int().cpu()
             iteration_count = raw_dist.numpy().tolist()
 
