@@ -41,7 +41,7 @@ A `config` written as a plain mapping, as above, is the settings of the block's 
 
 A key written in the wrong half is **rejected, not ignored**: `max_iter` left at the top level fails with a message naming `decoding.config`, and a framework-wide key such as `dtype` written inside `config` fails the same way in reverse. A decoder that quietly fell back to `max_iter: 50` instead of the configured `181` would still produce numbers, and they would look like results.
 
-**CUDA acceleration.** Every registered decoder **except `saq`** ships a CUDA-kernel implementation alongside its PyTorch/NumPy module (`saq` is a plain PyTorch model and runs on whatever device the config selects): the belief-propagation family (`bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp4`, `bp_sf`, `relay_bp`) plus `osd_0`, `mwpm`, and `union_find`. There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically when a CUDA-capable GPU is present and the kernel builds.
+**CUDA acceleration.** Every registered decoder **except `saq`, `bp_sum_prod`, and `bp_sum_prod_sc`** ships a CUDA-kernel implementation alongside its PyTorch/NumPy module (those three are plain PyTorch modules and run on whatever device the config selects): the belief-propagation family (`bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp4`, `bp_sf`, `relay_bp`) plus `osd_0`, `mwpm`, and `union_find`. There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically when a CUDA-capable GPU is present and the kernel builds.
 
 The kernels come in two flavors. The BP decoders use **fused per-iteration kernels** that vectorize the message-passing across the batch. The graph decoders `mwpm` and `union_find` are inherently sequential per shot, so their kernels parallelize over the **batch axis** (one CUDA thread decodes one shot), while `osd_0` runs one thread block per sample. For `osd_0`, `mwpm`, and `union_find` the CUDA output is **bit-for-bit identical** to the corresponding CPU implementation.
 
@@ -83,6 +83,8 @@ The following table lists every algorithm registered under `src/syndrilla/decode
 | `mwpm`                      | 1        | Minimum-Weight Perfect Matching (sparse-blossom). Graphlike codes only (every qubit column touches ≤2 checks) | PyMatching v2 sparse-blossom (Higgott & Gidney); clean-room PyTorch/NumPy transformation                     |
 | `union_find`                | 1        | Union-Find (Delfosse-Nickerson) cluster-growth + peeling decoder. Graphlike codes only (every qubit column touches at most 2 checks; weight-1 = open boundary, e.g. surface codes; weight-2 = toric) | Almost-linear-time decoding for topological codes (arXiv:1709.06218); port of chaeyeunpark/UnionFind         |
 | `saq`                       | 1        | Learned dual-stream transformer decoder plus CPND constraint projection. Single feed-forward pass; toric and rotated surface codes only; needs trained weights | SAQ: Stabilizer-Aware Quantum Error Correction Decoder (arXiv:2512.08914); port of DavidZenati/SAQ-Decoder |
+| `bp_sum_prod`               | 1        | Probability-domain sum-product BP (SPA) with the exact tanh-rule check-node update; deterministic reference for `bp_sum_prod_sc` | Gallager, Low-Density Parity-Check Codes (MIT Press, 1963); Factor Graphs and the Sum-Product Algorithm; On the Iterative Decoding of Sparse Quantum Codes |
+| `bp_sum_prod_sc`            | 1        | Bit-stream stochastic-computing sum-product BP with selectable hardware random-source models | -                                                                                                                                  |
 
 ### 3.1. Decoders using only the common configuration
 `bp_norm_min_sum` and `osd_0` introduce no algorithm-specific fields beyond Section 1 and `decoding.config.max_iter`.
@@ -394,6 +396,66 @@ The SF stage is configured by a nested `sf` block under `decoding.config`.
 | `decoding.config.sf.n_sample`     | Maximum combinations sampled per weight                                  | `0`       |
 
 `w_max` below `w_min` disables SF with a warning, so the defaults leave the decoder as plain normalized min-sum BP.
+
+### 3.13. bp_sum_prod
+Probability-domain sum-product BP (SPA). It matches `bp_norm_min_sum` except at the check node, which applies the exact syndrome-folded tanh rule with no normalization factor. It is the deterministic reference for the equations that `bp_sum_prod_sc` approximates with stochastic logic. Probabilities are clamped to [1e-12, 1 - 1e-12] to keep the probability-LLR maps finite. Example configuration (`bp_sum_prod_hx.decoding.yaml`):
+
+```
+decoding:
+  algorithm: bp_sum_prod
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    max_iter: 181
+```
+
+| Key                              | Description                                                              | Default   |
+|----------------------------------|--------------------------------------------------------------------------|-----------|
+| `decoding.config.max_iter`        | Maximum BP iterations                                                    | `50`      |
+
+### 3.14. bp_sum_prod_sc
+Bit-stream stochastic-computing (SC) sum-product BP. Each edge carries one Bernoulli bit per decoding cycle: check nodes are XOR gates folded with the syndrome, and variable nodes are equality logic whose hold state is resolved by a per-variable up/down saturating counter. The counter starts from the channel prior and its midpoint gives the hard decision. Example configuration (`bp_sum_prod_sc_hx.decoding.yaml`):
+
+```
+decoding:
+  algorithm: bp_sum_prod_sc
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    max_iter: 256
+    counter_width: 8
+    random_machine: system
+```
+
+| Key                                     | Description                                                              | Default   |
+|-----------------------------------------|--------------------------------------------------------------------------|-----------|
+| `decoding.config.max_iter`              | Decoding-cycle budget, equal to the bit-stream length. The hard decision flips only after the per-variable counter crosses its midpoint, moving at most one step per cycle, so max_iter must exceed 2^(`counter_width`-1) by a margin; the floor grows exponentially in `counter_width`. | `50`      |
+| `decoding.config.counter_width`         | Bit width of the per-variable up/down saturating counter                 | `8`       |
+| `decoding.config.random_machine`        | Random source for the Bernoulli streams: `system`, `sobol`, `smtj`, `ro`, `latch`, or `memristor` | `system`  |
+| `decoding.config.sobol_dim`             | `sobol`: which Sobol dimension (1-indexed) supplies the shared sequence, as in napl's encoder (integer in 1..21201) | `1`       |
+| `decoding.config.smtj_rho`              | `smtj`: lag-1 correlation rho of the MTJ state between cycles            | `0.5`     |
+| `decoding.config.ro_q`                  | `ro`: phase-noise variance Q per cycle                                   | `0.012`   |
+| `decoding.config.ro_nu`                 | `ro`: deterministic phase drift nu per cycle                             | `0.0`     |
+| `decoding.config.ro_bits`               | `ro`: comparator width k (fair bits per output bit)                      | `8`       |
+| `decoding.config.latch_offset_sigma`    | `latch`: standard deviation of the static per-site offset d             | `0.1`     |
+| `decoding.config.memristor_tau_sigma`   | `memristor`: log-normal spread sigma_log of the per-site switching time constant | `0.0`     |
+
+The `smtj` states x and `ro` phases reset at the start of each decode, and the channel streams and the edge streams keep separate state. The `latch` offsets d and `memristor` draws g are drawn once per decoder instance, like fixed hardware. An invalid or non-string `random_machine` logs a warning and falls back to `system`. The source parameters are validated: `sobol_dim` an integer in 1..21201, `smtj_rho` in [0, 1), `ro_q` >= 0, `ro_bits` an integer in 1..24, `latch_offset_sigma` >= 0, and `memristor_tau_sigma` >= 0; an invalid value logs a warning and uses the default.
+
+#### Random sources
+Each model turns a target probability p into one bit per stream per cycle. `smtj`, `latch`, and `memristor` emit Bernoulli(p) bits directly, while `ro` emits fair bits that a comparator converts to p.
+
+- `system` / `sobol`: draw a uniform u and emit bit = 1[u < p]. `system` draws an independent u per stream from `torch.rand`. `sobol` precomputes L = 2^ceil(log2(`max_iter`)) points of dimension `sobol_dim` of an unscrambled Sobol sequence, as in napl's encoder (github.com/UnaryLab/napl, commit 9a4a2ef, src/napl/module/encoder.py, the Sobol draw in gen_num_seq, lines 71-72). Torch builds all `sobol_dim` dimensions to select one, about 350 MB at `sobol_dim` = 21201 with L = 2048. At decoding cycle t every stream of both sites (channel and edge) uses the same value u_t, so at each cycle all streams are driven by one uniform: streams with equal p emit identical bits, and streams with different p are comonotonically (maximally) correlated rather than independent. All streams sharing one uniform per cycle is an extreme case of the RNG sharing in SC decoder hardware (Wu et al., TCAS-II 2016, Fig. 3, 64 LFSRs for 2048 variable nodes). Two decodes of the same syndrome are identical. The first unscrambled point is 0, so at cycle 1 every stream with p > 0 emits 1.
+- `smtj`: superparamagnetic-MTJ p-bit, modeled as a sampled two-state Markov chain. Each stream holds a state x, initialized as x ~ Bernoulli(p). The next bit is x' = 1[u < p + (x - p) * rho] with rho = exp(-T/tau_c), which gives stationary mean p and lag-1 correlation rho. This is the exp(-(r01 + r10)T) correlation of Vodenicarevic et al. 2017 (Phys. Rev. Applied 8, 054045, Sec. III) and the two-state model of Daniels et al. 2020 (Phys. Rev. Applied 13, 034016); the tunable p-bit follows Camsari et al. 2017 (Phys. Rev. X 7, 031014, Eq. 1). p changes every cycle, and the model assumes the device follows p within one cycle.
+- `ro`: ring-oscillator jitter TRNG plus a k-bit comparator. Each stream holds k phases phi, initialized uniform on [0, 1). Per cycle phi <- phi + nu + sqrt(Q) * z with z ~ N(0, 1), and each fair bit is 1[frac(phi) >= 1/2]. This is the Wiener-process phase model of Baudet et al. 2011 (J. Cryptology 24:398-425, Eq. 1) with Q = sigma^2 dt and nu = mu dt; Q = 0.012 is their measured value on Stratix II (Table 1). The k fair bits form an integer R in [0, 2^k), and the output is 1[R < floor(p * 2^k)], the weighted-binary SNG of Luo et al. 2025 (Supercond. Sci. Technol., "True stochastic number generator using AQFP logic", p = B/2^k). `ro_q`, `ro_nu`, and `ro_bits` set Q, nu, and k. In this model the fair-bit lag-1 autocorrelation is positive at `ro_nu` = 0 and negative near 0.5 (about +0.65 and -0.65 at Q = 0.012); Baudet et al. 2011 Table 1 reports -0.75 at Q = 0.012.
+- `latch`: metastable latch or gray-zone comparator with a static per-site offset. The bit is 1[z < Phi^-1(p) + d] with z ~ N(0, 1), so P(1) = Phi(Phi^-1(p) + d). The offset d ~ N(0, `latch_offset_sigma`) is drawn once per hardware site per decoder and shared across the batch and across decodes. The model follows Ben Romdhane 2014 (PhD thesis, Telecom ParisTech, Eq. 3.15, p_Q = 1/2 [1 - erf((dt - Tsetup0) / (sigma sqrt 2))]), which reports a die-to-die spread of 46.77-55.72% ones at the best setting (Table 4.7); the Josephson comparator TRNG of Sugiura et al. 2011 (IEEE TASC 21(3), Fig. 2) has the same erf-shaped gray zone. The default 0.1 matches the Table 4.7 spread (ndtri(0.5572) = 0.14, ndtri(0.4677) = -0.08). There is no drift term.
+- `memristor`: pulse-programmed memristor with Poisson switching, following Gaba et al. 2013 (Nanoscale 5, 5872, Eq. 2): P(switch in a pulse of length t) = 1 - exp(-t/tau). The target p sets the pulse length through t/tau_nom = -ln(1 - p). Each hardware site has a static tau_site = tau_nom * exp(sigma_log * g) with g ~ N(0, 1), drawn once per decoder and shared across the batch and across decodes, so the bit is 1[u < 1 - (1 - p)^(tau_nom/tau_site)]. The paper reports no device spread, so `memristor_tau_sigma` (sigma_log) has no published value; sigma_log = 0 is equivalent to `system`. The modeled non-volatile Ag/a-Si device of Gaba et al. 2013 is reset to OFF after every trial (Fig. 2c/2e, Methods). The volatile diffusive-memristor TRNG of Jiang et al. 2017 (Nat. Commun. 8, 882) needs no reset but reports 6 kb/s (Methods: 300 us pulses at 1 kHz, 6 low-order bits) and endurance about 10^7 cycles with stuck-ON failure (Discussion).
 
 ## 4. Adaptive iteration speedup (`rebatch_speedup`)
 An opt-in, per-decoder block consumed by the iterative BP decoders `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp4`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, and `relay_bp` and by `bp_branch_assisted` on its CUDA path only (other algorithms, e.g. `bp_sf` and `osd_0`, ignore it). It reduces decoding **time** by stopping a batch once a warm-up-learned fraction of samples has converged and deferring the unconverged tail to be re-decoded uncapped.

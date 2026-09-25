@@ -1,0 +1,18 @@
+decoding:
+  algorithm: bp_sum_prod_sc
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    max_iter: 256
+    counter_width: 8
+    random_machine: system
+    # smtj_rho: 0.5
+    # ro_q: 0.012
+    # ro_nu: 0.0
+    # ro_bits: 8
+    # latch_offset_sigma: 0.1
+    # memristor_tau_sigma: 0.0
+    # sobol_dim: 1   # sobol: which Sobol dimension (1-indexed) supplies the one value all streams share per cycle
