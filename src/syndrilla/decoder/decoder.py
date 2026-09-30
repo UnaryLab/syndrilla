@@ -422,46 +422,26 @@ def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):
 
 def _create_one_decoder(dec_cfg: dict, header: str, func_name: str, **kwargs):
     """Instantiate one decoder, picking the CUDA kernel implementation when the config
-    asks for a CUDA device and one is available.
+    asks for a CUDA device.
     """
     algo = dec_cfg[func_name].lower()
     device_type = (dec_cfg.get("device") or {}).get("device_type", "cpu")
     force_pytorch = dec_cfg.get("force_pytorch", False)
-    cuda_error = None
 
     if device_type == "cuda" and not force_pytorch:
         decoder_dir = os.path.dirname(__file__)
         cuda_file = os.path.join(decoder_dir, algo, f"{algo}_cuda.py")
-        if os.path.isfile(cuda_file) and not torch.cuda.is_available():
-            # parse_device_dtype in the PyTorch module resolves cuda to cpu here.
-            logger.warning(
-                f"CUDA is unavailable: decoder <{algo}> falls back to the PyTorch "
-                "module on <cpu>."
+        if os.path.isfile(cuda_file):
+            spec = importlib.util.spec_from_file_location(
+                f"create_{header}_with_{algo}_cuda", cuda_file
             )
-        elif os.path.isfile(cuda_file):
-            # Every _cuda class builds its kernel in __init__, so a failed import, build,
-            # or instantiation all raise here.
-            try:
-                spec = importlib.util.spec_from_file_location(
-                    f"create_{header}_with_{algo}_cuda", cuda_file
-                )
-                module_py = importlib.util.module_from_spec(spec)
-                sys.modules[spec.name] = module_py
-                spec.loader.exec_module(module_py)
-                return module_py.create(dec_cfg, **kwargs)
-            except Exception as e:
-                first_line = (str(e).splitlines() or [""])[0]
-                cuda_error = f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__
+            module_py = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module_py
+            spec.loader.exec_module(module_py)
+            return module_py.create(dec_cfg, **kwargs)
 
-    # CPU device, CUDA unavailable, failed CUDA kernel, or no CUDA kernel port for this
-    # algorithm: the torch module runs on whatever device the config selects (it is
-    # device-agnostic).
-    decoder = call_func_from_cfg(
+    # CPU device, or no CUDA kernel port for this algorithm: the torch module runs
+    # on whatever device the config selects (it is device-agnostic).
+    return call_func_from_cfg(
         dec_cfg, header, func_name, os.path.dirname(__file__), **kwargs
     )
-    if cuda_error is not None:
-        logger.warning(
-            f"CUDA kernel for decoder <{algo}> failed ({cuda_error}): falls back to the "
-            f"PyTorch module on <{decoder.device}>."
-        )
-    return decoder
