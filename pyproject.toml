@@ -31,6 +31,10 @@ dependencies = [
     "torch>=2.0"
 ]
 
+[project.optional-dependencies]
+dev = ["pytest", "ninja"]
+stim = ["stim"]
+
 # Map script name to the main entry point (syndrilla/main.py -> main())
 [project.scripts]
 syndrilla = "syndrilla.main:main"
