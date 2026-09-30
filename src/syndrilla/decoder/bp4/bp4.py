@@ -124,8 +124,6 @@ class create(torch.nn.Module):
 
         self.batch_size, self.number_channel, _ = syndrome.size()
 
-        torch.set_default_dtype(self.dtype)
-
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
         self.N_extended = self.H_shape[1] + 1
         l_v = torch.zeros(

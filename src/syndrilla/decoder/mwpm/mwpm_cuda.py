@@ -92,7 +92,7 @@ class create(_MwpmPy):
         self.M = self.matcher.M
         self.N = self.matcher.N
         self._use_kernel = self.N <= 64 * _OBSW
-        self._H_np = np.asarray(self.H_matrix.detach().cpu().numpy()).astype(np.uint8)
+        self._V_c_col_np = self.V_c_col.detach().cpu().numpy()  # [M, D], padded with dummy column N
         if not self._use_kernel:
             logger.warning(
                 f"mwpm_cuda: N={self.N} > 64*OBSW={64 * _OBSW}; falling back to the CPU "
@@ -184,7 +184,7 @@ class create(_MwpmPy):
                             mef[bi], met[bi], menum[bi]
                         )
             bad_err = np.nonzero(err != 0)[0]
-            pred = (e_v.astype(np.int64) @ self._H_np.T.astype(np.int64)) & 1  # [B, M]
+            pred = np.pad(e_v, ((0, 0), (0, 1)))[:, self._V_c_col_np].sum(axis=2) & 1  # [B, M]
             bad_inv = np.nonzero((pred.astype(np.uint8) != synd_np).any(axis=1))[0]
             bad = np.union1d(bad_err, bad_inv)
             if bad.size:

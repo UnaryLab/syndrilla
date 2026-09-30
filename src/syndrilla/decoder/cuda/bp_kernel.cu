@@ -3,11 +3,16 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <climits>
 
 #define THREADS 256
 
-static inline int grid1d(int n) {
-    return (n + THREADS - 1) / THREADS;
+static inline int grid1d(int64_t n) {
+    const int64_t blocks = (n + THREADS - 1) / THREADS;
+    TORCH_CHECK(blocks <= INT_MAX, "launch needs ", blocks, " blocks of ", THREADS,
+                " threads for ", n, " elements, above the gridDim.x limit of ", INT_MAX,
+                "; reduce the batch size");
+    return (int)blocks;
 }
 
 // Every kernel indexes raw data pointers assuming row-major contiguous layout.
@@ -24,18 +29,18 @@ __global__ void k_init_messages(
     scalar_t*       __restrict__ a_v2c,    // [B, M, D]  — output
     int B, int M, int D, int N             // N = H_shape[1], not N_ext
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * M * D) return;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * M * D) return;
 
-    int k = idx % D;
-    int c = (idx / D) % M;
-    int b = idx / (D * M);
+    int k = (int)(idx % D);
+    int c = (int)((idx / D) % M);
+    int b = (int)(idx / ((int64_t)D * M));
 
     int n     = (int)V_c_col[c * D + k];
     int N_ext = N + 1;
     // Dummy edges (n == N) are zeroed so they don't perturb the CN update.
-    a_v2c[b * M * D + c * D + k] =
-        (n < N) ? u_init[b * N_ext + n] : (scalar_t)0;
+    a_v2c[(int64_t)b * M * D + c * D + k] =
+        (n < N) ? u_init[(int64_t)b * N_ext + n] : (scalar_t)0;
 }
 
 template <typename scalar_t>
@@ -46,21 +51,21 @@ __global__ void k_vn_update(
     scalar_t*       __restrict__ a_v2c,    // [B, M, D]   — output
     int B, int M, int D, int N
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * M * D) return;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * M * D) return;
 
-    int k = idx % D;
-    int c = (idx / D) % M;
-    int b = idx / (D * M);
+    int k = (int)(idx % D);
+    int c = (int)((idx / D) % M);
+    int b = (int)(idx / ((int64_t)D * M));
 
     int n = (int)V_c_col[c * D + k];
     if (n >= N) {
-        a_v2c[b * M * D + c * D + k] = (scalar_t)0;
+        a_v2c[(int64_t)b * M * D + c * D + k] = (scalar_t)0;
         return;
     }
     int N_ext = N + 1;
-    a_v2c[b * M * D + c * D + k] =
-        l_v[b * N_ext + n] - b_c2v[b * M * D + c * D + k];
+    a_v2c[(int64_t)b * M * D + c * D + k] =
+        l_v[(int64_t)b * N_ext + n] - b_c2v[(int64_t)b * M * D + c * D + k];
 }
 
 template <typename scalar_t>
@@ -72,12 +77,12 @@ __global__ void k_cn_update(
     double beta,
     int B, int M, int D, int N
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * M) return;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * M) return;
 
-    int c    = idx % M;
-    int b    = idx / M;
-    int base = b * M * D + c * D;
+    int c    = (int)(idx % M);
+    int b    = (int)(idx / M);
+    int64_t base = (int64_t)b * M * D + c * D;
 
     // Minima are tracked in scalar_t, NOT double — see precision note above.
     scalar_t sign_prod = (scalar_t)1;
@@ -97,7 +102,7 @@ __global__ void k_cn_update(
         else if (absval < min1) { min1 = absval; }
     }
 
-    scalar_t s_neg       = syndrome_neg_bc[b * M + c];
+    scalar_t s_neg       = syndrome_neg_bc[(int64_t)b * M + c];
     scalar_t scaled_beta = (scalar_t)beta;
 
     for (int k = 0; k < D; k++) {
@@ -127,11 +132,11 @@ __global__ void k_llr_update(
     scalar_t*       __restrict__ l_v,       // [B, N_ext]  — output
     int B, int M, int D, int N_ext, int VD
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * N_ext) return;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * N_ext) return;
 
-    int n = idx % N_ext;
-    int b = idx / N_ext;
+    int n = (int)(idx % N_ext);
+    int b = (int)(idx / N_ext);
 
     // Sum the edge messages FIRST, then add the channel LLR last — this matches
     // the PyTorch reference's association l_v = u_init + scatter_add(b_c2v).
@@ -143,19 +148,19 @@ __global__ void k_llr_update(
         int c = (int)VN_adj_c[n * VD + vd];
         if (c < 0) break;                           // hit padding sentinel
         int k = (int)VN_adj_k[n * VD + vd];
-        acc += b_c2v[b * M * D + c * D + k];
+        acc += b_c2v[(int64_t)b * M * D + c * D + k];
     }
-    acc += u_init[b * N_ext + n];                   // channel LLR added last
-    l_v[b * N_ext + n] = acc;
+    acc += u_init[(int64_t)b * N_ext + n];          // channel LLR added last
+    l_v[(int64_t)b * N_ext + n] = acc;
 }
 
 template <typename scalar_t>
 __global__ void k_hard_decision(
     const scalar_t* __restrict__ l_v,  // [B, N_ext]
     scalar_t*       __restrict__ e_v,  // [B, N_ext]  — output
-    int total
+    int64_t total
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
     e_v[idx] = (l_v[idx] <= (scalar_t)0) ? (scalar_t)1 : (scalar_t)0;
 }
@@ -167,20 +172,20 @@ __global__ void k_syndrome_est(
     scalar_t*       __restrict__ s_est,    // [B, M]  — output
     int B, int M, int D, int N
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * M) return;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * M) return;
 
-    int c     = idx % M;
-    int b     = idx / M;
+    int c     = (int)(idx % M);
+    int b     = (int)(idx / M);
     int N_ext = N + 1;
     int parity = 0;
 
     for (int k = 0; k < D; k++) {
         int n = (int)V_c_col[c * D + k];
         // Dummy variable (n == N) always has e_v = 0 (l_v[N] = inf > 0).
-        if (n < N && e_v[b * N_ext + n] > (scalar_t)0.5f) parity ^= 1;
+        if (n < N && e_v[(int64_t)b * N_ext + n] > (scalar_t)0.5f) parity ^= 1;
     }
-    s_est[b * M + c] = (scalar_t)parity;
+    s_est[(int64_t)b * M + c] = (scalar_t)parity;
 }
 
 template <typename scalar_t>
@@ -202,13 +207,13 @@ __global__ void k_convergence_update(
 
     // Check all syndrome bits for this sample.
     for (int c = 0; c < M; c++) {
-        if (s_est[b * M + c] != syndrome[b * M + c]) return;
+        if (s_est[(int64_t)b * M + c] != syndrome[(int64_t)b * M + c]) return;
     }
 
     // All checks satisfied — record convergence and snapshot buffers.
     num_iters[b] = iter;
     converges[b] = 1;
-    int base = b * N_ext;
+    int64_t base = (int64_t)b * N_ext;
     for (int n = 0; n < N_ext; n++) {
         e_out[base + n] = e_v[base + n];
         l_out[base + n] = l_v[base + n];
@@ -259,8 +264,8 @@ __global__ void k_bp_nms_fused(
     scalar_t* mn0_s  = sp_s   + M;              // per-check smallest |a|
     scalar_t* mn1_s  = mn0_s  + M;              // per-check 2nd smallest |a|
 
-    const int bM  = b * M;
-    const int bNe = b * N_ext;
+    const int64_t bM  = (int64_t)b * M;
+    const int64_t bNe = (int64_t)b * N_ext;
     for (int i = tid; i < E; i += bsz) vcol_s[i] = (int32_t)V_c_col[i];
     for (int i = tid; i < A; i += bsz) {
         adjc_s[i] = (int32_t)VN_adj_c[i];
@@ -404,7 +409,7 @@ void init_messages_cuda(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         u_init.scalar_type(), "init_messages_cuda",
     [&]() {
-        k_init_messages<scalar_t><<<grid1d(B * M * D), THREADS, 0, stream>>>(
+        k_init_messages<scalar_t><<<grid1d((int64_t)B * M * D), THREADS, 0, stream>>>(
             u_init.data_ptr<scalar_t>(),
             V_c_col.data_ptr<int64_t>(),
             a_v2c.data_ptr<scalar_t>(),
@@ -427,7 +432,7 @@ void vn_update_cuda(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         l_v.scalar_type(), "vn_update_cuda",
     [&]() {
-        k_vn_update<scalar_t><<<grid1d(B * M * D), THREADS, 0, stream>>>(
+        k_vn_update<scalar_t><<<grid1d((int64_t)B * M * D), THREADS, 0, stream>>>(
             l_v.data_ptr<scalar_t>(),
             b_c2v.data_ptr<scalar_t>(),
             V_c_col.data_ptr<int64_t>(),
@@ -452,7 +457,7 @@ void cn_update_cuda(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         a_v2c.scalar_type(), "cn_update_cuda",
     [&]() {
-        k_cn_update<scalar_t><<<grid1d(B * M), THREADS, 0, stream>>>(
+        k_cn_update<scalar_t><<<grid1d((int64_t)B * M), THREADS, 0, stream>>>(
             a_v2c.data_ptr<scalar_t>(),
             syndrome_neg_bc.data_ptr<scalar_t>(),
             V_c_col.data_ptr<int64_t>(),
@@ -483,7 +488,7 @@ void llr_update_cuda(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         u_init.scalar_type(), "llr_update_cuda",
     [&]() {
-        k_llr_update<scalar_t><<<grid1d(B * N_ext), THREADS, 0, stream>>>(
+        k_llr_update<scalar_t><<<grid1d((int64_t)B * N_ext), THREADS, 0, stream>>>(
             u_init.data_ptr<scalar_t>(),
             b_c2v.data_ptr<scalar_t>(),
             VN_adj_c.data_ptr<int64_t>(),
@@ -499,7 +504,7 @@ void hard_decision_cuda(
     torch::Tensor e_v   // [B, N_ext]  — modified in-place
 ) {
     CHECK_INPUT(l_v); CHECK_INPUT(e_v);
-    int total = (int)l_v.numel();
+    int64_t total = l_v.numel();
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16,
@@ -527,7 +532,7 @@ void syndrome_est_cuda(
         at::ScalarType::Half, at::ScalarType::BFloat16,
         e_v.scalar_type(), "syndrome_est_cuda",
     [&]() {
-        k_syndrome_est<scalar_t><<<grid1d(B * M), THREADS, 0, stream>>>(
+        k_syndrome_est<scalar_t><<<grid1d((int64_t)B * M), THREADS, 0, stream>>>(
             e_v.data_ptr<scalar_t>(),
             V_c_col.data_ptr<int64_t>(),
             s_est.data_ptr<scalar_t>(),

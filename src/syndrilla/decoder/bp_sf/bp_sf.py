@@ -95,14 +95,24 @@ class create(torch.nn.Module):
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
         self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(
-            self.check_type
+            self.check_type, dense=False
         )
 
         self.mask_dummy = self.V_c_col == self.H_shape[1]
 
-        # dense parity-check matrix [M, N], used to compute the syndrome shift of a
-        # candidate flip set during SF post-processing.
-        self.H_dense = self.H_matrix.to(dtype=self.dtype).to(self.device)
+        # padded CSC [N, max column degree]: the checks on each variable, padded with
+        # the dummy check M; used to compute the syndrome shift of a candidate flip
+        # set during SF post-processing.
+        M, N = self.H_shape
+        edge = ~self.mask_dummy
+        rows, cols = self.V_c_row[edge], self.V_c_col[edge]
+        order = torch.argsort(cols, stable=True)
+        rows, cols = rows[order], cols[order]
+        counts = torch.bincount(cols, minlength=N)
+        start = torch.cumsum(counts, 0) - counts
+        self.V_v_row = torch.full([N, int(counts.max())], M, dtype=torch.long, device=cols.device)
+        self.V_v_row[cols, torch.arange(cols.numel(), device=cols.device) - start[cols]] = rows
+        self.V_v_row = self.V_v_row.to(self.device)
 
         # set iteration
         self.i = 0
@@ -154,7 +164,6 @@ class create(torch.nn.Module):
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
         llr0 = io_dict["llr0"].to(dtype=self.dtype).to(self.device)
         self.batch_size, _ = syndrome.size()
-        torch.set_default_dtype(self.dtype)
 
         # ---- pass 1: normalized min-sum BP, tracking oscillation counts ----
         e_out, l_out, converges, num_iters, osc = self._bp_core(
@@ -202,7 +211,7 @@ class create(torch.nn.Module):
 
         # check-grouped (-1)^syndrome term used by the check-node update
         syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(dtype)
-        self.syndrome_neg = syndrome_neg[:, self.V_c_row]
+        self.syndrome_neg = syndrome_neg.unsqueeze(2)
         self.batch_size = batch_size
 
         # oscillation tracking: prev hard decision and per-bit flip count
@@ -298,7 +307,10 @@ class create(torch.nn.Module):
         combo_mask = combo_mask[:, :topk]  # drop the sentinel column
 
         # syndrome shift per (sample, combo) = parity of the selected columns: [U, C, M]
-        Hcols = self.H_dense[:, cand]  # [M, U, topk]
+        M = self.H_shape[0]
+        Hcols = torch.zeros([U, topk, M + 1], dtype=self.dtype, device=self.device)
+        Hcols.scatter_(2, self.V_v_row[cand], 1.0)
+        Hcols = Hcols[:, :, :M].permute(2, 0, 1)  # H[:, cand]: [M, U, topk]
         shift = torch.einsum("muk,ck->ucm", Hcols, combo_mask).remainder(2.0)
         new_synd = (syndrome[unconv].unsqueeze(1) + shift).remainder(2.0)  # [U, C, M]
         M = new_synd.size(2)
@@ -352,9 +364,9 @@ class create(torch.nn.Module):
         Q_sign = self.syndrome_neg * sign_prod
 
         abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=2)
-        min_0 = sorted[:, :, 0].unsqueeze(2)
-        min_1 = sorted[:, :, 1].unsqueeze(2)
+        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
+        min_0 = mins[:, :, 0].unsqueeze(2)
+        min_1 = mins[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
         message = beta * sign * Q_sign * min_result
@@ -363,11 +375,10 @@ class create(torch.nn.Module):
 
     def c2v(self, b_c2v):
         data_flat = b_c2v.flatten(start_dim=1)
-        partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
         sum_b_c2v = torch.zeros(
             [self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device
         )
-        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
         return sum_b_c2v
 
     def llr_update(self, u_init, b_c2v):
@@ -382,4 +393,4 @@ class create(torch.nn.Module):
         temp_e = e_v
         temp_e[:, -1] = 0.0
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
-        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
+        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0).to(self.dtype)

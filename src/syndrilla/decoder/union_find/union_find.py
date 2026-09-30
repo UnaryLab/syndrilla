@@ -189,7 +189,7 @@ class Lattice:
     boundary_vertex: Optional[int] = None  # id M for surface, None for toric
 
 
-def build_lattice_from_parity(H) -> Lattice:
+def build_lattice_from_parity(rows, cols, M: int, N: int) -> Lattice:
     """Transformation of ``LatticeFromParity`` (single-shot constructor).
 
     The graph is loaded differently for the two code families, selected purely by
@@ -206,15 +206,15 @@ def build_lattice_from_parity(H) -> Lattice:
         never trigger the boundary branch and stay byte-identical.
 
     Columns of weight > 2 are non-graphlike and rejected.
-    """
-    H = np.asarray(H.todense() if hasattr(H, "todense") else H).astype(np.uint8)
-    M, N = H.shape
 
+    ``rows``/``cols`` are the nonzero (row, col) pairs of the M x N matrix H in
+    row-major order (rows ascending, cols ascending within a row), as given by a
+    coalesced sparse COO ``indices()``.
+    """
     # construct_qubit_associated_parities: rows per qubit, increasing row order.
     qubit_parities: List[List[int]] = [[] for _ in range(N)]
-    for p in range(M):
-        for q in np.nonzero(H[p])[0]:
-            qubit_parities[int(q)].append(p)
+    for p, q in zip(rows, cols):
+        qubit_parities[int(q)].append(int(p))
 
     weights = [len(qp) for qp in qubit_parities]
     if any(w > 2 for w in weights):
@@ -441,10 +441,9 @@ class create(torch.nn.Module):
             self.check_type
         )
 
-        H_np = np.asarray(self.H_matrix.detach().cpu().numpy()).astype(np.uint8)
-        self.M, self.N = H_np.shape  # M detector rows, N qubit columns
-
-        self.lattice = build_lattice_from_parity(H_np)
+        self.M, self.N = self.H_shape  # M detector rows, N qubit columns
+        rows, cols = self.H_matrix.indices().cpu().tolist()
+        self.lattice = build_lattice_from_parity(rows, cols, self.M, self.N)
         self.V = self.lattice.num_vertices
         self.boundary = self.lattice.boundary_vertex
         self.has_boundary = self.boundary is not None

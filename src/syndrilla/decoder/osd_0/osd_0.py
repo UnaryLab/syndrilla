@@ -7,7 +7,7 @@ from syndrilla.utils import parse_device_dtype
 class COOMatrixGF2Batch:
     def __init__(self, H: torch.Tensor, B: int):
         """
-        H: Dense GF(2) matrix of shape [M, N], dtype=torch.uint8 or torch.bool
+        H: GF(2) matrix of shape [M, N], dense or sparse COO, dtype=torch.uint8 or torch.bool
         B: Number of batches
         """
         assert H.dim() == 2, 'H must be a 2D matrix'
@@ -17,8 +17,12 @@ class COOMatrixGF2Batch:
         self.shape = (B, M, N)
         self.B = B
 
-        # Find non-zero positions
-        nz = H.nonzero(as_tuple=False)  # [nnz, 2], each row is [row, col]
+        # Find non-zero positions, row-major order for both layouts
+        if H.is_sparse:
+            H = H.coalesce()
+            nz = H.indices()[:, H.values().bool()].t()  # [nnz, 2], each row is [row, col]
+        else:
+            nz = H.nonzero(as_tuple=False)  # [nnz, 2], each row is [row, col]
         self.nnz = nz.size(0)
 
         # Repeat for all batches
@@ -554,7 +558,8 @@ class create(torch.nn.Module):
             rank (int): The rank of the input matrix over the finite field GF(2),
             determined using Gaussian elimination with XOR operations.
         """
-        mat = matrix.clone()
+        # ponytail: a sparse matrix is densified to a host bool copy, O(M*N) host memory per forward call; switch to sparse elimination if OSD is ever run at d>=15
+        mat = matrix.to_dense().cpu() if matrix.is_sparse else matrix.clone()
         n_rows, n_cols = mat.shape
         rank = 0
 

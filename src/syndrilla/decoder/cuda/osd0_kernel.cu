@@ -36,14 +36,14 @@ __global__ void k_osd0_fused(
     __syncthreads();
     for (int r = tid; r < M; r += bsz) {
         row_pcol[r] = -1;
-        if (synd[b * M + r]) aug[(size_t)r * W + wN] |= maskN;   // syndrome column
+        if (synd[(int64_t)b * M + r]) aug[(size_t)r * W + wN] |= maskN;   // syndrome column
     }
     __syncthreads();
 
     for (int ci = 0; ci < N; ci++) {
         if (s_found >= A_rank) break;            // full rank reached (uniform)
 
-        const int      c  = order[b * N + ci];
+        const int      c  = order[(int64_t)b * N + ci];
         const int      wc = c >> 6;
         const uint64_t mc = 1ULL << (c & 63);
 
@@ -70,12 +70,12 @@ __global__ void k_osd0_fused(
         __syncthreads();                          // single barrier, block-uniform
     }
 
-    for (int c = tid; c < N; c += bsz) e_out[b * N + c] = 0;
+    for (int c = tid; c < N; c += bsz) e_out[(int64_t)b * N + c] = 0;
     __syncthreads();
     for (int r = tid; r < M; r += bsz) {
         const int c = row_pcol[r];
         if (c != -1)
-            e_out[b * N + c] = (aug[(size_t)r * W + wN] & maskN) ? 1 : 0;
+            e_out[(int64_t)b * N + c] = (aug[(size_t)r * W + wN] & maskN) ? 1 : 0;
     }
 }
 
@@ -130,17 +130,17 @@ __global__ void k_osd_pivot(
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= B) return;
 
-    const int      c  = order[b * N + step];
+    const int      c  = order[(int64_t)b * N + step];
     const int      wc = c >> 6;
     const uint64_t mc = 1ULL << (c & 63);
     const uint64_t* A = aug + (size_t)b * M * W;
 
     int piv = -1;
     for (int r = 0; r < M; r++) {
-        if (row_pcol[b * M + r] == -1 && (A[(size_t)r * W + wc] & mc)) { piv = r; break; }
+        if (row_pcol[(int64_t)b * M + r] == -1 && (A[(size_t)r * W + wc] & mc)) { piv = r; break; }
     }
     pivot_row[b] = piv;
-    if (piv >= 0) row_pcol[b * M + piv] = c;
+    if (piv >= 0) row_pcol[(int64_t)b * M + piv] = c;
 }
 
 void osd_pivot_cuda(
@@ -171,16 +171,16 @@ __global__ void k_osd_eliminate(
     const int32_t*  __restrict__ pivot_row,  // [B]
     int B, int M, int W, int N, int step
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * M) return;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * M) return;
 
-    const int r = idx % M;
-    const int b = idx / M;
+    const int r = (int)(idx % M);
+    const int b = (int)(idx / M);
 
     const int piv = pivot_row[b];
     if (piv < 0 || r == piv) return;
 
-    const int      c  = order[b * N + step];
+    const int      c  = order[(int64_t)b * N + step];
     const int      wc = c >> 6;
     const uint64_t mc = 1ULL << (c & 63);
     uint64_t* A = aug + (size_t)b * M * W;
@@ -199,7 +199,7 @@ void osd_eliminate_cuda(
     const int W = (int)aug.size(2);
     if (B == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
-    k_osd_eliminate<<<(B * M + THREADS - 1) / THREADS, THREADS, 0, stream>>>(
+    k_osd_eliminate<<<(int)(((int64_t)B * M + THREADS - 1) / THREADS), THREADS, 0, stream>>>(
         reinterpret_cast<uint64_t*>(aug.data_ptr<int64_t>()),
         order.data_ptr<int32_t>(),
         pivot_row.data_ptr<int32_t>(),
@@ -216,19 +216,19 @@ __global__ void k_osd_solve(
     uint8_t*        __restrict__ e_out,     // [B, N]  pre-zeroed
     int B, int M, int W, int N
 ) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * M) return;
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int64_t)B * M) return;
 
-    const int r = idx % M;
-    const int b = idx / M;
+    const int r = (int)(idx % M);
+    const int b = (int)(idx / M);
 
-    const int c = row_pcol[b * M + r];
+    const int c = row_pcol[(int64_t)b * M + r];
     if (c == -1) return;
 
     const int      wN    = N >> 6;
     const uint64_t maskN = 1ULL << (N & 63);
     const uint64_t* A = aug + (size_t)b * M * W;
-    e_out[b * N + c] = (A[(size_t)r * W + wN] & maskN) ? 1 : 0;
+    e_out[(int64_t)b * N + c] = (A[(size_t)r * W + wN] & maskN) ? 1 : 0;
 }
 
 void osd_solve_cuda(
@@ -240,7 +240,7 @@ void osd_solve_cuda(
     const int W = (int)aug.size(2);
     if (B == 0) return;
     auto stream = at::cuda::getCurrentCUDAStream();
-    k_osd_solve<<<(B * M + THREADS - 1) / THREADS, THREADS, 0, stream>>>(
+    k_osd_solve<<<(int)(((int64_t)B * M + THREADS - 1) / THREADS), THREADS, 0, stream>>>(
         reinterpret_cast<const uint64_t*>(aug.data_ptr<int64_t>()),
         row_pcol.data_ptr<int32_t>(),
         e_out.data_ptr<uint8_t>(),

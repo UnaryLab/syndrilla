@@ -63,7 +63,7 @@ class create(torch.nn.Module):
         self.Hz_matrix = bundle.Hz_matrix
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type, dense=False)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
 
@@ -111,8 +111,6 @@ class create(torch.nn.Module):
 
         self.batch_size, _ = syndrome.size()
 
-        torch.set_default_dtype(self.dtype)
-
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
         N_extended = self.H_shape[1] + 1
         l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
@@ -129,12 +127,10 @@ class create(torch.nn.Module):
 
         # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
-        message = torch.zeros_like(self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
 
         # compute syndrome for multiplication
-        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
-        self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
+        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype).unsqueeze(2)
 
         logger.info('Complete.')
 
@@ -246,9 +242,9 @@ class create(torch.nn.Module):
 
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=2)
-        min_0 = sorted[:, :, 0].unsqueeze(2)
-        min_1 = sorted[:, :, 1].unsqueeze(2)
+        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
+        min_0 = mins[:, :, 0].unsqueeze(2)
+        min_1 = mins[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
         # quantization on both beta and min result computation before final multiplication
@@ -268,10 +264,9 @@ class create(torch.nn.Module):
         """
         # set up the format for both data and partition so they can matching each other
         data_flat = b_c2v.flatten(start_dim=1)
-        partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
         sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
 
-        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
         return sum_b_c2v
 
 
@@ -304,4 +299,4 @@ class create(torch.nn.Module):
         temp_e[:, -1] = 0.0
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
 
-        return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0)
+        return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0).to(self.dtype)

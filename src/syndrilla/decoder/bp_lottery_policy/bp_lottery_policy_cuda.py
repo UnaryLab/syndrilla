@@ -36,12 +36,6 @@ class create(_NmsCuda, _PolicyPy):
             )
             self.sign_flip_policy = "Proposed"
 
-        # Dense [M, N] parity matrix on-device — the inherited sign_flip_* methods
-        # index self.H_matrix (bp_norm_min_sum_cuda kept only V_c_col).
-        bundle = kwargs.get("bundle")
-        _, _, _, H_matrix = bundle.select(self.check_type)
-        self.H_matrix = H_matrix.to(self.device, self.dtype)
-
         self.algo = "bp_lottery_policy"
         logger.info(
             f"bp_lottery_policy_cuda ready (per-step path, policy={self.sign_flip_policy})."

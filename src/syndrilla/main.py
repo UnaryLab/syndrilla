@@ -261,8 +261,6 @@ def main():
             f"decoder <{decoders[0].algo}> decodes <{expected_channel}>. "
         )
     check_type = decoding_cfg.get("check_type", "hx")
-    shape, _, _, _ = bundle.Hx_matrix.get_index()
-    H_matrix = bundle.select(check_type)[3]
 
     algo_name = []
     num_max_iter = []
@@ -270,6 +268,8 @@ def main():
         decoder.eval()
         algo_name.append(decoder.algo)
         num_max_iter.append(getattr(decoder, "num_max_iter", 0))
+
+    shape, _, _, H_matrix = bundle.select(check_type, dense=False)
 
     H_file_name = bundle.get_H_file_name(check_type, number_channel)
     l_matrix = bundle.get_l_matrix(check_type, number_channel)

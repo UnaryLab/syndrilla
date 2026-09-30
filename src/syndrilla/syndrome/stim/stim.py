@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from loguru import logger
 
@@ -29,8 +30,13 @@ class create:
         self.path = "<inline>"
 
         H, obs_mat, _ = _build_dem_matrices(self.circuit)
-        self._H = torch.from_numpy(H)
-        self._L = torch.from_numpy(obs_mat)
+        H = H.tocoo()
+        self._H = torch.sparse_coo_tensor(
+            torch.from_numpy(np.vstack([H.row, H.col]).astype(np.int64)),
+            torch.from_numpy(H.data).to(torch.float32),
+            H.shape,
+        ).coalesce()
+        self._L = torch.from_numpy(obs_mat.toarray())
 
         self.num_detectors = self.circuit.num_detectors
         self.num_observables = self.circuit.num_observables
@@ -75,10 +81,10 @@ class create:
         # since a row sum counts at most the circuit's fault mechanisms and float32
         # represents every integer below 2^24 exactly
         e = error.to(dtype=torch.float32)
-        H = self._H.to(device=device, dtype=torch.float32)
+        H = self._H.to(device=device)
         L = self._L.to(device=device, dtype=torch.float32)
 
-        syndrome = ((e @ H.t()) % 2).to(torch.int64)
+        syndrome = (torch.sparse.mm(H, e.t()) % 2).t().contiguous().to(torch.int64)
         self.observable_flips = ((e @ L.t()) % 2).to(torch.uint8)
         self.syndrome_actual = syndrome
 

@@ -69,29 +69,21 @@ def _load_ext():
     return _EXT
 
 
-def _pack_H(H_np: np.ndarray, N: int, W: int) -> np.ndarray:
-    """Bit-pack a dense {0,1} [M, N] matrix into uint64 [M, W] (column N = syndrome,
-    left zero). Returns the int64 view so it can become a torch int64 tensor."""
-    M = H_np.shape[0]
+def _pack_H(rows: np.ndarray, cols: np.ndarray, M: int, W: int) -> np.ndarray:
+    """Bit-pack the {0,1} [M, N] matrix given by its nonzero (rows, cols) into uint64
+    [M, W] (column N = syndrome, left zero). Returns the int64 view so it can become a
+    torch int64 tensor."""
     packed = np.zeros((M, W), dtype=np.uint64)
-    rows, cols = np.nonzero(H_np)
     word = (cols >> 6).astype(np.int64)
     bit = (cols & 63).astype(np.uint64)
     np.bitwise_or.at(packed, (rows, word), (np.uint64(1) << bit))
     return packed.view(np.int64)
 
 
-def _gf2_rank(H_np: np.ndarray) -> int:
-    """Rank over GF(2) via bit-packed elimination on the columns (host, once)."""
-    M, N = H_np.shape
-    W = (N + 63) >> 6
-    rows = np.zeros((M, W), dtype=np.uint64)
-    rr, cc = np.nonzero(H_np)
-    np.bitwise_or.at(
-        rows,
-        (rr, (cc >> 6).astype(np.int64)),
-        (np.uint64(1) << (cc & 63).astype(np.uint64)),
-    )
+def _gf2_rank(packed: np.ndarray, M: int, N: int) -> int:
+    """Rank over GF(2) of the bit-packed [M, W] rows from _pack_H, eliminating over
+    columns 0..N-1 (host, once)."""
+    rows = packed.view(np.uint64).copy()
     used = np.zeros(M, dtype=bool)
     rank = 0
     for c in range(N):
@@ -163,15 +155,17 @@ class create(nn.Module):
             raise ValueError(
                 "osd_0_cuda requires a pre-loaded MatrixBundle via the `bundle` kwarg."
             )
-        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
+        H_shape, _, V_c_col, _ = bundle.select(self.check_type, dense=False)
         self.H_shape = H_shape
         self.V_c_col = nn.Parameter(V_c_col.to(self.device), requires_grad=False)
         self.M, self.N = int(H_shape[0]), int(H_shape[1])
         self.W = ((self.N + 1) + 63) >> 6
 
-        H_np = (H_matrix.detach().cpu().numpy() != 0).astype(np.uint8)
-        self.A_rank = _gf2_rank(H_np)
-        H_packed = torch.from_numpy(_pack_H(H_np, self.N, self.W)).contiguous()
+        V_c_col_np = V_c_col.detach().cpu().numpy()
+        rows, pos = np.nonzero(V_c_col_np != self.N)
+        H_packed_np = _pack_H(rows, V_c_col_np[rows, pos], self.M, self.W)
+        self.A_rank = _gf2_rank(H_packed_np, self.M, self.N)
+        H_packed = torch.from_numpy(H_packed_np).contiguous()
         self.H_packed = nn.Parameter(H_packed.to(self.device), requires_grad=False)
 
         self.algo = "osd_0"

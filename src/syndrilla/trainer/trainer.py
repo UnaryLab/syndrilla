@@ -85,14 +85,18 @@ class Trainer:
             "rng": rng,
         }
 
-    def load_train_state(self, state):
-        """Restore what `train_state` saved, onto this run and the model it fits."""
+    def load_train_state(self, state, path=None):
+        """Restore what `train_state` saved, onto this run and the model it fits.
+
+        `path` names the checkpoint in errors; it is optional.
+        """
         missing = [key for key in TRAIN_STATE_KEYS if key not in state]
         if missing:
             raise ValueError(
                 f"Training checkpoint is missing <{', '.join(missing)}>. It saved "
                 f"weights only: it can be decoded from, but a run cannot be resumed."
             )
+        self.model.drop_saved_H(state["state_dict"], path)
         self.model.load_state_dict(state["state_dict"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])

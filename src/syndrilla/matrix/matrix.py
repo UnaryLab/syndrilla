@@ -1,5 +1,7 @@
 import os
 
+import numpy as np
+import scipy.sparse as sp
 import torch
 from loguru import logger
 
@@ -16,48 +18,41 @@ from syndrilla.utils import (
 STIM_CIRCUIT_CACHE: dict = {}
 
 
-def dense_to_index_format(matrix_np, device):
+def dense_to_index_format(matrix, device):
     """
-    Convert a dense GF(2) matrix into the (shape, V_c_row, V_c_col, matrix_tensor)
-    tuple every syndrilla decoder consumes from a matrix loader's get_index().
+    Convert a GF(2) matrix, a dense array or a scipy sparse matrix, into the
+    (shape, V_c_row, V_c_col, matrix_tensor) tuple every syndrilla decoder consumes
+    from a matrix loader's get_index(); every loader returns this tuple unchanged.
+    Entries are summed and reduced mod 2, so a (row, col) pair listed an even number
+    of times cancels.
 
-    Same logic as the inlined version in alist.py / npz.py — extracted so new
-    loaders (e.g. the stim DEM loader) don't have to copy ~25 lines of imperative
-    code.
+    Row r of V_c_col lists the columns of row r's nonzeros in ascending order, padded
+    to the largest row degree with the dummy column shape[1]; every entry of row r of
+    V_c_row is r. matrix_tensor is the matrix as a coalesced sparse COO tensor with
+    bool values.
     """
-    shape = matrix_np.shape
-    matrix = torch.tensor(matrix_np, device=device)
+    csr = sp.csr_matrix(matrix, dtype=np.int64, copy=True)
+    csr.sum_duplicates()  # also sorts each row's column indices
+    csr.data %= 2
+    csr.eliminate_zeros()
+    shape = csr.shape
 
-    degree = torch.max(torch.sum(matrix, 1)).int().item()
+    counts = torch.from_numpy(np.diff(csr.indptr)).long()
+    degree = int(counts.max())
+    rows = torch.repeat_interleave(torch.arange(shape[0]), counts)
+    pos = torch.arange(csr.nnz) - torch.from_numpy(csr.indptr[:-1]).long()[rows]
 
-    row_indices, indices = torch.where(matrix == 1)
+    V_c_col = torch.full([shape[0], degree], shape[1], dtype=torch.long)
+    V_c_col[rows, pos] = torch.from_numpy(csr.indices).long()
+    V_c_row = torch.arange(shape[0]).unsqueeze(1).expand(shape[0], degree).contiguous()
 
-    V_c_row = torch.full([shape[0], degree], -1, dtype=torch.long, device=device)
-    V_c_col = torch.full([shape[0], degree], -1, dtype=torch.long, device=device)
+    coo = csr.tocoo()
+    indices = torch.from_numpy(np.vstack([coo.row, coo.col]).astype(np.int64))
+    matrix = torch.sparse_coo_tensor(
+        indices, torch.ones(coo.nnz, dtype=torch.bool), shape, device=device
+    ).coalesce()
 
-    row = 0
-    column = 0
-    for i in range(indices.size()[0]):
-        if row_indices[i] == row:
-            V_c_row[row][column] = row
-            V_c_col[row][column] = indices[i]
-            column += 1
-        else:
-            while V_c_col[row][degree - 1] == -1:
-                V_c_row[row][column] = row
-                V_c_col[row][column] = shape[1]
-                column += 1
-            row += 1
-            column = 0
-            V_c_row[row][column] = row
-            V_c_col[row][column] = indices[i]
-            column += 1
-    while V_c_col[row][degree - 1] == -1:
-        V_c_row[row][column] = row
-        V_c_col[row][column] = shape[1]
-        column += 1
-
-    return shape, V_c_row, V_c_col, matrix
+    return shape, V_c_row.to(device), V_c_col.to(device), matrix
 
 
 def create_parity_matrix(yaml_path=None, cfg=None, **kwargs):
@@ -93,13 +88,18 @@ class MatrixBundle:
         self.lx_matrix = lx_matrix
         self.lz_matrix = lz_matrix
 
-    def select(self, check_type):
+    def select(self, check_type, dense=False):
         """
         Return (H_shape, V_c_row, V_c_col, H_matrix) for the requested check
         type. Used by single-channel decoders that pick one of Hx/Hz.
+        H_matrix is the coalesced bool sparse COO tensor dense_to_index_format
+        builds, or its dense form when `dense`.
         """
         m = self.Hx_matrix if check_type.lower() == 'hx' else self.Hz_matrix
-        return m.get_index()
+        shape, V_c_row, V_c_col, H_matrix = m.get_index()
+        if dense:
+            H_matrix = H_matrix.to_dense()
+        return shape, V_c_row, V_c_col, H_matrix
 
     def get_H_file_name(self, check_type, number_channel):
         if number_channel > 1:
@@ -137,8 +137,8 @@ def load_matrices(matrix_cfg, device, dtype=None):
     Load all matrices a decoder needs from a matrix config.
 
     Matrix entries ('parity_matrix_hx', etc.) can be either:
-      - a yaml file path (str)  — loaded via create_parity_matrix(yaml_path=...)
-      - a config dict           — loaded via create_parity_matrix(cfg=...)
+      - a yaml file path (str): loaded via create_parity_matrix(yaml_path=...)
+      - a config dict:          loaded via create_parity_matrix(cfg=...)
 
     Returns a MatrixBundle. If logical_check_matrix is False/missing, the
     logical matrices are computed via compute_lz from Hx/Hz.

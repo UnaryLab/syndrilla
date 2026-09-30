@@ -178,3 +178,6 @@ cython_debug/
 *.out
 *.slurm
 *.pdf
+.peon-code-task.md
+CLAUDE.md
+CODE_MAP.md

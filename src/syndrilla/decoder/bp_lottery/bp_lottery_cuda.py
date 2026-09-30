@@ -2,6 +2,7 @@ import torch
 from loguru import logger
 
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _BaseCuda
+from syndrilla.decoder.bp_lottery.bp_lottery import cn_row_mask, vn_unsat_count
 
 
 class create(_BaseCuda):
@@ -27,12 +28,6 @@ class create(_BaseCuda):
             )
             self.random_machine = "sobol"
         self.flip_start_iter = int(decoding_cfg.get("flip_start_iter", 4))
-
-        # Dense [M, N] parity-check matrix on-device for the sign-flip scoring
-        # (bp_norm_min_sum_cuda keeps only V_c_col; the sign-flip needs the matrix).
-        bundle = kwargs.get("bundle")
-        _, _, _, H_matrix = bundle.select(self.check_type)
-        self.H_dense = H_matrix.to(self.device, self.dtype)
 
         self.algo = "bp_lottery"
         logger.info("bp_lottery_cuda decoder ready (per-step path + sign-flip).")
@@ -169,11 +164,8 @@ class create(_BaseCuda):
         chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
 
         # variable selection: 1) max unsatisfied-CN connectivity 2) min |LLR|
-        H_expanded = self.H_dense.unsqueeze(0).expand(batch_size, -1, -1)
-        candidate_vn_mask = H_expanded[
-            torch.arange(batch_size), chosen_cn_idx, :
-        ].bool()
-        vn_unsat_counts = torch.matmul(unsat_cn_mask.to(self.dtype), self.H_dense)
+        candidate_vn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, self.N)
+        vn_unsat_counts = vn_unsat_count(unsat_cn_mask.to(self.dtype), self.V_c_col, self.N)
 
         llr = torch.abs(l_v[:, :-1])  # [B, N]
         score = vn_unsat_counts * 1e6 - llr

@@ -31,20 +31,28 @@ class MatchingGraph:
     adj_edge: np.ndarray  # [2E]
 
 
-def build_matching_graph(H) -> MatchingGraph:
-    """Build the detector graph from a graphlike GF(2) check matrix H ([M, N]).
+def _column_rows(rows, cols, N):
+    """Split the nonzero (row, col) pairs of a GF(2) check matrix into N per-column
+    row arrays, rows ascending within each column."""
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    order = np.lexsort((rows, cols))
+    rows, cols = rows[order], cols[order]
+    return np.split(rows, np.searchsorted(cols, np.arange(1, N)))
+
+
+def build_matching_graph(rows, cols, M, N) -> MatchingGraph:
+    """Build the detector graph from a graphlike GF(2) check matrix ([M, N]) given
+    as the (row, col) coordinates of its nonzeros.
 
     Raises ValueError if any column has weight > 2 (H is not graphlike, so plain
     matching does not apply -- a hypergraph/correlated decoder would be needed).
     """
-    H = np.asarray(H).astype(np.uint8)
-    M, N = H.shape
     boundary = M
     num_nodes = M + 1
 
     edge_u, edge_v, edge_qubit = [], [], []
-    for j in range(N):
-        checks = np.nonzero(H[:, j])[0]
+    for j, checks in enumerate(_column_rows(rows, cols, N)):
         w = checks.size
         if w == 0:
             continue  # qubit in no check: never an edge here
@@ -233,40 +241,6 @@ class SearchNode:
         self.index_of_predecessor = SIZE_MAX
         self.distance_from_source = 0
         self.tracker.clear()
-
-
-def build_search_graph(H, W=2):
-    """Build search nodes from H, matching pymatching neighbor ordering:
-    boundary edge (weight-1 column) at index 0, then non-boundary neighbors in
-    increasing column (fault-id) order. Uniform integer weight W per edge."""
-    H = np.asarray(H).astype(np.uint8)
-    M, N = H.shape
-    nodes = [SearchNode(i) for i in range(M)]
-    # collect edges per column
-    boundary_edges = [[] for _ in range(M)]  # (fault) for weight-1 cols
-    normal_edges = [[] for _ in range(M)]  # (other_node, fault)
-    for j in range(N):
-        rows = np.nonzero(H[:, j])[0]
-        if len(rows) == 1:
-            r = int(rows[0])
-            boundary_edges[r].append(j)
-        elif len(rows) == 2:
-            a, b = int(rows[0]), int(rows[1])
-            normal_edges[a].append((b, j))
-            normal_edges[b].append((a, j))
-        # len 0 or >2 ignored
-    for r in range(M):
-        # boundary first
-        for j in boundary_edges[r]:
-            nodes[r].neighbors.append(None)
-            nodes[r].neighbor_weights.append(W)
-            nodes[r].neighbor_obs.append([j])
-        # then normal in column order
-        for other, j in sorted(normal_edges[r], key=lambda x: x[1]):
-            nodes[r].neighbors.append(nodes[other])
-            nodes[r].neighbor_weights.append(W)
-            nodes[r].neighbor_obs.append([j])
-    return nodes
 
 
 class SearchFlooder:
@@ -1410,41 +1384,13 @@ class Mwpm:
         self.shatter_blossom_and_extract_match_edges(region, match_edges)
 
 
-def build_main_graph(H, W=2):
-    H = np.asarray(H).astype(np.uint8)
-    M, N = H.shape
-    nodes = [DetectorNode(i) for i in range(M)]
-    boundary_edges = [[] for _ in range(M)]
-    normal_edges = [[] for _ in range(M)]
-    for j in range(N):
-        rows = np.nonzero(H[:, j])[0]
-        if len(rows) == 1:
-            boundary_edges[int(rows[0])].append(j)
-        elif len(rows) == 2:
-            a, b = int(rows[0]), int(rows[1])
-            normal_edges[a].append((b, j))
-            normal_edges[b].append((a, j))
-    for r in range(M):
-        for j in boundary_edges[r]:
-            nodes[r].neighbors.append(None)
-            nodes[r].neighbor_weights.append(W)
-            nodes[r].neighbor_observables.append(1 << j)
-        for other, j in sorted(normal_edges[r], key=lambda x: x[1]):
-            nodes[r].neighbors.append(nodes[other])
-            nodes[r].neighbor_weights.append(W)
-            nodes[r].neighbor_observables.append(1 << j)
-    return nodes
-
-
 # Public entry point: NativeMatcher (bit-exact PyMatching from_check_matrix(H) decode)
-def _parse_H(H):
-    """(M, N, boundary_edges, normal_edges) from a dense parity-check matrix."""
-    H = np.asarray(H).astype(np.uint8)
-    M, N = H.shape
+def _parse_H(rows, cols, M, N):
+    """(M, N, boundary_edges, normal_edges) from the nonzero (row, col) coordinates
+    of an [M, N] parity-check matrix."""
     boundary_edges = [[] for _ in range(M)]
     normal_edges = [[] for _ in range(M)]
-    for j in range(N):
-        rows = np.nonzero(H[:, j])[0]
+    for j, rows in enumerate(_column_rows(rows, cols, N)):
         if len(rows) == 1:
             boundary_edges[int(rows[0])].append(j)
         elif len(rows) == 2:
@@ -1475,6 +1421,25 @@ def _parse_graph(g):
     return M, N, boundary_edges, normal_edges
 
 
+def _collapse_parallel_edges(boundary_edges, normal_edges):
+    """Keep one edge per node pair and one boundary edge per node.
+
+    Parallel edges between the same two nodes, and multiple boundary edges of one
+    node, collapse to the minimum-weight edge and keep that edge's fault id
+    (qubit/column index), as PyMatching does. All edges share the weight ``W``, so
+    the kept edge is the one with the lowest column index.
+    """
+    boundary_edges = [[min(js)] if js else [] for js in boundary_edges]
+    collapsed = []
+    for edges in normal_edges:
+        best = {}
+        for other, j in edges:
+            if other not in best or j < best[other]:
+                best[other] = j
+        collapsed.append(list(best.items()))
+    return boundary_edges, collapsed
+
+
 def _build_nodes(node_cls, M, boundary_edges, normal_edges, W_):
     nodes = [node_cls(i) for i in range(M)]
     for r in range(M):
@@ -1499,7 +1464,8 @@ class NativeMatcher:
     """Bit-exact native reimplementation of PyMatching's ``Matching.from_check_matrix(H)``.
 
     Build once from a check matrix (``from_check_matrix``) or a MatchingGraph
-    (``from_graph``); call ``decode`` per syndrome. The search graph is built once and reused;
+    (``from_graph``); both collapse parallel and repeated boundary edges with
+    ``_collapse_parallel_edges``. Call ``decode`` per syndrome. The search graph is built once and reused;
     the (stateful) flood graph is rebuilt per shot.
     """
 
@@ -1507,6 +1473,9 @@ class NativeMatcher:
         self.M = M
         self.N = N
         self.num_observables = N
+        boundary_edges, normal_edges = _collapse_parallel_edges(
+            boundary_edges, normal_edges
+        )
         self._boundary_edges = boundary_edges
         self._normal_edges = normal_edges
         self._search_nodes = _build_nodes(
@@ -1515,8 +1484,9 @@ class NativeMatcher:
         self._search_flooder = SearchFlooder(self._search_nodes)
 
     @classmethod
-    def from_check_matrix(cls, H):
-        return cls(*_parse_H(H))
+    def from_check_matrix(cls, rows, cols, M, N):
+        """Build from the nonzero (row, col) coordinates of an [M, N] check matrix."""
+        return cls(*_parse_H(rows, cols, M, N))
 
     @classmethod
     def from_graph(cls, g):
@@ -1636,9 +1606,9 @@ def decode_single(g, syndrome, return_rounds=False):
 _MP_MATCHER = None  # per-worker NativeMatcher, set by _mp_worker_init
 
 
-def _mp_worker_init(H_np):
+def _mp_worker_init(rows, cols, M, N):
     global _MP_MATCHER
-    _MP_MATCHER = NativeMatcher.from_check_matrix(np.ascontiguousarray(H_np))
+    _MP_MATCHER = NativeMatcher.from_check_matrix(rows, cols, M, N)
 
 
 def _mp_worker_decode(syndrome_row):
@@ -1674,13 +1644,14 @@ class create(torch.nn.Module):
             self.check_type
         )
 
-        # Build the detector graph once from the dense H (graphlike: col weight <= 2).
-        H_np = np.asarray(self.H_matrix.detach().cpu().numpy()).astype(np.uint8)
-        self.graph = build_matching_graph(H_np)
+        # Build the detector graph once from the sparse H (graphlike: col weight <= 2).
+        rows, cols = self.H_matrix.coalesce().indices().cpu().numpy()
+        M, N = self.H_shape
+        self._H_coo = (rows, cols, M, N)
+        self.graph = build_matching_graph(*self._H_coo)
         # The bit-exact native sparse-blossom matcher (built once, reused per shot).
-        self.matcher = NativeMatcher.from_check_matrix(H_np)
+        self.matcher = NativeMatcher.from_check_matrix(*self._H_coo)
 
-        self._H_np = H_np
         self._num_workers = int(decoding_cfg.get("num_workers", os.cpu_count() or 1))
         self._mp_min_batch = int(decoding_cfg.get("mp_min_batch", 64))
         self._pool = None
@@ -1711,7 +1682,7 @@ class create(torch.nn.Module):
                 max_workers=self._num_workers,
                 mp_context=ctx,
                 initializer=_mp_worker_init,
-                initargs=(self._H_np,),
+                initargs=self._H_coo,
             )
         return self._pool
 

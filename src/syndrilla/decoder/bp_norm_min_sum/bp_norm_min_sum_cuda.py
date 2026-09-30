@@ -209,7 +209,7 @@ class create(nn.Module):
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
 
-        H_shape, V_c_row, V_c_col, H_matrix = bundle.select(self.check_type)
+        H_shape, V_c_row, V_c_col, H_matrix = bundle.select(self.check_type, dense=False)
         self.H_shape = H_shape  # (M, N)
         self.N = H_shape[1]  # variable nodes (excludes dummy)
         self.N_ext = self.N + 1

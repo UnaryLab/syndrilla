@@ -1,13 +1,25 @@
 import numpy as np
+import scipy.sparse as sp
 from loguru import logger
 
 from syndrilla.interface.stim.stim import get_stim_circuit
 from syndrilla.matrix.matrix import STIM_CIRCUIT_CACHE, dense_to_index_format
 
 
+def _binary_csr(rows, cols, shape):
+    """int64 CSR matrix over GF(2): a (row, col) pair given an even number of times cancels, as in Stim."""
+    m = sp.csr_matrix(
+        (np.ones(len(rows), dtype=np.int64), (rows, cols)), shape=shape
+    )
+    m.sum_duplicates()
+    m.data %= 2
+    m.eliminate_zeros()
+    return m
+
+
 def _build_dem_matrices(circuit):
-    """Extract (H, obs_mat, priors) from a stim circuit. Cached by circuit content
-    (string form) — id() can be recycled by CPython when a Circuit is freed,
+    """Extract (H, obs_mat, priors) from a stim circuit, H and obs_mat as scipy CSR.
+    Cached by circuit content (string form), since id() can be recycled by CPython when a Circuit is freed,
     causing a fresh Circuit to alias an unrelated cached entry.
     """
     key = str(circuit)
@@ -36,12 +48,8 @@ def _build_dem_matrices(circuit):
         err_idx += 1
     num_errors = err_idx
 
-    H = np.zeros((num_detectors, num_errors), dtype=np.int64)
-    if h_rows:
-        H[h_rows, h_cols] = 1
-    obs_mat = np.zeros((num_observables, num_errors), dtype=np.int64)
-    if o_rows:
-        obs_mat[o_rows, o_cols] = 1
+    H = _binary_csr(h_rows, h_cols, (num_detectors, num_errors))
+    obs_mat = _binary_csr(o_rows, o_cols, (num_observables, num_errors))
 
     result = (H, obs_mat, np.asarray(priors, dtype=np.float64))
     STIM_CIRCUIT_CACHE[key] = result
@@ -77,12 +85,12 @@ class create:
             )
 
         H, obs_mat, priors = _build_dem_matrices(circuit)
-        self._dense_np = H if self.target == "check" else obs_mat
+        self._matrix = H if self.target == "check" else obs_mat
         self.priors = priors
 
     def get_index(self):
         logger.info(f"Building index for stim {self.target} matrix from <{self.path}>.")
-        return dense_to_index_format(self._dense_np, self.device)
+        return dense_to_index_format(self._matrix, self.device)
 
     def get_dense(self):
-        return self._dense_np
+        return self._matrix.toarray()

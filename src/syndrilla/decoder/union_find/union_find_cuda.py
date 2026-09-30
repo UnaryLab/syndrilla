@@ -130,8 +130,9 @@ class create(nn.Module):
         self.M, self.N = int(H_shape[0]), int(H_shape[1])
 
         self._ext = _load_ext()
-        H_int = (H_matrix.detach().cpu() != 0).to(torch.int32).contiguous()
-        conn_off, conn_nbr, conn_q, vcc, V, B, M, N = self._ext.uf_build_lattice(H_int)
+        conn_off, conn_nbr, conn_q, vcc, V, B, M, N = self._ext.uf_build_lattice(
+            H_matrix.indices().contiguous(), self.M, self.N
+        )
         assert int(M) == self.M and int(N) == self.N, "lattice shape disagrees with H"
         self.V = int(V)
         self.boundary = int(B)  # -1 for toric, else boundary vertex id (== M)

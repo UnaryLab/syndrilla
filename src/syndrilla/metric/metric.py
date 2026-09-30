@@ -345,7 +345,7 @@ class MetricState:
 
         if iteration.numel() == 0:
             average_iter = 0.0
-            distribution = torch.zeros(num_max_iter + 1).to(e_estimated.device)
+            distribution = torch.zeros(num_max_iter + 1, dtype=torch.float64).to(e_estimated.device)
         else:
             distribution = (
                 torch.bincount(
@@ -660,9 +660,9 @@ class MetricState:
 
             if done:
                 total = decoder_metrics["distribution"].sum()
-                cdf = torch.cumsum(decoder_metrics["distribution"], dim=0) / total
+                cdf = torch.cumsum(decoder_metrics["distribution"].to(torch.float64), dim=0) / total
                 qs = torch.linspace(
-                    0.0, 1.0, 101, device=decoder_metrics["distribution"].device
+                    0.0, 1.0, 101, dtype=torch.float64, device=decoder_metrics["distribution"].device
                 )
                 indices = torch.searchsorted(cdf, qs, right=False)
                 distribution = (indices + 1).int().tolist()
@@ -892,7 +892,7 @@ class MetricState:
                 float(entry["average time per sample (s)"]) * sc
             )
             state.average_iter[idx] = float(entry["average iteration"]) * sc
-            state.distribution[idx] = torch.tensor(entry["iteration distribution"])
+            state.distribution[idx] = torch.tensor(entry["iteration distribution"], dtype=torch.float64)
             state.average_time_sample_iter[idx] = (
                 float(entry["average time per iteration (s)"]) * sc
             )
@@ -1116,7 +1116,7 @@ class MetricState:
                 f"run selects on <{score_name}>. The two are not comparable, so the "
                 f"record cannot carry over."
             )
-        self._trainer.load_train_state(state)
+        self._trainer.load_train_state(state, path)
         self.epoch = state["epoch"]
         self.best = state["best"]
         self.history = list(state["history"])

@@ -2,6 +2,7 @@ import torch
 from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
+from syndrilla.decoder.bp_lottery.bp_lottery import vn_unsat_count
 
 
 class create(torch.nn.Module):
@@ -74,7 +75,7 @@ class create(torch.nn.Module):
         self.Hz_matrix = bundle.Hz_matrix
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type, dense=False)
 
         self.mask_dummy = (self.V_c_col == self.H_shape[1])
 
@@ -118,9 +119,7 @@ class create(torch.nn.Module):
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
         N_extended = self.H_shape[1] + 1
         l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
         e_v_saver = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
 
         # tensor needed for BSFBP
         l_saver = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
@@ -141,7 +140,6 @@ class create(torch.nn.Module):
 
         # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
-        message = torch.zeros_like(self.V_c_col.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
         message_saved = torch.zeros_like(self.V_c_col.unsqueeze(0), dtype=self.dtype, device=self.device).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
 
@@ -303,8 +301,7 @@ class create(torch.nn.Module):
 
     def cn_update(self, a_v2c, syndrome, curr_iters):
         # compute syndrome for multiplication
-        syndrome_neg = torch.where(syndrome != 0, -1.0, 1.0)
-        syndrome_neg = syndrome_neg[:, self.V_c_row]
+        syndrome_neg = torch.where(syndrome != 0, -1.0, 1.0).unsqueeze(2)
 
         beta = 1.0 - torch.pow(2.0, -curr_iters).to(self.dtype)
         beta = beta.unsqueeze(1).unsqueeze(2)
@@ -317,9 +314,9 @@ class create(torch.nn.Module):
 
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=2)
-        min_0 = sorted[:, :, 0].unsqueeze(2)
-        min_1 = sorted[:, :, 1].unsqueeze(2)
+        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
+        min_0 = mins[:, :, 0].unsqueeze(2)
+        min_1 = mins[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
         return beta * sign * Q_sign  * min_result
@@ -328,13 +325,9 @@ class create(torch.nn.Module):
     def llr_update(self, u_init, b_c2v):
         # set up the format for both data and partition so they can matching each other
         data_flat = b_c2v.flatten(start_dim=1)
-        partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
-
-        sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
 
         # Use index_add to accumulate sums in the result tensor
-        sum_b_c2v = u_init + sum_b_c2v
-        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+        sum_b_c2v = u_init.index_add(1, self.V_c_col.flatten(), data_flat)
 
         return sum_b_c2v
 
@@ -351,8 +344,7 @@ class create(torch.nn.Module):
     def sign_flip(self, syndrome, s_est, l_v):
         synd_diff = (syndrome + s_est)%2.0
 
-        temp_ls = torch.matmul(synd_diff.float(), self.H_matrix.unsqueeze(0).float())
-        temp_ls = temp_ls.squeeze(0)
+        temp_ls = vn_unsat_count(synd_diff.float(), self.V_c_col, self.H_shape[1])
 
         total_ones = temp_ls.sum(dim=1).to(self.dtype)
 
