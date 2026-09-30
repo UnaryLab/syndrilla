@@ -1116,7 +1116,7 @@ class MetricState:
                 f"run selects on <{score_name}>. The two are not comparable, so the "
                 f"record cannot carry over."
             )
-        self._trainer.load_train_state(state, path)
+        self._trainer.load_train_state(state)
         self.epoch = state["epoch"]
         self.best = state["best"]
         self.history = list(state["history"])
