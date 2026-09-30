@@ -6,20 +6,31 @@
     TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor");           \
     TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
 
-void osd0_fused_cuda(torch::Tensor H_packed, torch::Tensor synd,
-                     torch::Tensor order, torch::Tensor e_out,
-                     int64_t N, int64_t A_rank, int64_t block_size);
+// Pack the first K columns of each sample's order into the workspace.
+void osd_gather_cuda(torch::Tensor ws, torch::Tensor colptr, torch::Tensor rowidx,
+                     torch::Tensor order, int64_t K);
+
+// Gauss-Jordan over workspace columns 0..K-1, one block per sample in shared memory.
+void osd0_fused_ws_cuda(torch::Tensor ws, torch::Tensor row_pcol, torch::Tensor found,
+                        int64_t K, int64_t A_rank, int64_t block_size);
 
 // Shared-memory the fused kernel needs (bytes) and the device opt-in limit.
 int64_t fused_smem_bytes(int64_t M, int64_t W);
 int64_t fused_smem_limit();
 
-void osd_pivot_cuda(torch::Tensor aug, torch::Tensor order,
-                    torch::Tensor row_pcol, torch::Tensor pivot_row,
-                    int64_t step, int64_t N);
+// Per-step path: load column j and find its pivot; eliminate column j.
+void osd_load_col_cuda(torch::Tensor ws, torch::Tensor colw, torch::Tensor row_pcol,
+                       torch::Tensor pivbuf, int64_t j);
+void osd_step_cuda(torch::Tensor ws, torch::Tensor colw, torch::Tensor row_pcol,
+                   torch::Tensor pivbuf, torch::Tensor found, int64_t j, int64_t K);
 
-void osd_eliminate_cuda(torch::Tensor aug, torch::Tensor order,
-                        torch::Tensor pivot_row, int64_t step, int64_t N);
+// Order positions of each sample's pivot columns; stops early once the packed
+// syndrome (empty tensor: never) lies in the span of the pivots found.
+void osd_scan_cuda(torch::Tensor Tr, torch::Tensor TuT, torch::Tensor colptr,
+                   torch::Tensor rowidx, torch::Tensor order, torch::Tensor piv_pos,
+                   torch::Tensor found, torch::Tensor synd, torch::Tensor stopped,
+                   torch::Tensor scan_end);
 
-void osd_solve_cuda(torch::Tensor aug, torch::Tensor row_pcol,
-                    torch::Tensor e_out, int64_t N);
+// Read out the OSD-0 estimate from the pivot rows.
+void osd_solve_ws_cuda(torch::Tensor ws, torch::Tensor row_pos, torch::Tensor order,
+                       torch::Tensor e_out, int64_t K);

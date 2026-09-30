@@ -37,8 +37,6 @@ class create(_BranchPy):
         self.VN_adj_k = nn.Parameter(
             torch.from_numpy(adj_k).to(self.device), requires_grad=False
         )
-        # dense [M, N] matrix for the inherited sign_flip
-        self.H_matrix = self.H_matrix.to(self.device, self.dtype)
 
         # pure-PyTorch branch builds no cap; enable the adaptive cap here when an
         # rebatch_speedup block is present (the forward below already honors it).

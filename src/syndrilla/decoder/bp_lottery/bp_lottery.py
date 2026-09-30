@@ -5,6 +5,23 @@ from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
 
 
+def vn_unsat_count(cn_val, V_c_col, N):
+    """cn_val [B, M] @ H as [B, N]: per variable, the sum of cn_val over its checks.
+
+    Scatters each edge's check value onto its variable over V_c_col; padded edges
+    land on the dummy column N, which is dropped. Output dtype follows cn_val.
+    """
+    B, D = cn_val.shape[0], V_c_col.shape[1]
+    src = cn_val.unsqueeze(2).expand(-1, -1, D).reshape(B, -1)
+    return cn_val.new_zeros(B, N + 1).index_add_(1, V_c_col.reshape(-1), src)[:, :N]
+
+
+def cn_row_mask(V_c_col, cn_idx, N):
+    """Bool [B, N] mask of the variables on check cn_idx[b], i.e. H[cn_idx].bool()."""
+    mask = torch.zeros(cn_idx.shape[0], N + 1, dtype=torch.bool, device=V_c_col.device)
+    return mask.scatter_(1, V_c_col[cn_idx], True)[:, :N]
+
+
 class create(torch.nn.Module):
     """
     This class creates a lotterybp decoder on a single GPU
@@ -77,7 +94,7 @@ class create(torch.nn.Module):
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
         self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(
-            self.check_type
+            self.check_type, dense=False
         )
 
         self.mask_dummy = self.V_c_col == self.H_shape[1]
@@ -92,7 +109,6 @@ class create(torch.nn.Module):
             self.V_c_col.to(self.device), requires_grad=False
         )
         self.mask_dummy = self.mask_dummy.to(self.device)
-        self.H_matrix = self.H_matrix.to(self.device)
 
         self.algo = "bp_lottery"
         self.num_max_iter = self.max_iter
@@ -128,8 +144,6 @@ class create(torch.nn.Module):
 
         self.batch_size, _ = syndrome.size()
 
-        torch.set_default_dtype(self.dtype)
-
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
         N_extended = self.H_shape[1] + 1
         l_v = torch.zeros(
@@ -160,19 +174,15 @@ class create(torch.nn.Module):
 
         # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
-        message = torch.zeros_like(
-            self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device
-        ).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
 
         # compute syndrome for multiplication
-        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
-        self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
+        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype).unsqueeze(2)
 
         if self.random_machine.lower() == "sobol":
             if self.dtype in {"float32", "float64"}:
                 sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-                self.r = sobol.draw(self.max_iter).to(self.device).to(self.dtype)
+                self.r = sobol.draw(self.max_iter, dtype=self.dtype).to(self.device).to(self.dtype)
             else:
                 sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
                 self.r = (
@@ -297,9 +307,9 @@ class create(torch.nn.Module):
 
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=2)
-        min_0 = sorted[:, :, 0].unsqueeze(2)
-        min_1 = sorted[:, :, 1].unsqueeze(2)
+        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
+        min_0 = mins[:, :, 0].unsqueeze(2)
+        min_1 = mins[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
         message = beta * sign * Q_sign * min_result
@@ -315,12 +325,11 @@ class create(torch.nn.Module):
         """
         # set up the format for both data and partition so they can matching each other
         data_flat = b_c2v.flatten(start_dim=1)
-        partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
         sum_b_c2v = torch.zeros(
             [self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device
         )
 
-        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
 
         return sum_b_c2v
 
@@ -349,13 +358,12 @@ class create(torch.nn.Module):
         temp_e[:, -1] = 0.0
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
 
-        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
+        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0).to(self.dtype)
 
     def sign_flip(self, syndrome, s_est, l_v):
         synd_diff = (syndrome + s_est) % 2.0
 
-        temp_ls = torch.matmul(synd_diff.float(), self.H_matrix.unsqueeze(0).float())
-        temp_ls = temp_ls.squeeze(0)
+        temp_ls = vn_unsat_count(synd_diff.float(), self.V_c_col, self.H_shape[1])
 
         total_ones = temp_ls.sum(dim=1).to(self.dtype)
 
@@ -389,7 +397,7 @@ class create(torch.nn.Module):
 
         # random selection setup
         if self.random_machine.lower() == "system":
-            r = torch.rand(batch_size, device=self.device)
+            r = torch.rand(batch_size, device=self.device, dtype=self.dtype)
         else:  # sobol
             r = self.r[(self.i - 1)].repeat(batch_size)
 
@@ -405,12 +413,10 @@ class create(torch.nn.Module):
         chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
 
         # VN Selection: 1. Unsat CN count priority ->  2. Min LLR priority
-        H_expanded = self.H_matrix.unsqueeze(0).expand(batch_size, -1, -1)  # [B, M, N]
-        candidate_vn_mask = H_expanded[
-            torch.arange(batch_size), chosen_cn_idx, :
-        ].bool()
+        N = self.H_shape[1]
+        candidate_vn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, N)  # [B, N]
 
-        vn_unsat_counts = torch.matmul(unsat_cn_mask.float(), self.H_matrix.float())
+        vn_unsat_counts = vn_unsat_count(unsat_cn_mask.float(), self.V_c_col, N)
 
         llr = torch.abs(l_v[:, :-1])  # [B, N]
         score = vn_unsat_counts * 1e6 - llr
@@ -433,7 +439,7 @@ class create(torch.nn.Module):
         valid_mask = total_unsat > 0
 
         if self.random_machine.lower() == "system":
-            r = torch.rand(batch_size, device=self.device)
+            r = torch.rand(batch_size, device=self.device, dtype=self.dtype)
         elif self.random_machine.lower() == "sobol":
             r = self.r[(self.i - 1)].repeat(batch_size)
 
@@ -446,7 +452,7 @@ class create(torch.nn.Module):
         chosen_cn = ((unsat_cumsum >= rand_pos.unsqueeze(1)) & unsat_cn_mask).float()
         chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
 
-        cn_mask = self.H_matrix[chosen_cn_idx, :].bool()  # [B, N]
+        cn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, self.H_shape[1])  # [B, N]
 
         llr = l_v[:, :-1]  # [B, N]
         masked_llr = llr + (~cn_mask).float() * 1e9

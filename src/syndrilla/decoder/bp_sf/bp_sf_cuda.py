@@ -17,8 +17,9 @@ class create(_BpSfPy):
     routes the SF retries through the modular kernels instead of the fused one."""
 
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
-        # Build all SF params, H_dense, and the message-passing helpers. The base
-        # also resolves self.device to cuda:idx (device_type=cuda in the YAML).
+        # Build all SF params, the CSC check index V_v_row, and the message-passing
+        # helpers. The base also resolves self.device to cuda:idx (device_type=cuda
+        # in the YAML).
         super().__init__(decoding_cfg, **kwargs)
 
         if not torch.cuda.is_available():

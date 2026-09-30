@@ -71,7 +71,7 @@ class create(torch.nn.Module):
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
         self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(
-            self.check_type
+            self.check_type, dense=False
         )
 
         self.mask_dummy = self.V_c_col == self.H_shape[1]
@@ -122,8 +122,6 @@ class create(torch.nn.Module):
 
         self.batch_size, _ = syndrome.size()
 
-        torch.set_default_dtype(self.dtype)
-
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
         N_extended = self.H_shape[1] + 1
         l_v = torch.zeros(
@@ -154,14 +152,10 @@ class create(torch.nn.Module):
 
         # set up initialization for all parameters for decoding process
         # message is a in place version of a_v2c and b_c2v
-        message = torch.zeros_like(
-            self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device
-        ).repeat(self.batch_size, 1, 1)
         message = u_init[:, self.V_c_col]
 
         # compute syndrome for multiplication
-        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype)
-        self.syndrome_neg = self.syndrome_neg[:, self.V_c_row]
+        syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype).unsqueeze(2)
 
         logger.info("Complete.")
 
@@ -186,7 +180,7 @@ class create(torch.nn.Module):
             message = self.vn_update(message, l_v_v2c)
 
             # check node update (min-sum), still in the [batch, n_checks, degree] layout
-            message = self.cn_update(message)
+            message = self.cn_update(message, syndrome_neg)
 
             # c2v: convert the check messages back to the per-variable layout
             message_c2v = self.c2v(message)
@@ -263,7 +257,7 @@ class create(torch.nn.Module):
         else:
             return l_v_v2c - b_c2v
 
-    def cn_update(self, a_v2c):
+    def cn_update(self, a_v2c, syndrome_neg):
         base = torch.tensor(2.0, dtype=self.dtype)
         exponent = torch.tensor(-(self.i), dtype=self.dtype)
         beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
@@ -272,13 +266,13 @@ class create(torch.nn.Module):
         sign = torch.sgn(a_v2c)
         sign = torch.where(sign == 0.0, -1.0, sign)
         sign_prod = torch.prod(sign, dim=2, keepdim=True)
-        Q_sign = self.syndrome_neg * sign_prod
+        Q_sign = syndrome_neg * sign_prod
 
         # compute min
         abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=2)
-        min_0 = sorted[:, :, 0].unsqueeze(2)
-        min_1 = sorted[:, :, 1].unsqueeze(2)
+        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
+        min_0 = mins[:, :, 0].unsqueeze(2)
+        min_1 = mins[:, :, 1].unsqueeze(2)
         min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
 
         message = beta * sign * Q_sign * min_result
@@ -294,12 +288,11 @@ class create(torch.nn.Module):
         """
         # set up the format for both data and partition so they can matching each other
         data_flat = b_c2v.flatten(start_dim=1)
-        partitions_flat = self.V_c_col.flatten().repeat(self.batch_size, 1)
         sum_b_c2v = torch.zeros(
             [self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device
         )
 
-        sum_b_c2v.scatter_add_(1, partitions_flat, data_flat)
+        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
 
         return sum_b_c2v
 
@@ -328,4 +321,4 @@ class create(torch.nn.Module):
         temp_e[:, -1] = 0.0
         estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
 
-        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0)
+        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0).to(self.dtype)

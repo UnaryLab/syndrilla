@@ -1,6 +1,8 @@
 #ifndef UNION_FIND_SERIAL_CUH
 #define UNION_FIND_SERIAL_CUH
 
+#include <cstdint>
+
 #if defined(__CUDACC__)
 #define UF_HD __host__ __device__
 #else
@@ -201,9 +203,9 @@ struct UFScratch {
     int* bord_k;    // [V*maxcap] border-set keys
 };
 
-UF_HD inline long uf_scratch_ints(int V, int N) {
-    long mc = uf_maxcap(V);
-    return 16L * V + (V + 1) + 5L * N + 5L * mc + 2L * V * mc;
+UF_HD inline int64_t uf_scratch_ints(int V, int N) {
+    int64_t mc = uf_maxcap(V);
+    return (int64_t)16 * V + (int64_t)V + 1 + (int64_t)5 * N + 5 * mc + 2 * mc * V;
 }
 
 // Carve a UFScratch out of a flat int buffer `buf` (>= uf_scratch_ints(V,N)).
@@ -237,14 +239,14 @@ UF_HD inline void uf_carve(UFScratch* s, int* buf, int V, int N) {
     s->roots_k = p; p += mc;
     s->odd_d = p; p += mc;
     s->odd_k = p; p += mc;
-    s->bord_d = p; p += (long)V * mc;
-    s->bord_k = p; p += (long)V * mc;
+    s->bord_d = p; p += (int64_t)V * mc;
+    s->bord_k = p; p += (int64_t)V * mc;
 }
 
 // Load a border RSet view for root `r` (buffers offset r*maxcap).
 UF_HD inline void uf_border_load(RSet* b, UFScratch* s, int r, int mc) {
-    b->rd = s->bord_d + (long)r * mc;
-    b->rk = s->bord_k + (long)r * mc;
+    b->rd = s->bord_d + (int64_t)r * mc;
+    b->rk = s->bord_k + (int64_t)r * mc;
     b->cap = s->bcap[r]; b->mask = s->bmask[r]; b->size = s->bsize[r];
 }
 UF_HD inline void uf_border_store(const RSet* b, UFScratch* s, int r) {
@@ -368,7 +370,7 @@ UF_HD inline void uf_decode_shot(
         int ringcap = pe_n + 1;
         int head = 0, dqsize = pe_n;
         for (int i = 0; i < pe_n; i++) s->dq[i] = i;   // deque = peeling_edges in order
-        long guard = 0, maxguard = (long)pe_n * pe_n + pe_n + 16;
+        int64_t guard = 0, maxguard = (int64_t)pe_n * pe_n + pe_n + 16;
         while (dqsize > 0 && guard++ < maxguard) {
             int bi = (head + dqsize - 1) % ringcap;    // back
             int idx = s->dq[bi]; dqsize--;             // pop back

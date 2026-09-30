@@ -203,13 +203,19 @@ class create(nn.Module):
             raise ValueError(
                 "saq requires a pre-loaded MatrixBundle via the `bundle` kwarg."
             )
-        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
+        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type, dense=False)
         # a circuit-level DEM's columns are fault mechanisms rather than qubits, which is
         # what `metric` names the result file by
         source = (
             bundle.Hx_matrix if self.check_type.lower() == "hx" else bundle.Hz_matrix
         )
         self.from_circuit_dem = getattr(source, "is_circuit_dem", False)
+        # names the matrix in errors: its file, or the DEM a stim interface builds
+        self.H_source = (
+            "the stim interface's circuit-level DEM"
+            if self.from_circuit_dem
+            else f"<{getattr(source, 'path', None)}>"
+        )
 
         l_matrix = (
             bundle.lx_matrix if self.check_type.lower() == "hx" else bundle.lz_matrix
@@ -225,7 +231,8 @@ class create(nn.Module):
             )
 
         self.register_buffer("V_c_col", V_c_col.to(self.device))
-        self.register_buffer("H_matrix", H_matrix.to(self.device))
+        # sparse COO, not a buffer, so it stays out of the state_dict
+        self.H_matrix = H_matrix.to(self.device)
         self.register_buffer(
             "logic_matrix", l_matrix.t().to(self.device).to(self.dtype)
         )
@@ -339,7 +346,9 @@ class create(nn.Module):
 
     def _build_cpnd(self, H_matrix, l_matrix):
         """Precompute `[H; L]`, its right inverse, and the stabilizer moves."""
-        H_np = H_matrix.detach().cpu().numpy().astype(np.uint8) % 2
+        # ponytail: dense host copy of H, O(M*N) host memory at init; switch to sparse
+        # GF(2) elimination if saq is ever run on large DEMs
+        H_np = H_matrix.cpu().to_dense().numpy().astype(np.uint8)
         L_np = l_matrix.detach().cpu().numpy().astype(np.uint8) % 2
 
         # column pivots of H^T are row pivots of H
@@ -386,8 +395,18 @@ class create(nn.Module):
             self.register_buffer("src_mask_LN", None)
             return
 
-        H = H_matrix.detach().cpu().to(torch.float32)
-        loc = (H @ H.t()) > 0
+        # support of H @ H.T from the COO indices: checks i, j are linked when they
+        # share a column. `table` lists each column's checks, padded with row m.
+        rows, cols = H_matrix.cpu().coalesce().indices()
+        cols, order = cols.sort(stable=True)
+        rows = rows[order]
+        slot = torch.arange(cols.numel()) - torch.searchsorted(cols, cols)
+        degree = int(slot.max()) + 1 if slot.numel() else 0
+        table = torch.full((self.n, degree), self.m)
+        table[cols, slot] = rows
+        loc = torch.zeros(self.m + 1, self.m + 1, dtype=torch.bool)
+        loc[table.unsqueeze(2), table.unsqueeze(1)] = True
+        loc = loc[: self.m, : self.m]
         loc.fill_diagonal_(True)
 
         star = torch.zeros(self.m + 1, self.m + 1, dtype=torch.bool)
@@ -401,6 +420,27 @@ class create(nn.Module):
             "src_mask_LN",
             torch.zeros(1, 1, self.logical_classes, self.m + 1, dtype=torch.bool),
         )
+
+    def drop_saved_H(
+        self,
+        state,
+        path=None,
+        fix="Resume from a checkpoint trained for this check side and matrix.",
+    ):
+        """Remove the `H_matrix` a saved state_dict may carry; it must equal this H.
+
+        `path` names the checkpoint and `fix` is the advice in the error.
+        """
+        saved_H = state.pop("H_matrix", None)
+        if saved_H is not None and not torch.equal(
+            saved_H.cpu().bool(), self.H_matrix.cpu().to_dense()
+        ):
+            name = "saq checkpoint" if path is None else f"saq checkpoint <{path}>"
+            raise ValueError(
+                f"{name} was trained on a <{tuple(saved_H.shape)}> check matrix that "
+                f"differs from the <{(self.m, self.n)}> <{self.check_type}> matrix this "
+                f"run loads from {self.H_source}. {fix}"
+            )
 
     def _load_checkpoint(self, path, training):
         """Load the weights `checkpoint` names, and record which ones they were."""
@@ -421,6 +461,12 @@ class create(nn.Module):
         state = torch.load(path, map_location=self.device, weights_only=True)
         if isinstance(state, dict):
             state = state.get("state_dict", state.get("model", state))
+        self.drop_saved_H(
+            state,
+            path,
+            fix="Use the checkpoint trained for this check side and matrix, or train "
+            "one with -t.",
+        )
         missing, unexpected = self.load_state_dict(state, strict=False)
         if missing:
             raise ValueError(

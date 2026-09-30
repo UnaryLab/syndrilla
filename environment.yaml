@@ -4,7 +4,7 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python>=3.10
+  - python=3.13
   - pyyaml
   - yamlordereddictloader
   - pyfiglet
@@ -13,8 +13,17 @@ dependencies:
   - numpy
   - scipy
   - nvidia-ml-py
-  - pytorch
+  - pytorch=2.13.0=cuda130*
   - matplotlib
-  - stim
+  - ninja
+  - pytest
+  - libstdcxx-ng>=14
+  - cuda-version=13.0
+  - cuda-nvcc=13.0
+  - cuda-cudart-dev=13.0
+  - libcublas-dev
+  - libcusparse-dev
+  - libcusolver-dev
   - pip:
     - ldpc
+    - stim  # conda-forge 'stim' is an unrelated package

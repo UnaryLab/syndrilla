@@ -1,8 +1,8 @@
 import numpy as np
-import torch
 from loguru import logger
 
 from syndrilla.utils import get_path
+from syndrilla.matrix.matrix import dense_to_index_format
 
 
 class create():
@@ -37,45 +37,12 @@ class create():
         # Use the column neighbor lists to fill the matrix.
         for j, neighbors in enumerate(col_neighbors):
             for r in neighbors:
-                matrix[j, r-1] = 1
+                matrix[j, r-1] += 1
 
-        # ****************************************************************
-        # don't change the code below
-        # ****************************************************************
-        shape = matrix.shape
-        matrix = torch.tensor(matrix, device = self.device)
-
-        degree = torch.max(torch.sum(matrix, 1)).int().item()
-
-        row_indices, indices = torch.where(matrix == 1)
-
-        V_c_row = torch.full([shape[0], degree], -1, dtype=torch.long, device=self.device)
-        V_c_col = torch.full([shape[0], degree], -1, dtype=torch.long, device=self.device)
-
-        row = 0
-        column = 0
-        for i in range(indices.size()[0]):
-            if row_indices[i] == row:
-                V_c_row[row][column] = row
-                V_c_col[row][column] = indices[i]
-                column += 1
-            else:
-                while V_c_col[row][degree - 1] == -1:
-                    V_c_row[row][column] = row
-                    V_c_col[row][column] = shape[1]
-                    column += 1
-                row += 1
-                column = 0
-                V_c_row[row][column] = row
-                V_c_col[row][column] = indices[i]
-                column += 1
-        while V_c_col[row][degree - 1] == -1:
-            V_c_row[row][column] = row
-            V_c_col[row][column] = shape[1]
-            column += 1
+        out = dense_to_index_format(matrix, self.device)
 
         logger.info('Complete.')
-        return shape, V_c_row, V_c_col, matrix
+        return out
 
     def get_dense(self):
         with open(self.path, 'r') as f:
@@ -97,7 +64,7 @@ class create():
         # Use the column neighbor lists to fill the matrix.
         for j, neighbors in enumerate(col_neighbors):
             for r in neighbors:
-                matrix[j, r-1] = 1
+                matrix[j, r-1] += 1
 
-        return matrix
+        return matrix % 2
 
