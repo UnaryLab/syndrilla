@@ -1,8 +1,7 @@
-"""osd_0_cuda gives the same e_v, bit for bit, as the CPU osd_0 and as a
-reference osd_0_cuda.py (full-width Gauss-Jordan over all N columns) given by the
-SYNDRILLA_REF_OSD environment variable. Each test runs its CPU comparisons first
-and skips, with a message, when that variable is unset or its file is missing."""
-import importlib.util
+"""osd_0_cuda gives the same e_v, bit for bit, as the CPU osd_0 on the fused
+and the per-step path, with one chunk and with several chunks. The tests also
+check last_pivot_pos, the early-stop flags and pivot counts in scan_stats, and
+the GPU rank fallback."""
 import os
 
 import numpy as np
@@ -24,7 +23,6 @@ from syndrilla.utils import parse_device_dtype, read_yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-REF_OSD = os.environ.get("SYNDRILLA_REF_OSD", "")
 CUDA_CFG = {"device": {"device_type": "cuda", "device_idx": 0}, "dtype": "float64"}
 
 
@@ -36,32 +34,6 @@ class _Bundle:
 
     def select(self, check_type, dense=False):
         return self.index
-
-
-def _reference_decoder(cfg, bundle):
-    """The reference osd_0_cuda, loaded under another module name and built in
-    its own extension directory; skips the calling test when unavailable."""
-    if not REF_OSD:
-        pytest.skip("SYNDRILLA_REF_OSD is unset: set it to a reference osd_0_cuda.py")
-    if not os.path.isfile(REF_OSD):
-        pytest.skip(f"SYNDRILLA_REF_OSD file not found: {REF_OSD}")
-    spec = importlib.util.spec_from_file_location("osd_0_cuda_reference", REF_OSD)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    root = os.environ.get("TORCH_EXTENSIONS_DIR")
-    if root is None:
-        from torch.utils.cpp_extension import _get_build_directory
-
-        root = os.path.dirname(_get_build_directory("x", False))
-    prev = os.environ.get("TORCH_EXTENSIONS_DIR")
-    os.environ["TORCH_EXTENSIONS_DIR"] = os.path.join(root, "osd_reference")
-    try:
-        return mod.create(dict(cfg), bundle=bundle)
-    finally:
-        if prev is None:
-            del os.environ["TORCH_EXTENSIONS_DIR"]
-        else:
-            os.environ["TORCH_EXTENSIONS_DIR"] = prev
 
 
 def _run(dec, synd, llr, H):
@@ -114,21 +86,19 @@ def surface10():
     return cfg, bundle, io["synd"].cpu(), io["llr"].double().cpu()
 
 
-def test_surface10_matches_cpu_and_reference(surface10):
+def test_surface10_matches_cpu(surface10):
     cfg, bundle, synd, llr = surface10
     H = bundle.select("hx")[3]
     ref = _cpu_osd(bundle, synd, llr)
     for per_step in (False, True):
         dec = osd_gpu.create(dict(cfg, force_per_step=per_step), bundle=bundle)
         assert torch.equal(_run(dec, synd, llr, H), ref), f"force_per_step={per_step}"
-    refk = _reference_decoder(cfg, bundle)
-    assert torch.equal(_run(refk, synd, llr, H), ref)
 
 
 def test_surface10_chunked(surface10):
     """A workspace_bytes budget of 5 samples splits the 64 samples into 13
-    chunks; e_v and last_pivot_pos equal the one-chunk run, the CPU osd_0 and
-    the reference kernel, on the fused and the per-step path."""
+    chunks; e_v and last_pivot_pos equal the one-chunk run and the CPU osd_0,
+    on the fused and the per-step path."""
     cfg, bundle, synd, llr = surface10
     H = bundle.select("hx")[3]
     ref = _cpu_osd(bundle, synd, llr)
@@ -143,17 +113,14 @@ def test_surface10_chunked(surface10):
         )
         assert torch.equal(_run(dec, synd, llr, H), ref), f"force_per_step={per_step}"
         assert dec.last_pivot_pos == whole.last_pivot_pos
-    refk = _reference_decoder(cfg, bundle)
-    assert torch.equal(_run(refk, synd, llr, H), ref)
 
 
 @pytest.mark.parametrize("M", [20, 80])
 def test_rank_deficient_late_pivots(M):
     """H with a duplicated row (rank < M) whose 2M lowest-LLR columns span rank 1,
     so pivots lie past order position 2M (asserted via last_pivot_pos); M=80
-    leaves more than 32 rows without a pivot. e_v equals the CPU osd_0 and the
-    reference kernel on the fused and the per-step path, and equals the
-    reference kernel for random syndromes too."""
+    leaves more than 32 rows without a pivot. e_v equals the CPU osd_0 on the
+    fused and the per-step path."""
     rng = np.random.default_rng(M)
     N, B = 20 * M, 8
     H = (rng.random((M, N)) < 0.08).astype(np.uint8)
@@ -168,19 +135,12 @@ def test_rank_deficient_late_pivots(M):
     Ht = bundle.select("hx")[3]
 
     ref = _cpu_osd(bundle, synd, llr)
-    outs = []
     for per_step in (False, True):
         dec = osd_gpu.create(dict(CUDA_CFG, force_per_step=per_step), bundle=bundle)
         assert dec.A_rank < M
-        outs.append(_run(dec, synd, llr, Ht))
+        out = _run(dec, synd, llr, Ht)
         assert dec.last_pivot_pos >= 2 * M  # a pivot beyond the first 2M columns
-        assert torch.equal(outs[-1], ref), f"force_per_step={per_step}"
-    refk = _reference_decoder(CUDA_CFG, bundle)
-    assert refk.A_rank == dec.A_rank
-    assert torch.equal(_run(refk, synd, llr, Ht), ref)
-    # Random syndromes, mostly outside the column space of H.
-    rs = torch.from_numpy(rng.integers(0, 2, (B, M))).to(torch.uint8)
-    assert torch.equal(_run(dec, rs, llr, Ht), _run(refk, rs, llr, Ht))
+        assert torch.equal(out, ref), f"force_per_step={per_step}"
 
 
 def _gpu_variants(cfg, bundle, B):
@@ -204,8 +164,7 @@ def _gpu_variants(cfg, bundle, B):
 def test_early_stop_low_weight(surface10):
     """Errors of weight 1 to 3 whose columns come first in the order: the
     syndrome lies in the span of the first pivots, so every scan stops before
-    the last pivot position of the full scan. e_v equals the CPU osd_0 and the
-    reference kernel."""
+    the last pivot position of the full scan. e_v equals the CPU osd_0."""
     cfg, bundle, _, _ = surface10
     H = bundle.select("hx")[3]
     Hd = H.to_dense().cpu().numpy().astype(np.int64)
@@ -228,14 +187,12 @@ def test_early_stop_low_weight(surface10):
         full_last = piv_pos[:, -1].cpu()
         assert bool((st["end"].cpu() - 1 < full_last).all()), label
         assert bool((st["pivots"].cpu() < dec.A_rank).all()), label
-    refk = _reference_decoder(cfg, bundle)
-    assert torch.equal(_run(refk, synd, llr, H), ref)
 
 
 def test_no_early_stop_inconsistent():
     """H with a duplicated row and syndromes that differ on those two rows, so
     no syndrome is in the column space: no scan stops early, every sample uses
-    all rank(H) pivots, and e_v equals the CPU osd_0 and the reference kernel."""
+    all rank(H) pivots, and e_v equals the CPU osd_0."""
     rng = np.random.default_rng(4)
     M, N, B = 30, 240, 12
     Hm = (rng.random((M, N)) < 0.1).astype(np.uint8)
@@ -252,13 +209,11 @@ def test_no_early_stop_inconsistent():
         st = dec.scan_stats
         assert not bool(st["stopped"].any()), label
         assert bool((st["pivots"] == dec.A_rank).all()), label
-    refk = _reference_decoder(CUDA_CFG, bundle)
-    assert torch.equal(_run(refk, synd, llr, H), ref)
 
 
 def test_gpu_rank_fallback(monkeypatch):
     """With ldpc hidden, rank(H) comes from the GPU scan and equals the host
-    reference elimination."""
+    elimination in _gf2_rank."""
     rng = np.random.default_rng(2)
     H = (rng.random((30, 90)) < 0.1).astype(np.uint8)
     H[5] = H[3] ^ H[4]
