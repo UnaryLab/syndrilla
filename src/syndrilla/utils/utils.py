@@ -27,7 +27,9 @@ def parse_device_dtype(cfg, default_dtype="float64"):
 
     dtype_name = str(cfg.get("dtype", default_dtype))
     if dtype_name not in {"float32", "float64", "bfloat16", "float16"}:
-        logger.warning(f"Invalid input data type <{dtype_name}>, default to <torch.float64>.")
+        logger.warning(
+            f"Invalid input data type <{dtype_name}>, default to <torch.float64>."
+        )
         dtype_name = "float64"
     dtype = getattr(torch, dtype_name)
 
@@ -730,7 +732,7 @@ def fp2fxp(input, intwidth=7, fracwidth=8, rounding="floor"):
 
 
 def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_density):
-    """predict_pct schedule for the rebatch_speedup deferred ('extra') queue.
+    """predict_pct schedule for the rebatch_opt deferred ('extra') queue.
 
     The cap defers hard (slow-to-converge) samples into an extra queue; this decides
     WHEN to re-decode them (NOT the cap percentile, which decides WHICH samples get
@@ -748,7 +750,9 @@ def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_d
     Returns (flush, flushing): whether to run an extra batch now, and whether this is the
     endgame drain (used only for logging).
     """
-    flushing = num_err >= batch_size  # endgame: error budget passed
+    flushing = (
+        target_error is not None and num_err >= target_error
+    )  # endgame: error budget passed
     if n_extra <= 0:
         return False, flushing
     if target_error is None:
@@ -764,13 +768,13 @@ def should_flush_extra_queue(n_extra, num_err, target_error, batch_size, extra_d
 
 
 class ExtraQueue:
-    """Deferred-sample queue for the rebatch_speedup adaptive cap.
+    """Deferred-sample queue for the rebatch_opt adaptive cap.
 
-    The cap leaves hard (unconverged) samples behind; they are parked here on CPU
-    and re-decoded later in full, uncapped batches. This class owns the offload
-    scheduling (WHEN to flush, via should_flush_extra_queue) and the one-time
-    hard-queue density measurement; the cap itself decides WHICH samples get
-    deferred. A no-op until samples are actually deferred into it.
+    The cap leaves hard (unconverged) samples behind; they are parked here on the
+    decoder device and re-decoded later in full, uncapped batches. This class
+    owns the offload scheduling (WHEN to flush, via should_flush_extra_queue) and
+    the one-time hard-queue density measurement; the cap itself decides WHICH
+    samples get deferred. A no-op until samples are actually deferred into it.
     """
 
     def __init__(self, batch_size, target_error, device="cpu"):
@@ -779,25 +783,33 @@ class ExtraQueue:
         self.device = (
             device  # decoder's device: deferred samples live where they're re-decoded
         )
-        self.err = None  # [n, N] deferred errors (on self.device)
-        self.llr = None  # [n, ...] deferred priors (on self.device)
+        # deferred rows (on self.device): err, llr0 (prior after adjust_llr0), synd
+        # (measured syndrome), obs (observable flips, or None when the measurer has none)
+        self.rows = None
         self.density = None  # errors-per-drained-sample, frozen after the FIRST flush
 
     def __len__(self):
-        return 0 if self.err is None else self.err.shape[0]
+        return 0 if self.rows is None else self.rows[0].shape[0]
 
     @property
     def nonempty(self):
         return len(self) > 0
 
-    def defer(self, err, llr, defer_mask):
-        """Park the rows selected by defer_mask (a full-batch bool tensor) onto the queue."""
+    def defer(self, defer_mask, err, llr0, synd, obs=None):
+        """Park the rows selected by defer_mask (a full-batch bool tensor) onto the queue,
+        together with the syndrome and observable flips measured for them."""
         if not bool(defer_mask.any()):
             return
-        d = defer_mask.to(err.device)  # index on err's device
-        e_def, l_def = err[d].detach().to(self.device), llr[d].detach().to(self.device)
-        self.err = e_def if self.err is None else torch.cat((self.err, e_def))
-        self.llr = l_def if self.llr is None else torch.cat((self.llr, l_def))
+        new = [
+            None if t is None else t[defer_mask.to(t.device)].detach().to(self.device)
+            for t in (err, llr0, synd, obs)
+        ]
+        if self.rows is None:
+            self.rows = new
+        else:
+            self.rows = [
+                None if a is None else torch.cat((a, b)) for a, b in zip(self.rows, new)
+            ]
 
     def should_flush(self, num_err):
         """(do_flush, flushing): wrap should_flush_extra_queue with the queue's own state."""
@@ -806,11 +818,11 @@ class ExtraQueue:
         )
 
     def take_batch(self):
-        """Pop up to batch_size of the hardest deferred samples as a one-item dataloader.
-        Returns (error_dataloader, n_taken)."""
+        """Pop up to batch_size deferred samples, oldest first, as a one-item dataloader
+        of (err, llr0, synd, obs). Returns (error_dataloader, n_taken)."""
         n = min(self.batch_size, len(self))
-        batch = [(self.err[:n], self.llr[:n], None)]
-        self.err, self.llr = self.err[n:], self.llr[n:]
+        batch = [tuple(None if t is None else t[:n] for t in self.rows)]
+        self.rows = [None if t is None else t[n:] for t in self.rows]
         return batch, n
 
     def freeze_density(self, errors_found, n_drained):

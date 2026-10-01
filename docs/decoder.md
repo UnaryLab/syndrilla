@@ -17,7 +17,8 @@ The following table details the configuration parameters shared by every decodin
 | `decoding.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
 | `decoding.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 | `decoding.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device, skipping the fused-CUDA-kernel port | `false`                  |
-| `decoding.rebatch_speedup`| (optional) Adaptive batch-shrinking cap (Section 4)                        | `{kl_eps: 0.001}`                                  |
+| `decoding.rebatch_opt`  | (optional) Iteration cap on or off, default `true`; `false` means no iteration cap (Section 4) | `false`                                  |
+| `decoding.rebatch_opt_params`| (optional) Block overriding the cap's defaults `kl_eps`, `kl_window`, `kl_min`, `candidates` (Section 4) | `{kl_eps: 0.001}`                                  |
 | `decoding.config`       | Algorithm-specific settings, one entry per entry of `decoding.algorithm` (Section 1.1) | `{max_iter: 131}`         |
 
 ### 1.1. Algorithm-specific configuration (`decoding.config`)
@@ -45,7 +46,7 @@ A key written in the wrong half is **rejected, not ignored**: `max_iter` left at
 
 The kernels come in two flavors. The BP decoders use **fused per-iteration kernels** that vectorize the message-passing across the batch. The graph decoders `mwpm` and `union_find` are inherently sequential per shot, so their kernels parallelize over the **batch axis** (one CUDA thread decodes one shot), while `osd_0` runs one thread block per sample. For `osd_0`, `mwpm`, and `union_find` the CUDA output is **bit-for-bit identical** to the corresponding CPU implementation.
 
-The selection **falls back to PyTorch automatically**. If no CUDA GPU is available, or the `.cu` kernel fails to build or instantiate (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM, where the CUDA kernels do not compile), the plain `<algo>/<algo>.py` PyTorch module runs instead, on whatever device the config resolves to (the CUDA device under ROCm, otherwise CPU). The same fallback applies when an algorithm has no CUDA port. Set `force_pytorch: true` to force the PyTorch module even on an NVIDIA CUDA device.
+The selection **falls back to PyTorch automatically**. If no CUDA GPU is available, or the `.cu` kernel fails to build or instantiate (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM, where the CUDA kernels do not compile), the plain `<algo>/<algo>.py` PyTorch module runs instead, on whatever device the config resolves to (the CUDA device under ROCm, otherwise CPU). The same fallback applies when an algorithm has no CUDA port. Set `force_pytorch: true` to force the PyTorch module even on an NVIDIA CUDA device. The PyTorch `bp_norm_min_sum` and the PyTorch decoders built on it (`bp_sf`, `bp_lottery`, `bp_lottery_policy`, `bp_norm_min_sum_quant`, `bp_lottery_quant`, `bp_sum_prod`), plus `relay_bp`, `bp_branch_assisted` and `bp4`, compile their iteration body with `torch.compile` on CUDA by default (decoder config key `compile`, default `true`); set `compile: false` to run them eager. Each decoder instance keeps its own compile cache. On CPU, or without torch.compile and Triton, the key is ignored and the eager path runs.
 
 ## 2. Chained decoders
 A list of algorithms runs each decoder in order; later decoders are only invoked on samples that the earlier ones did not converge on.
@@ -84,8 +85,8 @@ The following table lists every algorithm registered under `src/syndrilla/decode
 | `union_find`                | 1        | Union-Find (Delfosse-Nickerson) cluster-growth + peeling decoder. Graphlike codes only (every qubit column touches at most 2 checks; weight-1 = open boundary, e.g. surface codes; weight-2 = toric) | Almost-linear-time decoding for topological codes (arXiv:1709.06218); port of chaeyeunpark/UnionFind         |
 | `saq`                       | 1        | Learned dual-stream transformer decoder plus CPND constraint projection. Single feed-forward pass; toric and rotated surface codes only; needs trained weights | SAQ: Stabilizer-Aware Quantum Error Correction Decoder (arXiv:2512.08914); port of DavidZenati/SAQ-Decoder |
 
-### 3.1. Decoders using only the common configuration
-`bp_norm_min_sum` and `osd_0` introduce no algorithm-specific fields beyond Section 1 and `decoding.config.max_iter`.
+### 3.1. bp_norm_min_sum and osd_0
+`osd_0` adds one optional key beyond Section 1, `decoding.config.workspace_bytes` (default 4 GiB), described in its entry below. `bp_norm_min_sum`, the PyTorch decoders built on it, `relay_bp`, `bp_branch_assisted` and `bp4` add one optional key, `decoding.config.compile` (default `true`), which applies only to their PyTorch path on a CUDA device; see Section 1.1.
 
 - `bp_norm_min_sum` — normalized min-sum BP. Standalone example (`bp_hx.decoding.yaml`):
 
@@ -101,7 +102,7 @@ decoding:
     max_iter: 181
 ```
 
-- `osd_0` — order-0 Ordered Statistics Decoding. Almost always chained after a BP variant; runs only on samples the previous decoder did not converge on. There is no standalone OSD example, since it is configured inside a chained decoding YAML such as `bposd_hx.decoding.yaml` (see Section 2). `osd_0` does not iterate, so it ignores `max_iter`. On a `cuda` device it uses its CUDA kernel (`osd_0/osd_0_cuda.py`, one thread block per sample), whose correction is bit-for-bit identical to the PyTorch path; it falls back to PyTorch on CPU or when the kernel is unavailable.
+- `osd_0` — order-0 Ordered Statistics Decoding. Almost always chained after a BP variant; runs only on samples the previous decoder did not converge on. There is no standalone OSD example, since it is configured inside a chained decoding YAML such as `bposd_hx.decoding.yaml` (see Section 2). `osd_0` does not iterate, so it ignores `max_iter`. It scans the columns in ascending LLR order and keeps each column that is independent of those already kept. For a syndrome in the column space of `H` it stops once the syndrome lies in their span, and the correction is the unique solution on the kept columns. A syndrome outside the column space never stops early: the scan runs to the end of the order and the correction solves the system on the pivot rows only. It sorts and scans the batch in chunks of samples whose working memory fits `workspace_bytes` (default 4 GiB), set in the `osd_0` entry of `decoding.config`, the same key `osd_0_cuda` reads. The budget counts `12*(M+1)*U + 16*D*U + 64*(M+1) + 48*U + 60*N` bytes per sample, with `U = ceil((M+1)/64)` words and `D` the largest column weight of `H` rounded up to a power of two: the bit-packed row transform (`8*(M+1)*U`) and its row-update temporaries (`4*(M+1)*U`), the gathered column words, the per-row vectors (a row-transform column, its nonzero indices, the pivot rows and columns), the packed per-sample vectors, and the sort, column order and estimate. The inputs (`llr`, `synd`), the `[B, N]` outputs and the retry stages' copies of the inputs are outside the budget. Its `iter` output is the previous decoder's `iter` (zeros when there is none), with `N`, the number of columns of `H`, on the samples OSD decodes; `converge` is 1 for every sample. On a `cuda` device it uses its CUDA kernel (`osd_0/osd_0_cuda.py`, one thread block per sample), whose correction is bit-for-bit identical to the PyTorch path; it falls back to PyTorch on CPU or when the kernel is unavailable.
 
 ### 3.2. bp_norm_min_sum_quant
 Normalized min-sum BP with fixed-point quantized messages. Example configuration (`bp_quant_hx.decoding.yaml`):
@@ -395,19 +396,30 @@ The SF stage is configured by a nested `sf` block under `decoding.config`.
 
 `w_max` below `w_min` disables SF with a warning, so the defaults leave the decoder as plain normalized min-sum BP.
 
-## 4. Adaptive iteration speedup (`rebatch_speedup`)
-An opt-in, per-decoder block consumed by the iterative BP decoders `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp4`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, and `relay_bp` and by `bp_branch_assisted` on its CUDA path only (other algorithms, e.g. `bp_sf` and `osd_0`, ignore it). It reduces decoding **time** by stopping a batch once a warm-up-learned fraction of samples has converged and deferring the unconverged tail to be re-decoded uncapped.
+## 4. Adaptive iteration speedup (`rebatch_opt`, `rebatch_opt_params`)
+The iteration cap stops a batch once a warm-up-learned fraction of its samples has converged and defers the unconverged rest to be decoded again uncapped. It reduces decoding **time**.
 
-For these BP decoders the cap is **lossless**: every sample is still fully decoded, so the logical error rate is identical to a no-cap run. The deferred tail (`converge == 0`) is still re-decoded uncapped.
+The group key `rebatch_opt` (boolean, default `true`, Section 5.1) turns the cap on and off. The `rebatch_opt_params` block only overrides the cap's default parameters:
+- `rebatch_opt: true` without a `rebatch_opt_params` block runs the cap with the default parameters in the table below.
+- `rebatch_opt: true` with the block runs the cap with the block's values, and the defaults for the keys it leaves out.
+- `rebatch_opt: false` runs without the cap, even when the block is present.
 
-**Setup.** Add an `rebatch_speedup` block to the decoding YAML; omit it to disable the feature.
+`rebatch_opt` goes in a stage's `decoding.config` entry or at the top level of the `decoding` block, like the other group keys (Section 5.3). The key `rebatch_speedup` is not accepted: a config that has it raises a `ValueError` that names `rebatch_opt` and `rebatch_opt_params`.
+
+**Decoders.** The cap is read by `bp_norm_min_sum` (both paths) and the decoders built on its loop: `bp_norm_min_sum_quant`, `bp_sum_prod`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`; by `bp4` and `relay_bp` (both paths); and by `bp_branch_assisted` on its CUDA path only. `bp_sf`, `osd_0`, `mwpm`, `union_find` and `saq` have no cap. `main.py` keeps the cap only on the first decoder of a chain; BP stages after the first never cap.
+
+**Single round only.** The cap applies when the syndrome has no rounds dimension. With a syndrome generator whose `rounds` is above 1 (the phenomenological measurer), `main.py` logs a warning that the cap supports one round only, and the run never caps. A stim circuit counts as one round, since its detectors already cover every QEC round.
+
+**Warm-up.** For each batch the decoder records the histogram of stop iterations and pools it with the earlier batches. From the second batch on it computes the KL divergence between the pooled histogram with and without the new batch (Laplace smoothed) and logs `batch <n>: KL=<kl> streak=<s>/<kl_window>`. A batch counts as settled when at least `kl_min` batches have been seen and the KL is below `kl_eps`; any other batch resets the streak. After `kl_window` settled batches in a row, the decoder picks the percentile from `candidates` with the best projected speedup (ties keep the higher percentile) and logs `warm-up done after <n> batches: cap p<P> (stop each batch at <P>% converged), projected speedup <x>x`. With the defaults the earliest end of warm-up is batch 5: batches 1 and 2 cannot count as settled (`kl_min: 3`), and batches 3, 4 and 5 make the streak of 3. How many batches it takes beyond that depends on how fast the pooled histogram stops moving.
+
+**Capped batches.** After warm-up each batch stops once `P` percent of its samples have converged. `main.py` keeps the results of the samples the first decoder converged, puts the others in a queue, and decodes them again in later batches with the cap bypassed, so every sample is still fully decoded. A deferred sample reuses the syndrome, initial LLRs and observable flips measured with its first batch, so its result is the same as in a run without the cap. The exception is the `bp_lottery` family (`bp_lottery`, `bp_lottery_policy`, `bp_lottery_quant`) when the sign flip draws from the global RNG (`random_machine: system`, or the `local_random` policy): decoding a deferred sample again in another batch draws new random values, so capped and uncapped runs are not bit-equal. With the default Sobol draws the value depends only on the iteration index, so the result does not change. With `-te` the queue is decoded once it is predicted to hold the remaining errors; with `-tb` once it holds a full batch, and `-tb` counts the first-pass batches only, not the batches of deferred samples. After the run's budget is spent the loop keeps going until the queue is empty.
 
 ```
 decoding:
   algorithm: bp_norm_min_sum
   check_type: hx
   dtype: float64
-  rebatch_speedup:
+  rebatch_opt_params:
     kl_eps: 0.001
     kl_window: 2
     kl_min: 3
@@ -418,17 +430,119 @@ decoding:
     max_iter: 181
 ```
 
-| Key                               | Description                                              | Example | Default  |
-|-----------------------------------|----------------------------------------------------------|---------|----------|
-| `decoding.rebatch_speedup.kl_eps`     | Warm-up KL threshold (larger ⇒ shorter warm-up)          | `0.001` | `0.0001` |
-| `decoding.rebatch_speedup.kl_window`  | Consecutive settled batches that end warm-up             | `2`     | `3`      |
-| `decoding.rebatch_speedup.kl_min`     | Minimum warm-up batches                                  | `3`     | `3`      |
-| `decoding.rebatch_speedup.candidates` | (optional) cap percentiles to consider                   | -       | `0..99`  |
+| Key                                    | Description                                              | Example | Default  |
+|----------------------------------------|----------------------------------------------------------|---------|----------|
+| `decoding.rebatch_opt_params.kl_eps` | Warm-up KL threshold (larger ⇒ shorter warm-up)          | `0.001` | `0.0001` |
+| `decoding.rebatch_opt_params.kl_window` | Consecutive settled batches that end warm-up             | `2`     | `3`      |
+| `decoding.rebatch_opt_params.kl_min` | Minimum warm-up batches                                  | `3`     | `3`      |
+| `decoding.rebatch_opt_params.candidates` | (optional) cap percentiles to consider                   | -       | `0..99`  |
 
-**Output.** When a decoder uses `rebatch_speedup`, its per-decoder block in the result YAML gains a `rebatch_speedup` entry reporting `warmup batches` (the number of warm-up batches the KL test consumed) and, once the cap is chosen, `chosen pct`. This entry is emitted **before** the `total time (s)` timing fields.
+**Output.** When a decoder runs with the cap, its per-decoder block in the result YAML gains a `rebatch_opt` entry reporting `warmup batches` (the number of warm-up batches the KL test consumed) and, once the cap is chosen, `chosen pct`. This entry is emitted **before** the `total time (s)` timing fields.
 
 
-## 5. Decoder I/O contract
+## 5. Optimization knobs
+Every optimization in `bp_norm_min_sum` (both paths) and in `osd_0` (both paths), the H storage, and the iteration cap can be turned off by a decoder config key. Turning one off runs the plain implementation of the same algorithm, so the outputs stay the same; the exceptions are noted below. The decoders built on `bp_norm_min_sum` read only some of the knobs (see Section 5.3). Every boolean knob is `true` when its optimization is on (`persistent_kernel` also takes `auto`, its default); `edge_layout` is the one string knob, and `host_check_every`, `compact_frac` and `workspace_bytes` are numbers. The knobs are for ablation studies and debugging; the defaults are the fastest settings.
+
+### 5.1. Group keys
+Six boolean group keys, each default `true`, turn off a whole group at once. Setting a group key to `false` sets each of its members to the off value listed below. A decoder ignores the members it does not read.
+
+| Key           | Idea                                                       | Members, with off value |
+|---------------|------------------------------------------------------------|-------------------------|
+| `pruning_opt` | Stop or skip work once its result is known                 | `host_check_every: 0`, `skip_converged: false`, `compact_frac: 0`, `osd_early_stop: false`, `osd_prefix_scan: false`, `osd_solve_by_pivots: false`, `osd_skip_converged: false` |
+| `fusion_opt`  | Fewer kernel launches and fewer host round trips           | `persistent_kernel: false`, `compile: false`, `fuse_vn: false` |
+| `mapping_opt` | Map the message passing onto the GPU's execution model     | `cn_sign_parity: false`, `warp_per_check: false`, `f64_int_compare: false`, `edge_layout: padded` |
+| `gather_opt`  | Gather-based sums in a fixed order, same result on every run | `c2v_gather: false`, `vn_gather: false` |
+| `memory_opt`  | Allocate only what is live, and pack it                    | `reuse_buffers: false`, `osd_column_scan: false`, `osd_packed_transform: false`, `workspace_bytes: 1 << 60`, `sparse_h: false` |
+| `rebatch_opt` | Stop a batch at a learned percentile and defer the slow rest | `rebatch_opt: false` turns the iteration cap off; no other members (Section 4) |
+
+The group map is `GROUP_OFF` in `src/syndrilla/decoder/knobs.py`. `RebatchSpeedup.from_cfg` (`src/syndrilla/decoder/decoder.py`) reads `rebatch_opt`.
+
+### 5.2. Individual knobs
+Paths: "BP CUDA" is `bp_norm_min_sum/bp_norm_min_sum_cuda.py`, "BP PyTorch" is `bp_norm_min_sum/bp_norm_min_sum.py`, "OSD" is both `osd_0/osd_0.py` and `osd_0/osd_0_cuda.py`, "H" is the matrix bundle (`matrix/matrix.py`) and the stim syndrome measurer (`syndrome/stim/stim.py`). "per-step path only" means the knob acts on the BP CUDA per-step path and the persistent path never reads it.
+
+`pruning_opt`
+
+| Key                   | Path(s)    | Default | Off behavior |
+|-----------------------|------------|---------|--------------|
+| `host_check_every`    | BP CUDA    | `8`     | Per-step path checks on the host for early exit every this many iterations; `0` never checks, so the batch runs to `max_iter`. With the rebatch cap active the check runs every iteration. |
+| `skip_converged`      | BP CUDA    | `true`  | `false`: the kernels run every sample to the end of the batch, and each converged sample returns its iterate from its convergence iteration. |
+| `compact_frac`        | BP PyTorch | `0.75` (at most `0.75`) | Compact the per-iteration state to the unconverged samples once fewer than this fraction of rows are unconverged; `0` never compacts. |
+| `osd_early_stop`      | OSD        | `true`  | `false`: the scan does not stop once the syndrome is spanned. PyTorch scans the whole order; CUDA stops at full rank. The outputs are equal. |
+| `osd_prefix_scan`     | OSD        | `true`  | `false`: one stable sort over the whole order, instead of a first scan over the `N/16` least reliable columns with retries on `4N/16` and then all columns. The prefix applies only when `N >= 16384` and `osd_column_scan` is on. |
+| `osd_solve_by_pivots` | OSD        | `true`  | `false`: back substitution over `M` pivot slots (PyTorch) or elimination over `rank(H)` columns (CUDA), instead of the largest pivot count found. |
+| `osd_skip_converged`  | OSD        | `true`  | `false`: decode every sample and keep the result only where `converge` is 0. |
+
+`fusion_opt`
+
+| Key                 | Path(s)    | Default | Off behavior |
+|---------------------|------------|---------|--------------|
+| `persistent_kernel` | BP CUDA    | `auto`  | `auto` runs the persistent kernel (one launch for all iterations) when `M <= 120`, or when `M <= 1320` and the batch has at least 4 samples per SM; `true` runs it whenever it can; `false` launches once per iteration step. `force_per_step: true` is the same as `persistent_kernel: false` when `persistent_kernel` is not set. |
+| `compile`           | BP PyTorch | `true`  | `false`: run the iteration body eager instead of through `torch.compile`. Applies on a CUDA device only. |
+| `fuse_vn`           | BP CUDA    | `true`  | `false`: a separate variable-node kernel (`vn_update_csr`) fills an `a_v2c` buffer `[B, nnz + 1]` (CSR) or `[B, M * D + 1]` (padded) before each check update, instead of the variable-node message computed inside the check-node kernel. Per-step path only. |
+
+`mapping_opt`
+
+| Key               | Path(s)    | Default | Off behavior |
+|-------------------|------------|---------|--------------|
+| `cn_sign_parity`  | BP PyTorch | `true`  | `false`: the check-node update takes the product of signs and `topk(2)`, instead of a sign-bit parity and min/amin. Ignored by a decoder that overrides `cn_update`. |
+| `warp_per_check`  | BP CUDA    | `true`  | `false`: one thread per check, a serial scan in `k` order, instead of a warp per check with shuffle reductions; same minima and tie order as the warp merge. Per-step path only. |
+| `f64_int_compare` | BP CUDA    | `true`  | `false`: the double check-node compares (sign test, absolute value and minimum match) use float compares instead of integer ops on the bit patterns. Both paths; no effect on other dtypes. |
+| `edge_layout`     | BP CUDA    | `csr`   | `padded`: check rows stored as padded `[M, D]` rows whose dummy edges have column index `N` and are skipped, with edge buffers `[B, M * D + 1]`, instead of CSR. Runs on both the per-step and the persistent path. |
+
+`gather_opt`
+
+| Key             | Path(s)    | Default | Off behavior |
+|-----------------|------------|---------|--------------|
+| `c2v_gather`    | BP PyTorch | `true`  | `false`: sum the check-to-variable messages with `index_add_` and run eager. On CUDA the atomic adds have no fixed order, so the LLRs can differ run to run in the last bits; on CPU the result is bit-identical. Ignored by a decoder that overrides `c2v`. |
+| `vn_gather`     | BP CUDA    | `true`  | `false`: the variable-node update sums its messages with one atomic add per edge. A baseline for ablation studies, not an optimization the decoder uses. Per-step path only; does not force `fuse_vn` off. The atomic add order is not fixed, so `llr` varies run to run. At stim d=9, `e_v`, `iter` and `converge` match the default, and `llr` is within rtol `1e-6` on converged rows and rtol `1e-4` / atol `1e-4` on unconverged rows. At stim d >= 11 the drift can change `e_v` and `iter`, and converged-row `llr` can differ beyond rtol `1e-6`. |
+
+`rebatch_opt`
+
+| Key           | Path(s) | Default | Off behavior |
+|---------------|---------|---------|--------------|
+| `rebatch_opt` | `bp_norm_min_sum` (both paths), `bp_norm_min_sum_quant`, `bp_sum_prod`, the `bp_lottery` family, `bp4`, `relay_bp`, `bp_branch_assisted` CUDA | `true` | `false`: no iteration cap, so every batch runs until all its samples converge or reach `max_iter`, and nothing is deferred. The `rebatch_opt_params` block, if present, is ignored. Single-round runs only (Section 4). |
+
+`memory_opt`
+
+| Key                    | Path(s)     | Default | Off behavior |
+|------------------------|-------------|---------|--------------|
+| `reuse_buffers`        | BP PyTorch  | `true`  | `false`: allocate the eager work buffers every iteration and compact by plain indexing. |
+| `osd_column_scan`      | OSD         | `true`  | `false`: CUDA eliminates over all `N` columns of the order without the column-local scan; PyTorch runs a dense Gauss-Jordan on `H` augmented with `s` over the whole order. |
+| `osd_packed_transform` | OSD PyTorch | `true`  | `false`: keep the row transform as a dense bool matrix instead of bit-packed and transposed. |
+| `workspace_bytes`      | OSD         | `4 << 30` (4 GiB) | Byte budget per chunk of samples (see Section 3.1). The group off value `1 << 60` puts the whole batch in one chunk. |
+| `sparse_h`             | H           | `true`  | Set outside the `decoding` block (see Section 5.3), read by the matrix bundle and the stim syndrome measurer. `true` keeps H as a coalesced bool sparse COO tensor and computes the syndrome with a sparse matmul; `false`: `MatrixBundle.select()` returns a dense int64 H and the syndrome uses a dense matmul. The bundle builds each check type's H once and `select()` returns that same tensor on every call. The outputs are bit-identical. `union_find`, `mwpm` and `saq` read the sparse H from the matrix loader. |
+
+### 5.3. Coupling rules
+- `osd_early_stop: false` forces `osd_prefix_scan` off.
+- `skip_converged: false`, `warp_per_check: false`, `fuse_vn: false`, `vn_gather: false`, or `persistent_kernel: false` (or `force_per_step: true`) force the BP CUDA per-step path, so the persistent kernel does not run. `edge_layout: padded` does not. The per-step path also runs for a subclass that overrides `_iter_hook` (the `bp_sf` main pass and the `bp_lottery` family), when no persistent block fits on an SM, and when the rebatch cap is active and the batch has more samples than can be co-resident.
+- The quantized subclasses (`bp_norm_min_sum_quant`, `bp_lottery_quant`) run the default kernels and ignore `warp_per_check`, `fuse_vn`, `f64_int_compare`, `edge_layout` and `vn_gather`, but `warp_per_check: false`, `fuse_vn: false` and `vn_gather: false` still force their per-step path.
+- `bp_sf` runs its persistent retries on the default kernels. `relay_bp` and `bp_branch_assisted` on CUDA ignore the BP CUDA kernel knobs.
+- `c2v_gather: false` or `cn_sign_parity: false` force `compile` off.
+- `rebatch_opt` is the switch for the iteration cap; the `rebatch_opt_params` block only overrides its default parameters (Section 4). On a syndrome with more than one round `main.py` runs uncapped whatever `rebatch_opt` says.
+- An individual key set explicitly wins over its group key: `pruning_opt: false` with `osd_skip_converged: true` turns off every other `pruning_opt` member.
+- All knobs and group keys except the H storage go in a stage's `decoding.config` entry, or at the top level of the `decoding` block, where they reach every stage of a chain. A key in a stage's entry wins over the same key at the top level.
+- H storage (`sparse_h`, or `memory_opt: false` for its `sparse_h: false` member) is read only outside the `decoding` block: from the `interface` block with `-i` (forwarded to both the stim syndrome measurer and the matrix bundle), else from the `matrix` block (the H the decoders get) and the stim `syndrome` block (the syndrome matmul). `memory_opt: false` in the `decoding` block alone turns off the other `memory_opt` members and leaves H sparse.
+
+```
+decoding:
+  algorithm: [bp_norm_min_sum, osd_0]
+  check_type: hx
+  dtype: float64
+  memory_opt: false        # every stage
+  config:
+    - {max_iter: 181, compile: false}
+    - {osd_early_stop: false}
+```
+
+```
+interface:
+  backend: stim
+  code: surface_code:rotated_memory_x
+  distance: 11
+  sparse_h: false          # dense H for the syndrome and the decoders
+```
+
+## 6. Decoder I/O contract
 Every decoder consumes and returns an `io_dict` with the following entries.
 | Key                | Direction | Description                                                                                              |
 |--------------------|-----------|----------------------------------------------------------------------------------------------------------|

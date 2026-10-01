@@ -1640,8 +1640,8 @@ class create(torch.nn.Module):
             raise ValueError(
                 "mwpm requires a pre-loaded MatrixBundle via the `bundle` kwarg."
             )
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(
-            self.check_type
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = (
+            (bundle.Hx_matrix if self.check_type.lower() == "hx" else bundle.Hz_matrix).get_index()
         )
 
         # Build the detector graph once from the sparse H (graphlike: col weight <= 2).

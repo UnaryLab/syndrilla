@@ -144,7 +144,11 @@ class create:
 
         rounds = syndrome_cfg.get("rounds", 1)
 
-        syn_cfg = {"measure": "stim", "rounds": rounds, **circuit_ref}
+        # top-level H storage knobs, read by the syndrome measurer and the matrix bundle
+        h_knobs = {
+            k: interface_cfg[k] for k in ("sparse_h", "memory_opt") if k in interface_cfg
+        }
+        syn_cfg = {"measure": "stim", "rounds": rounds, **circuit_ref, **h_knobs}
 
         self.syndrome_generator = create_syndrome(cfg=syn_cfg, training=training)
 
@@ -159,6 +163,7 @@ class create:
             "logical_check_matrix": True,
             "logical_check_lx": {**matrix_base, "target": "observable"},
             "logical_check_lz": {**matrix_base, "target": "observable"},
+            **h_knobs,
         }
         self.matrix_bundle = load_matrices(self.matrix_cfg, device, dtype)
 

@@ -4,6 +4,7 @@ from loguru import logger
 
 from syndrilla.decoder.bp_branch_assisted.bp_branch_assisted import create as _BranchPy
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import (
+    _build_csr,
     _build_vn_adj,
     _load_ext,
 )
@@ -11,9 +12,10 @@ from syndrilla.decoder.decoder import RebatchSpeedup
 
 
 class create(_BranchPy):
-    """bp_branch_assisted on CUDA kernels (per-step path). Accepts every
-    bp_branch_assisted key, plus the optional ``rebatch_speedup`` block to enable the
-    adaptive cap (omit it to run uncapped).
+    """bp_branch_assisted on the bp_norm_min_sum_cuda per-step CSR kernels, with
+    the per-sample beta applied in torch. Accepts every bp_branch_assisted key, plus
+    ``rebatch_opt`` (default true; false runs uncapped) and the optional
+    ``rebatch_opt_params`` block that tunes the adaptive cap.
     """
 
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
@@ -30,27 +32,33 @@ class create(_BranchPy):
         self.V_c_col = nn.Parameter(
             self.V_c_col.detach().to(self.device).long(), requires_grad=False
         )
-        adj_c, adj_k, self.VD = _build_vn_adj(self.V_c_col.cpu().numpy(), self.N)
-        self.VN_adj_c = nn.Parameter(
-            torch.from_numpy(adj_c).to(self.device), requires_grad=False
+        V_c_col_np = self.V_c_col.cpu().numpy()
+        adj_c, adj_k, _ = _build_vn_adj(V_c_col_np, self.N)
+        row_ptr, col, vn_eid = _build_csr(V_c_col_np, self.N, adj_c, adj_k)
+        self.nnz = len(col)
+        self.row_ptr = nn.Parameter(
+            torch.from_numpy(row_ptr).to(self.device), requires_grad=False
         )
-        self.VN_adj_k = nn.Parameter(
-            torch.from_numpy(adj_k).to(self.device), requires_grad=False
+        self.col = nn.Parameter(
+            torch.from_numpy(col).to(self.device), requires_grad=False
+        )
+        self.VN_eid = nn.Parameter(
+            torch.from_numpy(vn_eid).to(self.device), requires_grad=False
         )
 
-        # pure-PyTorch branch builds no cap; enable the adaptive cap here when an
-        # rebatch_speedup block is present (the forward below already honors it).
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get("rebatch_speedup"))
+        # pure-PyTorch branch builds no cap; build the adaptive cap here unless
+        # rebatch_opt is false (the forward below already honors it).
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
         self.cap_bypass = False
         self.cap_active_last = False
         if self.cap is None:
             logger.info(
-                "bp_branch_assisted_cuda: no rebatch_speedup block — running uncapped."
+                "bp_branch_assisted_cuda: rebatch_opt false, running uncapped."
             )
 
         self.algo = "bp_branch_assisted"
         logger.info(
-            "bp_branch_assisted_cuda decoder ready (per-step kernels + branching)."
+            "bp_branch_assisted_cuda decoder ready (per-step CSR kernels + branching)."
         )
 
     def forward(self, io_dict: dict) -> dict:
@@ -61,10 +69,7 @@ class create(_BranchPy):
         self.batch_size = B
         N_ext = self.N_ext
 
-        l_v = torch.zeros(B, N_ext, dtype=dt, device=dev)
-        e_v = torch.zeros(B, N_ext, dtype=dt, device=dev)
-        e_v_saver = torch.zeros(B, N_ext, dtype=dt, device=dev)
-        s_est = torch.zeros(B, M, dtype=dt, device=dev)
+        e_v_saver = torch.zeros(B, N_ext, dtype=torch.uint8, device=dev)
         l_saver = torch.zeros(B, N_ext, dtype=dt, device=dev)
         syndrome_saver = torch.zeros(B, M, dtype=dt, device=dev)
         s_est_saver = torch.zeros(B, M, dtype=dt, device=dev)
@@ -75,16 +80,21 @@ class create(_BranchPy):
 
         dummy_col = torch.full((B, 1), float("inf"), dtype=dt, device=dev)
         u_init = torch.cat([io_dict["llr0"].to(dev, dt), dummy_col], dim=1).contiguous()
-        e_out = torch.zeros(B, N_ext, dtype=dt, device=dev)
+        e_out = torch.zeros(B, N_ext, dtype=torch.uint8, device=dev)
         l_out = torch.zeros(B, N_ext, dtype=dt, device=dev)
         num_iters = torch.full((B,), -1, device=dev)
         converges = torch.zeros(B, dtype=torch.int64, device=dev)
 
-        D = int(self.V_c_col.shape[1])
-        message = u_init[:, self.V_c_col].contiguous()  # carried b_c2v (init)
-        message_saved = torch.zeros(B, M, D, dtype=dt, device=dev)
-        a_v2c = torch.zeros(B, M, D, dtype=dt, device=dev)
-        b_c2v = torch.zeros(B, M, D, dtype=dt, device=dev)
+        # CSR edge buffer [B, nnz + 1] of check->variable messages (last slot always
+        # zero), posterior LLR and uint8 hard decision. A sample at its first
+        # iteration (start or branch) has l_v = u_init and b_c2v = 0, so its first
+        # variable->check message is u_init. Every sample runs every iteration, so
+        # the kernels get an all -1 skip flag.
+        b_c2v = torch.zeros(B, self.nnz + 1, dtype=dt, device=dev)
+        message_saved = torch.zeros_like(b_c2v)
+        l_v = u_init.clone()
+        e_v = torch.empty(B, N_ext, dtype=torch.uint8, device=dev)
+        run_all = torch.full((B,), -1, dtype=torch.int64, device=dev)
 
         sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
         self.r = sobol.draw(self.max_iter * self.max_iter).to(dev, dt)
@@ -101,28 +111,20 @@ class create(_BranchPy):
             self.i += 1
             curr_iters = curr_iters + 1
 
-            self._ext.vn_update(l_v, message, self.V_c_col, a_v2c, self.N)
-            curr1 = curr_iters == 1
-            if curr1.any():
-                a_v2c[curr1] = message[curr1]
-
-            # ── cn_update (beta=1) then per-sample beta scale + dynamic syndrome ─
+            # variable->check message l_v[col] - b_c2v and check-node update with
+            # beta 1 in place on b_c2v, then the per-sample beta scale
             syndrome_neg_bc = torch.where(
                 syndrome == 0.0, torch.ones_like(syndrome), -torch.ones_like(syndrome)
             )
-            self._ext.cn_update(
-                a_v2c, syndrome_neg_bc, self.V_c_col, b_c2v, 1.0, self.N
+            self._ext.vn_cn_update_csr(
+                l_v, syndrome_neg_bc, self.row_ptr, self.col, b_c2v, run_all, 1.0, self.N
             )
-            beta_b = (1.0 - torch.pow(2.0, -curr_iters.to(dt))).view(B, 1, 1)
-            b_c2v = b_c2v * beta_b
-            message = b_c2v  # carry for next iteration
+            beta_b = (1.0 - torch.pow(2.0, -curr_iters.to(dt))).view(B, 1)
+            b_c2v.mul_(beta_b)
 
-            self._ext.llr_update(
-                u_init, b_c2v, self.VN_adj_c, self.VN_adj_k, l_v, self.VD
-            )
-            l_v[:, -1] = float("inf")
-            e_v = torch.where(l_v <= 0, 1.0, 0.0).to(dt)
-            self._ext.syndrome_est(e_v, self.V_c_col, s_est, self.N)
+            # l_v = sum of b_c2v + u_init (the dummy column gets +inf), hard decision
+            self._ext.llr_hard_update_csr(u_init, b_c2v, self.VN_eid, l_v, e_v, run_all)
+            s_est = (e_v[:, self.V_c_col].sum(2, dtype=torch.uint8) & 1).to(dt)
 
             if (curr_iters == 1).all():
                 s0_est_comp = torch.sum((s_est + syndrome) % 2, 1)
@@ -168,7 +170,8 @@ class create(_BranchPy):
             )[0]
             not_in = branch_index[~torch.isin(branch_index, index_saver)]
 
-            if not_in.numel() != 0 and self.i != 0:
+            branched = not_in.numel() != 0 and self.i != 0
+            if branched:
                 syndrome_saver[not_in] = syndrome[not_in]
                 syndrome[not_in] = sk_est_comp[not_in]
                 e_v_saver[not_in] = e_v[not_in]
@@ -176,15 +179,14 @@ class create(_BranchPy):
                 iteration_saver[not_in] = curr_iters[not_in]
                 curr_iters[not_in] = 0
                 l_saver[not_in] = l_v[not_in]
-                l_v[not_in] = u_init[not_in]
-                message_saved[not_in] = message[not_in]
-                message[not_in] = u_init[not_in][:, self.V_c_col]
+                message_saved[not_in] = b_c2v[not_in]
+                b_c2v[not_in] = 0.0
                 index_saver = torch.cat([not_in, index_saver], dim=0)
 
             b_finish = curr_iters[index_saver] >= self.max_b_iter
             if torch.any(b_finish):
                 last = index_saver[torch.where(b_finish)[0]]
-                message[last] = message_saved[last]
+                b_c2v[last] = message_saved[last]
                 syndrome[last] = syndrome_saver[last]
                 s0_est_comp[last] = torch.sum(
                     (s_est_saver[last] + syndrome[last]) % 2, 1
@@ -194,6 +196,9 @@ class create(_BranchPy):
                 index_saver = index_saver[~torch.isin(index_saver, last)]
 
             l_v = self.sign_flip(syndrome, s_est, l_v)  # inherited
+            if branched:
+                # new branch: l_v = u_init, set after the sign flip so the flip skips it
+                l_v[not_in] = u_init[not_in]
             checker = torch.where(num_iters == -1)[0]
 
         checker = torch.where(num_iters == -1)[0]
@@ -206,7 +211,7 @@ class create(_BranchPy):
 
         io_dict.update(
             {
-                "e_v": e_out[:, :-1],
+                "e_v": e_out[:, :-1].to(dt),
                 "iter": num_iters,
                 "llr": l_out[:, :-1],
                 "converge": converges,

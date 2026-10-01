@@ -23,6 +23,7 @@ class create:
     def __init__(self, syndrome_cfg, **kwargs) -> None:
         # imported here rather than at module scope: matrix/stim imports the stim
         # interface, which imports this package, and the cycle only closes at import time
+        from syndrilla.decoder.knobs import knob
         from syndrilla.matrix.stim.stim import _build_dem_matrices
 
         circuit_str = syndrome_cfg.get("circuit", None)
@@ -30,12 +31,16 @@ class create:
         self.path = "<inline>"
 
         H, obs_mat, _ = _build_dem_matrices(self.circuit)
-        H = H.tocoo()
-        self._H = torch.sparse_coo_tensor(
-            torch.from_numpy(np.vstack([H.row, H.col]).astype(np.int64)),
-            torch.from_numpy(H.data).to(torch.float32),
-            H.shape,
-        ).coalesce()
+        self.sparse_h = knob(syndrome_cfg, "sparse_h", True)
+        if self.sparse_h:
+            H = H.tocoo()
+            self._H = torch.sparse_coo_tensor(
+                torch.from_numpy(np.vstack([H.row, H.col]).astype(np.int64)),
+                torch.from_numpy(H.data).to(torch.float32),
+                H.shape,
+            ).coalesce()
+        else:
+            self._H = torch.from_numpy(H.toarray())
         self._L = torch.from_numpy(obs_mat.toarray())
 
         self.num_detectors = self.circuit.num_detectors
@@ -81,10 +86,14 @@ class create:
         # since a row sum counts at most the circuit's fault mechanisms and float32
         # represents every integer below 2^24 exactly
         e = error.to(dtype=torch.float32)
-        H = self._H.to(device=device)
+        H = self._H.to(device=device, dtype=torch.float32)
         L = self._L.to(device=device, dtype=torch.float32)
 
-        syndrome = (torch.sparse.mm(H, e.t()) % 2).t().contiguous().to(torch.int64)
+        if self.sparse_h:
+            syndrome = (torch.sparse.mm(H, e.t()) % 2).t().contiguous()
+        else:
+            syndrome = (e @ H.t()) % 2
+        syndrome = syndrome.to(torch.int64)
         self.observable_flips = ((e @ L.t()) % 2).to(torch.uint8)
         self.syndrome_actual = syndrome
 

@@ -5,8 +5,7 @@ import random
 import torch
 from loguru import logger
 
-from syndrilla.utils import parse_device_dtype
-from syndrilla.decoder.decoder import RebatchSpeedup
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _Base
 
 
 def sample_n_choose_k(iterable, k, num_samples):
@@ -31,10 +30,10 @@ def sample_n_choose_k(iterable, k, num_samples):
     return random.sample(list(itertools.combinations(iterable, k)), num_samples)
 
 
-class create(torch.nn.Module):
+class create(_Base):
     """BP-SF decoder (normalized min-sum BP + syndrome-flipping post-processing).
 
-    The belief-propagation core is identical to ``bp_norm_min_sum`` (parallel
+    The belief-propagation core is the ``bp_norm_min_sum`` forward (parallel
     normalized min-sum with the adaptive factor ``beta = 1 - 2^-i``, which is what
     the reference's ``bp_method="ms", ms_scaling_factor=0`` resolves to). On top of
     it BP-SF adds the two ingredients from https://github.com/Dies-Irae/BP-SF
@@ -52,78 +51,34 @@ class create(torch.nn.Module):
     """
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
-        super(create, self).__init__()
+        super(create, self).__init__(decoding_cfg, **kwargs)
 
         logger.info("Creating bp_sf decoder.")
 
-        # set up default device
-        self.device, _ = parse_device_dtype(decoding_cfg)
-
-        # set up default max_iter
-        self.max_iter = decoding_cfg.get("max_iter", 50)
-        if self.max_iter <= 0 or not isinstance(self.max_iter, int):
-            logger.warning(
-                f"Invalid input maximum iteration <{self.max_iter}>, default to <50>."
-            )
-            self.max_iter = 50
-
-        # set up default dtype
-        self.dtype = decoding_cfg.get("dtype", "float64")
-        if self.dtype not in {"float32", "float64", "bfloat16", "float16"}:
-            logger.warning(
-                f"Invalid input data type <{self.dtype}>, default to <torch.float64>."
-            )
-            self.dtype = "float64"
-        self.dtype = torch.__dict__[self.dtype]
-
-        self.batch_size = 1
-
-        self.check_type = decoding_cfg.get("check_type", "hx")
-        if self.check_type.lower() not in {"hx", "hz"}:
-            logger.warning(
-                f"Invalid input check type <{self.check_type}>, default to <hx>."
-            )
-            self.check_type = "hx"
-
-        bundle = kwargs.get("bundle")
-        if bundle is None:
-            raise ValueError(
-                "bp_sf requires a pre-loaded MatrixBundle via the `bundle` kwarg."
-            )
-        self.Hx_matrix = bundle.Hx_matrix
-        self.Hz_matrix = bundle.Hz_matrix
-        self.lx_matrix = bundle.lx_matrix
-        self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(
-            self.check_type, dense=False
-        )
-
-        self.mask_dummy = self.V_c_col == self.H_shape[1]
-
-        # padded CSC [N, max column degree]: the checks on each variable, padded with
-        # the dummy check M; used to compute the syndrome shift of a candidate flip
-        # set during SF post-processing.
-        M, N = self.H_shape
-        edge = ~self.mask_dummy
-        rows, cols = self.V_c_row[edge], self.V_c_col[edge]
-        order = torch.argsort(cols, stable=True)
-        rows, cols = rows[order], cols[order]
-        counts = torch.bincount(cols, minlength=N)
-        start = torch.cumsum(counts, 0) - counts
-        self.V_v_row = torch.full([N, int(counts.max())], M, dtype=torch.long, device=cols.device)
-        self.V_v_row[cols, torch.arange(cols.numel(), device=cols.device) - start[cols]] = rows
-        self.V_v_row = self.V_v_row.to(self.device)
-
-        # set iteration
-        self.i = 0
-
-        # convert to as the parameters in a model
-        self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
-        self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
+        self._init_sf(decoding_cfg)
+        if self.compile:
+            # beta of every iteration, same formula as bp_norm_min_sum
+            i = torch.arange(1, self.max_iter + 1).to(self.dtype)
+            self.betas = (
+                torch.tensor(1.0, dtype=self.dtype)
+                - torch.pow(torch.tensor(2.0, dtype=self.dtype), -i)
+            ).to(self.device)
 
         self.algo = "bp_sf"
-        self.num_max_iter = self.max_iter
+        self.cap = None
+        # oscillation counts of the main pass, None outside it
+        self._osc = None
 
+        logger.info(
+            f"Complete. SF: w=[{self.w_min},{self.w_max}], n_sample={self.n_sample}, topk={self.topk}."
+        )
+
+    def _init_sf(self, decoding_cfg):
+        """Parse the SF parameters (w_min, w_max, n_sample, topk), set max_iter and
+        num_max_iter to N when SF is on, and build V_v_row. Uses only H_shape,
+        V_c_row, V_c_col, device and max_iter, which bp_norm_min_sum and
+        bp_norm_min_sum_cuda both set."""
+        M, N = self.H_shape
         sf_cfg = decoding_cfg.get("sf", decoding_cfg)
         self.w_min = int(sf_cfg.get("w_min", 0))
         self.w_max = int(sf_cfg.get("w_max", 0))
@@ -139,125 +94,68 @@ class create(torch.nn.Module):
             self.topk = 20
 
         if self.w_max > 0:
-            N = self.H_shape[1]
             if self.max_iter != N:
                 logger.info(
                     f"SF enabled: overriding max_iter <{self.max_iter}> with the "
                     f"data-qubit count N=<{N}>."
                 )
-            self.max_iter = N
-            self.num_max_iter = self.max_iter
+            self.max_iter = self.num_max_iter = N
 
-        self.cap = RebatchSpeedup.from_cfg(None)
-        self.cap_bypass = False
-        self.cap_active_last = False
+        # padded CSC [N, max column degree]: the checks on each variable, padded with
+        # the dummy check M; used to compute the syndrome shift of a candidate flip
+        # set during SF post-processing.
+        edge = self.V_c_col != N
+        rows, cols = self.V_c_row[edge], self.V_c_col[edge]
+        order = torch.argsort(cols, stable=True)
+        rows, cols = rows[order], cols[order]
+        counts = torch.bincount(cols, minlength=N)
+        start = torch.cumsum(counts, 0) - counts
+        self.V_v_row = torch.full([N, int(counts.max())], M, dtype=torch.long, device=self.device)
+        self.V_v_row[cols, torch.arange(cols.numel(), device=self.device) - start[cols]] = rows
 
-        logger.info(
-            f"Complete. SF: w=[{self.w_min},{self.w_max}], n_sample={self.n_sample}, topk={self.topk}."
-        )
+    def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
+        """In the main pass, per bit, count how often the hard decision differs
+        from the previous iteration, starting from an all-zero prior."""
+        if self._osc is None:
+            return
+        rows = self._hook_rows
+        self._osc[rows] += e_v != self._prev_hard[rows]
+        self._prev_hard[rows] = e_v
 
     def forward(self, io_dict):
-        """Decode a batch: normalized-min-sum BP, then SF post-processing on the
-        samples BP left unconverged."""
+        """Decode a batch: the bp_norm_min_sum forward with oscillation counts, then
+        SF post-processing on the samples BP left unconverged."""
         logger.info("Initializing bp_sf decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
         llr0 = io_dict["llr0"].to(dtype=self.dtype).to(self.device)
-        self.batch_size, _ = syndrome.size()
+        B = syndrome.shape[0]
+        N_extended = self.H_shape[1] + 1
+        self._osc = torch.zeros([B, N_extended], dtype=torch.long, device=self.device)
+        self._prev_hard = torch.zeros([B, N_extended], dtype=self.dtype, device=self.device)
+        super(create, self).forward(io_dict)
+        osc = self._osc[:, :-1]
+        self._osc = self._prev_hard = None
 
-        # ---- pass 1: normalized min-sum BP, tracking oscillation counts ----
-        e_out, l_out, converges, num_iters, osc = self._bp_core(
-            syndrome, llr0, track_osc=True
-        )
-
-        # ---- pass 2: syndrome-flipping retry on the unconverged samples ----
         if self.w_max > 0:
             self._sf_postprocess(
-                syndrome, llr0, e_out, l_out, converges, num_iters, osc
+                syndrome,
+                llr0,
+                io_dict["e_v"],
+                io_dict["llr"],
+                io_dict["converge"],
+                io_dict["iter"],
+                osc,
             )
 
         logger.info("Complete.")
-        io_dict.update(
-            {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
-        )
         return io_dict
 
-    def _bp_core(self, syndrome, llr0, track_osc=False):
-        """Run normalized-min-sum BP on a batch of syndromes.
-
-        Identical message passing to ``bp_norm_min_sum`` (so BP-SF's core matches the
-        reference's ``ms``/``ms_scaling_factor=0`` decoder). Returns
-        ``(e_out, l_out, converges, num_iters, osc)`` over the real N bits; ``osc`` is
-        a per-bit oscillation count (``[batch, N]``) when ``track_osc`` else ``None``.
-        """
-        batch_size = syndrome.size(0)
-        device, dtype = self.device, self.dtype
-        N = self.H_shape[1]
-        N_extended = N + 1
-
-        l_v = torch.zeros([batch_size, N_extended], dtype=dtype, device=device)
-        e_v = torch.zeros([batch_size, N_extended], dtype=dtype, device=device)
-
-        dummy_column = torch.full(
-            [batch_size, 1], float("inf"), dtype=dtype, device=device
-        )
-        u_init = torch.cat((llr0, dummy_column), dim=1)
-        e_out = torch.zeros([batch_size, N_extended], dtype=dtype, device=device)
-        l_out = torch.zeros([batch_size, N_extended], dtype=dtype, device=device)
-        num_iters = torch.full([batch_size], -1, device=device)
-        converges = torch.full([batch_size], 0, device=device)
-
-        message = u_init[:, self.V_c_col]
-
-        # check-grouped (-1)^syndrome term used by the check-node update
-        syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(dtype)
-        self.syndrome_neg = syndrome_neg.unsqueeze(2)
-        self.batch_size = batch_size
-
-        # oscillation tracking: prev hard decision and per-bit flip count
-        if track_osc:
-            prev_hard = torch.zeros(
-                [batch_size, N_extended], dtype=dtype, device=device
-            )
-            osc = torch.zeros([batch_size, N_extended], dtype=torch.long, device=device)
-        else:
-            osc = None
-
-        self.i = 0
-        while self.i < self.max_iter:
-            self.i += 1
-
-            l_v_v2c = self.v2c(l_v)
-            message = self.vn_update(message, l_v_v2c)
-            message = self.cn_update(message)
-            message_c2v = self.c2v(message)
-            l_v = self.llr_update(u_init, message_c2v)
-            e_v = self.hard_decision(l_v)
-            s_est = self.syndrome_estimation(e_v)
-
-            if track_osc:
-                osc += (e_v != prev_hard).to(torch.long)
-                prev_hard = e_v
-
-            indices = torch.all(s_est == syndrome, 1).nonzero()
-            checker = torch.where(num_iters == -1.0)[0]
-            indices = indices[torch.isin(indices, checker)]
-            if indices.size()[0] > 0:
-                num_iters[indices] = self.i
-                e_out[indices] = e_v[indices]
-                l_out[indices] = l_v[indices]
-                converges[indices] = 1
-
-            if checker.size()[0] == 0:
-                break
-
-        checker = torch.where(num_iters == -1)[0]
-        e_out[checker] = e_v[checker]
-        l_out[checker] = l_v[checker]
-        num_iters[checker] = self.i
-
-        osc_out = osc[:, :N] if track_osc else None
-        return e_out[:, :N], l_out[:, :N], converges, num_iters, osc_out
+    def _bp_core(self, syndrome, llr0):
+        """SF retry decode through the bp_norm_min_sum forward. Returns
+        ``(e_out, l_out, converges, num_iters, None)`` over the real N bits."""
+        out = super(create, self).forward({"synd": syndrome, "llr0": llr0})
+        return out["e_v"], out["llr"], out["converge"], out["iter"], None
 
     def _sf_postprocess(self, syndrome, llr0, e_out, l_out, converges, num_iters, osc):
         """Syndrome-flipping retry on the samples pass-1 BP left unconverged.
@@ -317,9 +215,7 @@ class create(torch.nn.Module):
 
         # one batched BP over all U*C trials
         llr_batch = llr0[unconv].unsqueeze(1).expand(U, C, N).reshape(U * C, N)
-        e_r, l_r, conv_r, _, _ = self._bp_core(
-            new_synd.reshape(U * C, M), llr_batch, track_osc=False
-        )
+        e_r, l_r, conv_r, _, _ = self._bp_core(new_synd.reshape(U * C, M), llr_batch)
         e_r = e_r.view(U, C, N)
         l_r = l_r.view(U, C, N)
         conv_r = conv_r.view(U, C)
@@ -342,55 +238,3 @@ class create(torch.nn.Module):
         e_out[g] = chosen_e[has]
         l_out[g] = chosen_l[has]
         converges[g] = 1
-
-    # BP message-passing primitives (identical to bp_norm_min_sum)
-    def v2c(self, l_v):
-        return l_v[:, self.V_c_col]
-
-    def vn_update(self, b_c2v, l_v_v2c):
-        if self.i == 1:
-            return b_c2v
-        else:
-            return l_v_v2c - b_c2v
-
-    def cn_update(self, a_v2c):
-        base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype)
-        beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
-
-        sign = torch.sgn(a_v2c)
-        sign = torch.where(sign == 0.0, -1.0, sign)
-        sign_prod = torch.prod(sign, dim=2, keepdim=True)
-        Q_sign = self.syndrome_neg * sign_prod
-
-        abs_a_v2c = torch.abs(a_v2c)
-        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
-        min_0 = mins[:, :, 0].unsqueeze(2)
-        min_1 = mins[:, :, 1].unsqueeze(2)
-        min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
-
-        message = beta * sign * Q_sign * min_result
-        message[:, self.mask_dummy] = 0.0
-        return message
-
-    def c2v(self, b_c2v):
-        data_flat = b_c2v.flatten(start_dim=1)
-        sum_b_c2v = torch.zeros(
-            [self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device
-        )
-        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
-        return sum_b_c2v
-
-    def llr_update(self, u_init, b_c2v):
-        l_v = u_init + b_c2v
-        l_v[:, -1] = float("inf")
-        return l_v
-
-    def hard_decision(self, l_v):
-        return torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
-
-    def syndrome_estimation(self, e_v):
-        temp_e = e_v
-        temp_e[:, -1] = 0.0
-        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim=2).to(dtype=self.dtype)
-        return torch.where((estimated_syndrome % 2) > 0.0, 1.0, 0.0).to(self.dtype)

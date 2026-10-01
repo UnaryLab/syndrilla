@@ -19,6 +19,15 @@ from syndrilla.trainer import create_trainer, read_training_cfg
 from syndrilla.utils import ExtraQueue, bcolors, get_path, parse_device_dtype, read_yaml
 
 
+def _sync(device):
+    """Wait for queued GPU work on device so host timers cover it."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 def parse_commandline_args():
     """
     parse command line inputs
@@ -75,7 +84,7 @@ def parse_commandline_args():
         "--target_batch",
         type=int,
         default=None,
-        help="Target number of batches to stop decoding, instead of an error target. Wins over -te, with a warning, if both are given; ignored with -t.",
+        help="Target number of batches to stop decoding, instead of an error target; deferred re-decode batches do not count. Wins over -te, with a warning, if both are given; ignored with -t.",
     )
     parser.add_argument(
         "-m", "--matrix_yaml", type=str, default=None, help="Path to matrix yaml."
@@ -269,7 +278,7 @@ def main():
         algo_name.append(decoder.algo)
         num_max_iter.append(getattr(decoder, "num_max_iter", 0))
 
-    shape, _, _, H_matrix = bundle.select(check_type, dense=False)
+    shape, _, _, H_matrix = bundle.select(check_type)
 
     H_file_name = bundle.get_H_file_name(check_type, number_channel)
     l_matrix = bundle.get_l_matrix(check_type, number_channel)
@@ -277,10 +286,20 @@ def main():
 
     num_err = 0
 
+    # Only the first decoder's cap defers samples; later stages run uncapped.
+    for dec in decoders[1:]:
+        inner = getattr(dec, "decoder", dec)
+        if getattr(inner, "cap", None) is not None:
+            inner.cap = None
     inner0 = getattr(decoders[0], "decoder", decoders[0])
     cap_on = getattr(inner0, "cap", None) is not None
     if cap_on and getattr(syndrome_generator, "rounds", 1) != 1:
-        logger.warning("rebatch_speedup supports rounds==1 only; disabling the cap.")
+        logger.warning("rebatch_opt supports rounds==1 only; disabling the cap.")
+        inner0.cap = None
+        cap_on = False
+    if cap_on and args.train:
+        logger.warning("rebatch_opt is off during training; disabling the cap.")
+        inner0.cap = None
         cap_on = False
 
     logger.success(
@@ -331,6 +350,10 @@ def main():
         """Is there room to generate a fresh batch under this run's stop condition?"""
         return num_batches < max_batches and num_err <= error_budget
 
+    # a periodic save waits until the deferred queue is drained, so a checkpoint
+    # never leaves deferred samples undecoded
+    save_due = False
+
     # once the budget is spent, the loop keeps running to drain deferred samples
     while budget_left() or (cap_on and queue.nonempty):
         logger.success(
@@ -346,11 +369,11 @@ def main():
 
         # predict_pct offload scheduler: decide WHEN to re-decode the deferred queue
         do_flush, flushing = queue.should_flush(num_err)
-        use_extra = cap_on and (do_flush or not budget_left())
+        use_extra = cap_on and (do_flush or save_due or not budget_left())
         if cap_on:
             inner0.cap_bypass = use_extra
         if use_extra:
-            # re-decode a batch of the hardest deferred samples together (one batch at a time)
+            # re-decode a batch of deferred samples, oldest first (one batch at a time)
             error_dataloader, n = queue.take_batch()
             logger.info(
                 f"Decoding <{n}> deferred samples from the extra queue "
@@ -365,21 +388,25 @@ def main():
             avg_error_rate = torch.mean(torch.sum(error_vector, -1) / shape[1])
             logger.info(f"Specified error rate <{error_model.rate}>.")
             logger.info(f"Generated error rate <{avg_error_rate}>.")
-        num_batches += 1
+            num_batches += 1  # counts primary batches only
 
         num_err_before_batch = num_err
-        for err, llr, _ in error_dataloader:
+        for err, llr, *stored in error_dataloader:
             if bt is not None:
                 bt.record_error(err)
 
             logger.success(
                 "\n----------------------------------------------\nStep 7: Measure syndrome\n----------------------------------------------"
             )
-            synd = syndrome_generator.measure_syndrome(err, decoders[0])
-
-            llr0 = llr
-            if hasattr(syndrome_generator, "adjust_llr0"):
-                llr0 = syndrome_generator.adjust_llr0(llr0)
+            if use_extra:
+                # deferred samples reuse the syndrome measured with their primary batch
+                llr0, (synd, obs_flips) = llr, stored
+            else:
+                synd = syndrome_generator.measure_syndrome(err, decoders[0])
+                obs_flips = getattr(syndrome_generator, "observable_flips", None)
+                llr0 = llr
+                if hasattr(syndrome_generator, "adjust_llr0"):
+                    llr0 = syndrome_generator.adjust_llr0(llr0)
 
             io_dict = {"synd": synd, "llr0": llr0, "H_matrix": H_matrix}
 
@@ -387,6 +414,10 @@ def main():
                 "\n----------------------------------------------\nStep 8: Decode\n----------------------------------------------"
             )
             for decoder_idx in range(num_decoders):
+                device = getattr(
+                    decoders[decoder_idx], "device", io_dict["synd"].device
+                )
+                _sync(device)
                 start_time = time.time()
                 io_dict = decoders[decoder_idx](io_dict)
 
@@ -403,6 +434,7 @@ def main():
                         trainer.loss.class_error(io_dict, err),
                     )
                     break
+                _sync(device)
                 elapsed = time.time() - start_time
                 if bt is not None:
                     bt.record_metric(decoder_idx, io_dict, elapsed)
@@ -413,7 +445,7 @@ def main():
             cap_keep = None
             if cap_on and getattr(inner0, "cap_active_last", False):
                 keep = bt.converge_all[1].flatten() > 0
-                queue.defer(err, llr, ~keep)
+                queue.defer(~keep, err, llr0, synd, obs_flips)
                 cap_keep = keep.to(bt.e_all.device)
                 bt.keep_samples(cap_keep)
 
@@ -421,15 +453,8 @@ def main():
                 "\n----------------------------------------------\nStep 9: Check logical error rate\n----------------------------------------------"
             )
 
-            has_obs_flips = (
-                hasattr(syndrome_generator, "observable_flips")
-                and syndrome_generator.observable_flips is not None
-            )
-            check_error = (
-                syndrome_generator.observable_flips.to(dtype)
-                if has_obs_flips
-                else bt.e_all
-            )
+            has_obs_flips = obs_flips is not None
+            check_error = obs_flips.to(dtype) if has_obs_flips else bt.e_all
             if cap_keep is not None and has_obs_flips:
                 check_error = check_error[cap_keep]
 
@@ -468,29 +493,33 @@ def main():
                 )
                 metrics.update_metric(i, batch_result)
 
-            if num_batches % 100 == 0:
-                logger.success(
-                    "\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
-                )
-                all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
-                metrics.save_metric(
-                    all_metrics,
-                    args.run_dir + "/",
-                    args.batch_size,
-                    args.target_error,
-                    str(dtype),
-                    error_model.rate,
-                    num_batches,
-                    num_err,
-                    H_file_name,
-                    check_num,
-                    target_batch=args.target_batch,
-                )
-                logger.success(f"Saved log to <{output_log}>.")
-                logger.success(f"Saved metric results to <{args.run_dir}>.")
+            if not use_extra and num_batches % 100 == 0:
+                save_due = True
 
         if use_extra:  # measure density from the FIRST extra batch, then freeze
             queue.freeze_density(num_err - num_err_before_batch, n)
+
+        if save_due and not (cap_on and queue.nonempty):
+            save_due = False
+            logger.success(
+                "\n----------------------------------------------\nStep 11: Save batch log\n----------------------------------------------"
+            )
+            all_metrics = metrics.get_all_metrics(num_batches, algo_name, decoders)
+            metrics.save_metric(
+                all_metrics,
+                args.run_dir + "/",
+                args.batch_size,
+                args.target_error,
+                str(dtype),
+                error_model.rate,
+                num_batches,
+                num_err,
+                H_file_name,
+                check_num,
+                target_batch=args.target_batch,
+            )
+            logger.success(f"Saved log to <{output_log}>.")
+            logger.success(f"Saved metric results to <{args.run_dir}>.")
 
     if args.train:
         logger.success(

@@ -604,9 +604,9 @@ class MetricState:
                 inner = getattr(decoders[i], "decoder", decoders[i])
                 cap = getattr(inner, "cap", None)
             if cap is not None and cap.hists:
-                avg["rebatch_speedup"] = {"warmup batches": len(cap.hists)}
+                avg["rebatch_opt"] = {"warmup batches": len(cap.hists)}
                 if cap.pct is not None:
-                    avg["rebatch_speedup"]["chosen pct"] = cap.pct
+                    avg["rebatch_opt"]["chosen pct"] = cap.pct
             all_metrics.append(avg)
         return all_metrics
 
@@ -754,10 +754,10 @@ class MetricState:
                 "iteration distribution": distribution,
                 "iteration count": iteration_count,
             }
-            # rebatch_speedup (e.g. warmup batches) is reported before the timing fields.
-            if decoder_metrics.get("rebatch_speedup"):
-                all_metrics_results[decoder_key]["rebatch_speedup"] = decoder_metrics[
-                    "rebatch_speedup"
+            # rebatch_opt (e.g. warmup batches) is reported before the timing fields.
+            if decoder_metrics.get("rebatch_opt"):
+                all_metrics_results[decoder_key]["rebatch_opt"] = decoder_metrics[
+                    "rebatch_opt"
                 ]
             all_metrics_results[decoder_key].update(
                 {

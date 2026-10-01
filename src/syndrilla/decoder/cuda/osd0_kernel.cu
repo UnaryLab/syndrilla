@@ -258,11 +258,16 @@ void osd_step_cuda(
 #define SCAN_THREADS 512
 
 // Pivot-column scan, one block per sample, all N columns in one launch.
-// Tr [M, Uw]: row u of T (bits over original rows). TuT [M, Uw]: T transposed,
-// TuT[k] holds bit u = T_u[k]. For column c the bits on the pivot-free rows are
+// T is the row-operation matrix, kept compact: Tr row u is T_u (bits over
+// original rows) and TuT row k is T transposed (bit u = T_u[k]). A row is
+// stored only once it is first written, in a per-sample pool slot (Pr for Tr,
+// Pc for TuT) that rslot / cslot map it to; a row without a slot is the unit
+// vector. For column c the bits on the pivot-free rows are
 // v = alive & XOR_{k in h_c} TuT[k]. The pivot is the lowest row p in v; then
 // every other row u in v gets T_u ^= T_p (Tr rows u, and TuT[k] ^= v for every
-// k in T_p). Writes the order positions of the pivots to piv_pos.
+// k in T_p). Writes the order positions of the pivots to piv_pos. A sample
+// that needs more slots than its pool holds stops and sets overflow; the
+// caller reruns it with pools of M rows, which never overflow.
 //
 // Early stop (when synd is given): sres = T . s is updated by the same row
 // operations. Rows without a pivot are zero on every pivot column found so far,
@@ -273,8 +278,10 @@ void osd_step_cuda(
 // Gauss-Jordan on the prefix gives the same e_v as on all of S. The scan stops
 // there. An inconsistent syndrome never lies in that span, so it never stops.
 __global__ void k_osd_scan(
-    uint64_t*       __restrict__ Tr,       // [B, M, Uw]  identity on entry
-    uint64_t*       __restrict__ TuT,      // [B, M, Uw]  identity on entry
+    uint64_t*       __restrict__ Pr,       // [B, Rmax, Uw]  zero on entry
+    uint64_t*       __restrict__ Pc,       // [B, Cmax, Uw]  zero on entry
+    int32_t*        __restrict__ rslot,    // [B, M]  Tr row -> Pr slot, -1 on entry
+    int32_t*        __restrict__ cslot,    // [B, M]  TuT row -> Pc slot, -1 on entry
     const int64_t*  __restrict__ colptr,   // [N + 2]
     const int32_t*  __restrict__ rowidx,   // [nnz]
     const int32_t*  __restrict__ order,    // [B, N]
@@ -283,7 +290,8 @@ __global__ void k_osd_scan(
     const uint64_t* __restrict__ synd,     // [B, Uw] packed syndrome, or nullptr (no stop)
     uint8_t*        __restrict__ stopped,  // [B]  1 if the scan stopped early
     int32_t*        __restrict__ scan_end, // [B]  columns scanned
-    int M, int Uw, int N, int rank
+    uint8_t*        __restrict__ overflow, // [B]  1 if a pool ran out of slots
+    int M, int Uw, int N, int rank, int Rmax, int Cmax
 ) {
     extern __shared__ uint64_t sh[];
     uint64_t* v     = sh;           // [Uw]
@@ -294,10 +302,13 @@ __global__ void k_osd_scan(
     __shared__ int s_beg[SCAN_COLS + 1];       // staged column i: s_rows[s_beg[i] .. s_beg[i+1])
     __shared__ int s_rows[SCAN_ROWS];
     __shared__ int s_cnt;
+    __shared__ int s_nr, s_nc, s_ovf;          // Pr / Pc slots taken; pool overflow
     const int b = blockIdx.x, tid = threadIdx.x, bsz = blockDim.x;
     const int lane = tid & 31, warp = tid >> 5, nwarp = bsz >> 5;
-    uint64_t* R  = Tr  + (size_t)b * M * Uw;
-    uint64_t* RT = TuT + (size_t)b * M * Uw;
+    uint64_t* PR = Pr + (size_t)b * Rmax * Uw;
+    uint64_t* PC = Pc + (size_t)b * Cmax * Uw;
+    int32_t* rs = rslot + (size_t)b * M;
+    int32_t* cs = cslot + (size_t)b * M;
     const int32_t* ord = order + (int64_t)b * N;
 
     const bool use_stop = synd != nullptr;
@@ -308,12 +319,13 @@ __global__ void k_osd_scan(
         sres[w] = use_stop ? synd[(size_t)b * Uw + w] : 0;
         nz |= (sres[w] & alive[w]) != 0;
     }
-    if (tid == 0) s_min[0] = INT_MAX;
+    if (tid == 0) { s_min[0] = INT_MAX; s_nr = 0; s_nc = 0; s_ovf = 0; }
     int found = 0;
     int j0 = 0, jcnt = 0;     // columns j0 .. j0+jcnt-1 are staged
     bool direct = false;      // one column too long to stage: read rowidx directly
     const bool any_left = __syncthreads_or(nz);   // also the setup barrier
     bool done = use_stop && !any_left;
+    bool ovf = false;
 
     int j = 0;
     for (; j < N && found < rank && !done; j++) {
@@ -359,8 +371,16 @@ __global__ void k_osd_scan(
         const int64_t p0 = direct ? s_p0[0] : 0, p1 = direct ? p0 + s_beg[1] : 0;
         for (int w = tid; w < Uw; w += bsz) {
             uint64_t x = 0;
-            for (int q = q0; q < q1; q++) x ^= RT[(size_t)s_rows[q] * Uw + w];
-            for (int64_t p = p0; p < p1; p++) x ^= RT[(size_t)rowidx[p] * Uw + w];
+            for (int q = q0; q < q1; q++) {
+                const int k = s_rows[q], sl = cs[k];
+                if (sl >= 0) x ^= PC[(size_t)sl * Uw + w];
+                else if ((k >> 6) == w) x ^= 1ULL << (k & 63);
+            }
+            for (int64_t p = p0; p < p1; p++) {
+                const int k = rowidx[p], sl = cs[k];
+                if (sl >= 0) x ^= PC[(size_t)sl * Uw + w];
+                else if ((k >> 6) == w) x ^= 1ULL << (k & 63);
+            }
             x &= alive[w];
             v[w] = x;
             if (x) atomicMin(sm, 64 * w + __ffsll((long long)x) - 1);
@@ -373,26 +393,65 @@ __global__ void k_osd_scan(
         found++;
         const int      pw = piv >> 6;
         const uint64_t pm = 1ULL << (piv & 63);
-        const uint64_t* Tp = R + (size_t)piv * Uw;
+        const int      rp = rs[piv];
+        const uint64_t* Tp = rp >= 0 ? PR + (size_t)rp * Uw : nullptr;   // nullptr: T_p = e_p
         const bool sp = use_stop && ((sres[pw] >> (piv & 63)) & 1ULL);
-        // TuT[k] ^= v (without the pivot row) for every k with T_p[k] set.
-        for (int wq = warp; wq < Uw; wq += nwarp) {
-            uint64_t bits = Tp[wq];
+
+        // Take slots (initialized to the unit vector) for the rows about to be
+        // written: Tr rows u in v without the pivot, and, when that set is not
+        // empty, TuT rows k in T_p.
+        bool vo = false;
+        for (int w = tid; w < Uw; w += bsz) {
+            uint64_t bits = (w == pw) ? (v[w] & ~pm) : v[w];
+            vo |= bits != 0;
             while (bits) {
-                const int k = 64 * wq + __ffsll((long long)bits) - 1;
+                const int u = 64 * w + __ffsll((long long)bits) - 1;
                 bits &= bits - 1;
-                uint64_t* row = RT + (size_t)k * Uw;
-                for (int w = lane; w < Uw; w += 32) row[w] ^= (w == pw) ? (v[w] & ~pm) : v[w];
+                if (rs[u] < 0) {
+                    const int s = atomicAdd(&s_nr, 1);
+                    if (s < Rmax) { rs[u] = s; PR[(size_t)s * Uw + (u >> 6)] = 1ULL << (u & 63); }
+                    else s_ovf = 1;
+                }
             }
         }
-        // Tr[u] ^= T_p for every other pivot-free row u with the bit.
-        for (int wq = warp; wq < Uw; wq += nwarp) {
-            uint64_t bits = v[wq] & ((wq == pw) ? ~pm : ~0ULL);
-            while (bits) {
-                const int u = 64 * wq + __ffsll((long long)bits) - 1;
-                bits &= bits - 1;
-                uint64_t* row = R + (size_t)u * Uw;
-                for (int w = lane; w < Uw; w += 32) row[w] ^= Tp[w];
+        const bool vany = __syncthreads_or(vo);
+        if (vany)
+            for (int w = tid; w < Uw; w += bsz) {
+                uint64_t bits = Tp ? Tp[w] : (w == pw ? pm : 0);
+                while (bits) {
+                    const int k = 64 * w + __ffsll((long long)bits) - 1;
+                    bits &= bits - 1;
+                    if (cs[k] < 0) {
+                        const int s = atomicAdd(&s_nc, 1);
+                        if (s < Cmax) { cs[k] = s; PC[(size_t)s * Uw + (k >> 6)] = 1ULL << (k & 63); }
+                        else s_ovf = 1;
+                    }
+                }
+            }
+        __syncthreads();
+        if (s_ovf) { ovf = true; break; }              // block-uniform
+
+        if (vany) {
+            // TuT[k] ^= v (without the pivot row) for every k with T_p[k] set.
+            for (int wq = warp; wq < Uw; wq += nwarp) {
+                uint64_t bits = Tp ? Tp[wq] : (wq == pw ? pm : 0);
+                while (bits) {
+                    const int k = 64 * wq + __ffsll((long long)bits) - 1;
+                    bits &= bits - 1;
+                    uint64_t* row = PC + (size_t)cs[k] * Uw;
+                    for (int w = lane; w < Uw; w += 32) row[w] ^= (w == pw) ? (v[w] & ~pm) : v[w];
+                }
+            }
+            // Tr[u] ^= T_p for every other pivot-free row u with the bit.
+            for (int wq = warp; wq < Uw; wq += nwarp) {
+                uint64_t bits = v[wq] & ((wq == pw) ? ~pm : ~0ULL);
+                while (bits) {
+                    const int u = 64 * wq + __ffsll((long long)bits) - 1;
+                    bits &= bits - 1;
+                    uint64_t* row = PR + (size_t)rs[u] * Uw;
+                    if (Tp) { for (int w = lane; w < Uw; w += 32) row[w] ^= Tp[w]; }
+                    else if (lane == 0) row[pw] ^= pm;
+                }
             }
         }
         __syncthreads();
@@ -410,33 +469,37 @@ __global__ void k_osd_scan(
         found_out[b] = found;
         stopped[b] = done;
         scan_end[b] = j;
+        overflow[b] = ovf;
     }
 }
 
 void osd_scan_cuda(
-    torch::Tensor Tr, torch::Tensor TuT, torch::Tensor colptr, torch::Tensor rowidx,
-    torch::Tensor order, torch::Tensor piv_pos, torch::Tensor found,
-    torch::Tensor synd, torch::Tensor stopped, torch::Tensor scan_end
+    torch::Tensor Pr, torch::Tensor Pc, torch::Tensor rslot, torch::Tensor cslot,
+    torch::Tensor colptr, torch::Tensor rowidx, torch::Tensor order, torch::Tensor piv_pos,
+    torch::Tensor found, torch::Tensor synd, torch::Tensor stopped, torch::Tensor scan_end,
+    torch::Tensor overflow
 ) {
-    OSD_CHECK(Tr); OSD_CHECK(TuT); OSD_CHECK(colptr); OSD_CHECK(rowidx);
-    OSD_CHECK(order); OSD_CHECK(piv_pos); OSD_CHECK(found);
-    OSD_CHECK(synd); OSD_CHECK(stopped); OSD_CHECK(scan_end);
-    const int B = (int)Tr.size(0);
-    const int M = (int)Tr.size(1);
-    const int Uw = (int)Tr.size(2);
+    OSD_CHECK(Pr); OSD_CHECK(Pc); OSD_CHECK(rslot); OSD_CHECK(cslot);
+    OSD_CHECK(colptr); OSD_CHECK(rowidx); OSD_CHECK(order); OSD_CHECK(piv_pos);
+    OSD_CHECK(found); OSD_CHECK(synd); OSD_CHECK(stopped); OSD_CHECK(scan_end);
+    OSD_CHECK(overflow);
+    const int B = (int)Pr.size(0);
+    const int Uw = (int)Pr.size(2);
     if (B == 0) return;
     const size_t smem = 3 * (size_t)Uw * sizeof(uint64_t);
     if (smem > 48 * 1024)
         cudaFuncSetAttribute(k_osd_scan, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     auto stream = at::cuda::getCurrentCUDAStream();
     k_osd_scan<<<B, SCAN_THREADS, smem, stream>>>(
-        reinterpret_cast<uint64_t*>(Tr.data_ptr<int64_t>()),
-        reinterpret_cast<uint64_t*>(TuT.data_ptr<int64_t>()),
+        reinterpret_cast<uint64_t*>(Pr.data_ptr<int64_t>()),
+        reinterpret_cast<uint64_t*>(Pc.data_ptr<int64_t>()),
+        rslot.data_ptr<int32_t>(), cslot.data_ptr<int32_t>(),
         colptr.data_ptr<int64_t>(), rowidx.data_ptr<int32_t>(), order.data_ptr<int32_t>(),
         piv_pos.data_ptr<int32_t>(), found.data_ptr<int32_t>(),
         synd.numel() ? reinterpret_cast<const uint64_t*>(synd.data_ptr<int64_t>()) : nullptr,
-        stopped.data_ptr<uint8_t>(), scan_end.data_ptr<int32_t>(),
-        M, Uw, (int)order.size(1), (int)piv_pos.size(1));
+        stopped.data_ptr<uint8_t>(), scan_end.data_ptr<int32_t>(), overflow.data_ptr<uint8_t>(),
+        (int)rslot.size(1), Uw, (int)order.size(1), (int)piv_pos.size(1),
+        (int)Pr.size(1), (int)Pc.size(1));
 }
 
 // Read out: each pivot row's syndrome bit (bit K) is the solution bit of its

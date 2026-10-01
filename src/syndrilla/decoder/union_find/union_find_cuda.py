@@ -122,7 +122,9 @@ class create(nn.Module):
             raise ValueError(
                 "union_find_cuda requires a pre-loaded MatrixBundle via `bundle`."
             )
-        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type)
+        H_shape, _, V_c_col, H_matrix = (
+            (bundle.Hx_matrix if self.check_type.lower() == "hx" else bundle.Hz_matrix).get_index()
+        )
         self.H_shape = H_shape
         # V_c_col (parity-row -> qubit-column map) is read by the perfect syndrome
         # measurer when this decoder is decoders[0]; expose it like every decoder.

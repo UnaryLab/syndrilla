@@ -80,26 +80,33 @@ class MatrixBundle:
     decoder needs. Decoders should consume one of these instead of calling
     create_parity_matrix() and compute_lz() themselves.
     """
-    __slots__ = ('Hx_matrix', 'Hz_matrix', 'lx_matrix', 'lz_matrix')
+    __slots__ = ('Hx_matrix', 'Hz_matrix', 'lx_matrix', 'lz_matrix', 'sparse_h', '_index')
 
-    def __init__(self, Hx_matrix, Hz_matrix, lx_matrix, lz_matrix):
+    def __init__(self, Hx_matrix, Hz_matrix, lx_matrix, lz_matrix, sparse_h=True):
         self.Hx_matrix = Hx_matrix
         self.Hz_matrix = Hz_matrix
         self.lx_matrix = lx_matrix
         self.lz_matrix = lz_matrix
+        self.sparse_h = sparse_h
+        self._index = {}
 
-    def select(self, check_type, dense=False):
+    def select(self, check_type):
         """
         Return (H_shape, V_c_row, V_c_col, H_matrix) for the requested check
         type. Used by single-channel decoders that pick one of Hx/Hz.
-        H_matrix is the coalesced bool sparse COO tensor dense_to_index_format
-        builds, or its dense form when `dense`.
+        The tuple is built on the first call per check type and the same objects
+        are returned after that: H_matrix is the coalesced bool sparse COO tensor
+        dense_to_index_format builds when sparse_h is true, and its dense int64
+        form when sparse_h is false.
         """
-        m = self.Hx_matrix if check_type.lower() == 'hx' else self.Hz_matrix
-        shape, V_c_row, V_c_col, H_matrix = m.get_index()
-        if dense:
-            H_matrix = H_matrix.to_dense()
-        return shape, V_c_row, V_c_col, H_matrix
+        key = 'hx' if check_type.lower() == 'hx' else 'hz'
+        if key not in self._index:
+            m = self.Hx_matrix if key == 'hx' else self.Hz_matrix
+            shape, V_c_row, V_c_col, H_matrix = m.get_index()
+            if not self.sparse_h:
+                H_matrix = H_matrix.long().to_dense()
+            self._index[key] = (shape, V_c_row, V_c_col, H_matrix)
+        return self._index[key]
 
     def get_H_file_name(self, check_type, number_channel):
         if number_channel > 1:
@@ -141,8 +148,12 @@ def load_matrices(matrix_cfg, device, dtype=None):
       - a config dict:          loaded via create_parity_matrix(cfg=...)
 
     Returns a MatrixBundle. If logical_check_matrix is False/missing, the
-    logical matrices are computed via compute_lz from Hx/Hz.
+    logical matrices are computed via compute_lz from Hx/Hz. The top-level
+    knob sparse_h (default true) picks the H that select() returns: sparse COO,
+    or dense int64 when false.
     """
+    from syndrilla.decoder.knobs import knob
+
     kw = {'device': device}
     if dtype is not None:
         kw['dtype'] = dtype
@@ -161,5 +172,7 @@ def load_matrices(matrix_cfg, device, dtype=None):
         lx_matrix = compute_lz(Hz_matrix.get_dense(), Hx_matrix.get_dense())
         lz_matrix = compute_lz(Hx_matrix.get_dense(), Hz_matrix.get_dense())
 
-    return MatrixBundle(Hx_matrix, Hz_matrix, lx_matrix, lz_matrix)
+    return MatrixBundle(
+        Hx_matrix, Hz_matrix, lx_matrix, lz_matrix, knob(matrix_cfg, 'sparse_h', True)
+    )
 

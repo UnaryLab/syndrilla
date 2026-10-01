@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from loguru import logger
 
+from syndrilla.decoder.knobs import knob
 from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, read_yaml
 
 DEFAULT_CANDIDATES = tuple(range(100))
@@ -64,7 +65,7 @@ def _load_decoder_ext():
         )
     except Exception as e:  # nvcc missing, no GPU, compile error -> fall back
         logger.warning(
-            f"[rebatch_speedup] shared decoder CUDA kernel unavailable ({e}); "
+            f"[rebatch_opt] shared decoder CUDA kernel unavailable ({e}); "
             f"using torch.bincount."
         )
         _DECODER_EXT = False
@@ -90,12 +91,19 @@ class RebatchSpeedup:
         self.pct = None
 
     @classmethod
-    def from_cfg(cls, cfg):
-        """Build from the optional decoder-config ``rebatch_speedup`` block (unknown keys
-        ignored). Returns None if the block is missing/empty so the feature is opt-in.
-        """
-        if not cfg:
+    def from_cfg(cls, decoding_cfg):
+        """Build from the decoder config: None when ``rebatch_opt`` is false, else
+        the cap from the optional ``rebatch_opt_params`` block (unknown keys ignored),
+        or the class defaults when the block is absent. The old key
+        ``rebatch_speedup`` raises ValueError."""
+        if "rebatch_speedup" in decoding_cfg:
+            raise ValueError(
+                "decoder config key 'rebatch_speedup' is not supported; "
+                "use 'rebatch_opt' (bool) and 'rebatch_opt_params' (dict) instead."
+            )
+        if not knob(decoding_cfg, "rebatch_opt", True):
             return None
+        cfg = decoding_cfg.get("rebatch_opt_params") or {}
         keys = ("kl_eps", "kl_window", "kl_min", "candidates")
         return cls(**{k: cfg[k] for k in keys if k in cfg})
 
@@ -136,7 +144,7 @@ class RebatchSpeedup:
         settled = len(self.hists) >= self.kl_min and kl < self.kl_eps
         self.streak = self.streak + 1 if settled else 0
         logger.info(
-            f"[rebatch_speedup] batch {len(self.hists)}: KL={kl:.2e} "
+            f"[rebatch_opt] batch {len(self.hists)}: KL={kl:.2e} "
             f"streak={self.streak}/{self.kl_window}"
         )
         if self.streak >= self.kl_window:
@@ -150,7 +158,7 @@ class RebatchSpeedup:
                 best_sp, best_p = sp, p
         self.pct, self.frac = best_p, best_p / 100.0
         logger.success(
-            f"[rebatch_speedup] warm-up done after {len(self.hists)} batches: "
+            f"[rebatch_opt] warm-up done after {len(self.hists)} batches: "
             f"cap p{best_p} (stop each batch at {best_p}% converged), "
             f"projected speedup {best_sp:.2f}x"
         )
@@ -255,7 +263,7 @@ SHARED_KEYS = (
     "dtype",
     "device",
     "force_pytorch",
-    "rebatch_speedup",
+    "rebatch_opt_params",
     "config",
 )
 

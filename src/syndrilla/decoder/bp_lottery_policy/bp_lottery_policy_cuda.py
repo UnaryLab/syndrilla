@@ -1,4 +1,3 @@
-import torch
 from loguru import logger
 
 from syndrilla.decoder.bp_lottery_policy.bp_lottery_policy import create as _PolicyPy
@@ -6,7 +5,8 @@ from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _Nm
 
 
 class create(_NmsCuda, _PolicyPy):
-    """bp_lottery_policy on CUDA kernels (per-step path).
+    """bp_lottery_policy on CUDA kernels: the bp_norm_min_sum_cuda per-step loop
+    with the policy sign-flip in _iter_hook.
 
     Accepts every bp_norm_min_sum_cuda key plus:
         random_machine  : 'sobol' (default) | 'system'
@@ -17,9 +17,6 @@ class create(_NmsCuda, _PolicyPy):
         # Only the CUDA parent's __init__ runs (kernels, adjacency, V_c_col on
         # device, dtype, N_ext, …). The PyTorch parent contributes methods only.
         _NmsCuda.__init__(self, decoding_cfg, **kwargs)
-
-        # sign-flip is a per-iteration host op → no fused kernel.
-        self._use_fused = False
 
         self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
         if self.random_machine not in {"sobol", "system"}:
@@ -41,125 +38,21 @@ class create(_NmsCuda, _PolicyPy):
             f"bp_lottery_policy_cuda ready (per-step path, policy={self.sign_flip_policy})."
         )
 
-    # _PolicyPy defines these only as an instance attr (in its __init__, which we
-    # skip), so declare the valid set here for validation. The seven sign_flip_*
-    # methods themselves are inherited from _PolicyPy.
-    _sign_flip_policies = {
-        "Proposed",
-        "global_optimal",
-        "global_connectivity",
-        "global_weighted_random",
-        "local_random",
-        "local_reliable",
-        "local_connectivity",
-    }
-
-    def _apply_policy(self, syndrome, s_est, l_v):
-        p = self.sign_flip_policy
-        if p == "Proposed":
-            return self.sign_flip_lottery(syndrome, s_est, l_v)
-        if p == "global_optimal":
-            return self.sign_flip_global_optimal(syndrome, s_est, l_v)
-        if p == "global_connectivity":
-            return self.sign_flip_global_connectivity(syndrome, s_est, l_v)
-        if p == "global_weighted_random":
-            return self.sign_flip_global_weighted_random(syndrome, s_est, l_v)
-        if p == "local_random":
-            return self.sign_flip_local_random(syndrome, s_est, l_v)
-        if p == "local_reliable":
-            return self.sign_flip_local_reliable(syndrome, s_est, l_v)
-        if p == "local_connectivity":
-            return self.sign_flip_local_connectivity(syndrome, s_est, l_v)
-        return l_v
+    def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
+        """The bp_lottery_policy flip on the unconverged rows. When the policy
+        draws from the global RNG (random_machine system, or local_random), a
+        call with no unconverged row returns before drawing (one host sync per
+        call), so the RNG advances as if the loop had stopped when the last row
+        converged."""
+        draws = (
+            self.random_machine == "system" or self.sign_flip_policy == "local_random"
+        )
+        if draws and not active.any():
+            return
+        _PolicyPy._iter_hook(self, i, l_v, e_v, active, syndrome)
 
     def forward(self, io_dict: dict) -> dict:
-        """Per-step CUDA BP decode with the policy sign-flip applied each iteration."""
-        dev = self.device
-        syndrome = io_dict["synd"].to(dtype=self.dtype, device=dev).contiguous()
-        B, M = syndrome.shape
-        self.batch_size = B
-
-        llr0 = io_dict["llr0"].to(dtype=self.dtype, device=dev).contiguous()
-        dummy_col = torch.full((B, 1), float("inf"), dtype=self.dtype, device=dev)
-        u_init = torch.cat([llr0, dummy_col], dim=1)
-
-        syndrome_neg_bc = torch.where(
-            syndrome == 0.0, torch.ones_like(syndrome), -torch.ones_like(syndrome)
-        )
-
-        e_out = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        l_out = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        num_iters = torch.full((B,), -1, dtype=torch.int64, device=dev)
-        converges = torch.zeros(B, dtype=torch.int64, device=dev)
-
-        cap = getattr(self, "cap", None)
-        self.cap_active_last = bool(
-            cap is not None and cap.done and not getattr(self, "cap_bypass", False)
-        )
-        cap_frac = cap.frac if self.cap_active_last else None
-
-        if self.random_machine == "sobol":
-            sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-            draw_dtype = (
-                self.dtype
-                if self.dtype in {torch.float32, torch.float64}
-                else torch.float32
-            )
-            self.r = sobol.draw(self.max_iter, dtype=draw_dtype).to(dev, self.dtype)
-
-        D = int(self.V_c_col.shape[1])
-        a_v2c = torch.zeros(B, M, D, dtype=self.dtype, device=dev)
-        b_c2v = torch.zeros(B, M, D, dtype=self.dtype, device=dev)
-        l_v = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        e_v = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        s_est = torch.zeros(B, M, dtype=self.dtype, device=dev)
-
-        for i in range(1, self.max_iter + 1):
-            self.i = i
-            beta = 1.0 - 2.0 ** (-i)
-            if i == 1:
-                self._ext.init_messages(u_init, self.V_c_col, a_v2c)
-            else:
-                self._ext.vn_update(l_v, b_c2v, self.V_c_col, a_v2c, self.N)
-            self._ext.cn_update(
-                a_v2c, syndrome_neg_bc, self.V_c_col, b_c2v, beta, self.N
-            )
-            self._ext.llr_update(
-                u_init, b_c2v, self.VN_adj_c, self.VN_adj_k, l_v, self.VD
-            )
-            l_v[:, -1] = float("inf")
-            self._ext.hard_decision(l_v, e_v)
-            self._ext.syndrome_est(e_v, self.V_c_col, s_est, self.N)
-            self._ext.convergence_update(
-                s_est, syndrome, e_v, l_v, e_out, l_out, num_iters, converges, i
-            )
-
-            n_conv = int((num_iters != -1).sum())
-            if n_conv == B:
-                break
-            if cap_frac is not None and n_conv >= cap_frac * B:
-                break
-
-            # policy sign-flip every iteration (matches bp_lottery_policy)
-            l_v = self._apply_policy(syndrome, s_est, l_v)
-
-        not_conv = num_iters == -1
-        if not_conv.any().item():
-            e_out[not_conv] = e_v[not_conv]
-            l_out[not_conv] = l_v[not_conv]
-            num_iters[not_conv] = (
-                self.i
-            )  # actual stop iter (== max_iter unless the cap broke early)
-
-        if cap is not None and not cap.done and not getattr(self, "cap_bypass", False):
-            cap.observe(num_iters, self.max_iter, B)
-
-        io_dict.update(
-            {
-                "e_v": e_out[:, :-1],
-                "iter": num_iters,
-                "llr": l_out[:, :-1],
-                "converge": converges,
-            }
-        )
-        return io_dict
+        """bp_norm_min_sum_cuda per-step decode with the policy sign-flip in
+        _iter_hook, after the flip's per-forward state (_PolicyPy._prepare)."""
+        self._prepare(io_dict)
+        return _NmsCuda.forward(self, io_dict)

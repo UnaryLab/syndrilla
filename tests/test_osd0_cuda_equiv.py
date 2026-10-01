@@ -1,7 +1,8 @@
 """osd_0_cuda gives the same e_v, bit for bit, as the CPU osd_0 on the fused
 and the per-step path, with one chunk and with several chunks. The tests also
 check last_pivot_pos, the early-stop flags and pivot counts in scan_stats, and
-the GPU rank fallback."""
+the GPU rank fallback, and that scan pool overflow, the order prefix (with
+ties at its boundary) and split elimination batches leave e_v unchanged."""
 import os
 
 import numpy as np
@@ -32,7 +33,7 @@ class _Bundle:
     def __init__(self, H):
         self.index = dense_to_index_format(H, "cpu")
 
-    def select(self, check_type, dense=False):
+    def select(self, check_type):
         return self.index
 
 
@@ -96,22 +97,25 @@ def test_surface10_matches_cpu(surface10):
 
 
 def test_surface10_chunked(surface10):
-    """A workspace_bytes budget of 5 samples splits the 64 samples into 13
-    chunks; e_v and last_pivot_pos equal the one-chunk run and the CPU osd_0,
-    on the fused and the per-step path."""
+    """A workspace_bytes budget of 5 scan samples (_scan_bytes) splits the 64
+    samples into 13 scan chunks (counted via _scan calls); e_v and
+    last_pivot_pos equal the one-chunk run and the CPU osd_0, on the fused and
+    the per-step path."""
     cfg, bundle, synd, llr = surface10
     H = bundle.select("hx")[3]
     ref = _cpu_osd(bundle, synd, llr)
     whole = osd_gpu.create(dict(cfg), bundle=bundle)
     assert torch.equal(_run(whole, synd, llr, H), ref)
-    M, rank = whole.M, whole.A_rank
-    per_sample = M * max(2 * ((M + 63) >> 6), (rank + 64) >> 6) * 8
+    per_sample = whole._scan_bytes(whole.pool_rows, whole.pool_cols, whole.A_rank)
     for per_step in (False, True):
         dec = osd_gpu.create(
             dict(cfg, force_per_step=per_step, workspace_bytes=5 * per_sample),
             bundle=bundle,
         )
+        calls, scan = [], dec._scan
+        dec._scan = lambda *a: calls.append(a[0].shape[0]) or scan(*a)
         assert torch.equal(_run(dec, synd, llr, H), ref), f"force_per_step={per_step}"
+        assert calls == [5] * 12 + [4]
         assert dec.last_pivot_pos == whole.last_pivot_pos
 
 
@@ -145,10 +149,9 @@ def test_rank_deficient_late_pivots(M):
 
 def _gpu_variants(cfg, bundle, B):
     """(label, decoder) for fused and per-step, each with one chunk and with a
-    workspace_bytes budget of 3 samples (several chunks)."""
+    workspace_bytes budget of 3 scan samples (several chunks)."""
     probe = osd_gpu.create(dict(cfg), bundle=bundle)
-    M, rank = probe.M, probe.A_rank
-    per_sample = M * max(2 * ((M + 63) >> 6), (rank + 64) >> 6) * 8
+    per_sample = probe._scan_bytes(probe.pool_rows, probe.pool_cols, probe.A_rank)
     out = []
     for per_step in (False, True):
         for budget in (None, 3 * per_sample):
@@ -156,8 +159,12 @@ def _gpu_variants(cfg, bundle, B):
             if budget:
                 c["workspace_bytes"] = budget
                 assert B > 3
-            out.append((f"per_step={per_step} chunked={bool(budget)}",
-                        osd_gpu.create(c, bundle=bundle)))
+            out.append(
+                (
+                    f"per_step={per_step} chunked={bool(budget)}",
+                    osd_gpu.create(c, bundle=bundle),
+                )
+            )
     return out
 
 
@@ -232,3 +239,210 @@ def test_gpu_rank_fallback(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", no_ldpc)
     assert dec._rank(rows, cols) == (ref, "GPU scan")
     assert dec.A_rank == ref
+
+
+def _same_stats(dec, ref):
+    """scan_stats end / pivots / stopped and last_pivot_pos equal ref's."""
+    for key in ("end", "pivots", "stopped"):
+        assert torch.equal(dec.scan_stats[key], ref.scan_stats[key]), key
+    assert dec.last_pivot_pos == ref.last_pivot_pos
+
+
+def _same_scan(dec, ref, llr):
+    """_scan on the full order returns the same 4-tuple for dec and ref."""
+    order = torch.sort(llr.to(dec.device), dim=1, stable=True)[1].int().contiguous()
+    for a, b in zip(dec._scan(order, dec.A_rank), ref._scan(order, ref.A_rank)):
+        assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("pool", [1, 12])
+def test_pool_overflow(surface10, pool):
+    """Scan pools of `pool` Tr and TuT rows (M = 90): with 1 row every sample
+    overflows and is rescanned with the full T; with 12 rows some samples
+    overflow and some do not. e_v, scan_stats, last_pivot_pos and the _scan
+    4-tuple equal the default pools (which never overflow here) and the CPU
+    osd_0."""
+    cfg, bundle, synd, llr = surface10
+    H = bundle.select("hx")[3]
+    ref = osd_gpu.create(dict(cfg), bundle=bundle)
+    ref_ev = _run(ref, synd, llr, H)
+    assert not bool(ref.scan_stats["overflow"].any())
+    dec = osd_gpu.create(dict(cfg), bundle=bundle)
+    dec.pool_rows = dec.pool_cols = pool
+    out = _run(dec, synd, llr, H)
+    ovf = dec.scan_stats["overflow"]
+    assert torch.equal(ovf, dec.last_overflow)
+    if pool == 1:
+        assert bool(ovf.all())
+    else:
+        assert bool(ovf.any()) and not bool(ovf.all())
+    assert torch.equal(out, ref_ev)
+    assert torch.equal(out, _cpu_osd(bundle, synd, llr))
+    _same_stats(dec, ref)
+    _same_scan(dec, ref, llr)
+
+
+def test_prefix_redo(surface10):
+    """A 12-column prefix of the order (N = 181): samples whose full scan ends
+    at or past column 12 are solved again on the first 48 columns, and those
+    whose full scan ends at or past column 48 are then solved with the full
+    order. The sample count of each stage is read from the _solve calls; e_v,
+    scan_stats and last_pivot_pos equal the full-sort run."""
+    cfg, bundle, synd, llr = surface10
+    H = bundle.select("hx")[3]
+    ref = osd_gpu.create(dict(cfg), bundle=bundle)
+    assert ref.prefix == ref.N  # N < 16384: full sort by default
+    ref_ev = _run(ref, synd, llr, H)
+    k = 12
+    retry = int((ref.scan_stats["end"] > k).sum())
+    full = int((ref.scan_stats["end"] > 4 * k).sum())
+    assert 0 < full < retry < llr.shape[0]
+
+    dec = osd_gpu.create(dict(cfg), bundle=bundle)
+    dec.prefix = k
+    widths, solve = [], dec._solve
+
+    def spy(s, order):
+        widths.append(tuple(order.shape))
+        return solve(s, order)
+
+    dec._solve = spy
+    out = _run(dec, synd, llr, H)
+    assert widths == [(llr.shape[0], k), (retry, 4 * k), (full, dec.N)]
+    assert torch.equal(out, ref_ev)
+    _same_stats(dec, ref)
+
+
+def test_prefix_ties(surface10):
+    """LLRs rounded to 4 levels, so the value at the 30-column prefix boundary
+    is shared by columns inside and outside the prefix (on some samples). e_v equals the CPU
+    osd_0 and the full-sort run; scan_stats equal the full-sort run."""
+    cfg, bundle, synd, llr = surface10
+    H = bundle.select("hx")[3]
+    k = 30
+    lo, hi = llr.min(), llr.max()
+    q = torch.round((llr - lo) / (hi - lo) * 3)  # levels 0..3
+    srt = torch.sort(q, dim=1, stable=True)[0]
+    assert bool((srt[:, k - 1] == srt[:, k]).any())  # ties cross the boundary
+    ref = osd_gpu.create(dict(cfg), bundle=bundle)
+    ref_ev = _run(ref, synd, q, H)
+    dec = osd_gpu.create(dict(cfg), bundle=bundle)
+    dec.prefix = k
+    out = _run(dec, synd, q, H)
+    assert torch.equal(out, ref_ev)
+    assert torch.equal(out, _cpu_osd(bundle, synd, q))
+    _same_stats(dec, ref)
+
+
+def test_elimination_sub_batches():
+    """M = 400 with a duplicated row and inconsistent syndromes, so every
+    sample uses all rank(H) pivots (K >= 320). A workspace_bytes budget of 3
+    elimination samples splits each scan chunk into several elimination
+    batches (counted via _eliminate calls). e_v and scan_stats equal the
+    default budget."""
+    rng = np.random.default_rng(5)
+    M, N, B = 400, 1200, 12
+    Hm = (rng.random((M, N)) < 0.01).astype(np.uint8)
+    Hm[1] = Hm[0]
+    bundle = _Bundle(Hm)
+    s = rng.integers(0, 2, (B, M))
+    s[:, 1] = 1 - s[:, 0]
+    synd = torch.from_numpy(s).to(torch.uint8)
+    llr = torch.from_numpy(rng.random((B, N)))
+    H = bundle.select("hx")[3]
+
+    ref = osd_gpu.create(dict(CUDA_CFG), bundle=bundle)
+    ref_ev = _run(ref, synd, llr, H)
+    K = int(ref.scan_stats["pivots"].max())
+    elim = M * (((K + 64) >> 6) * 8 + 16)
+    budget = 3 * elim
+    chunk = budget // ref._scan_bytes(ref.pool_rows, ref.pool_cols, ref.A_rank)
+    assert 3 < chunk  # several elimination batches per scan chunk
+    n_chunks = -(-B // chunk)
+
+    dec = osd_gpu.create(dict(CUDA_CFG, workspace_bytes=budget), bundle=bundle)
+    calls, elim_fn = [], dec._eliminate
+
+    def spy(s_, cols, rank):
+        calls.append(cols.shape[0])
+        return elim_fn(s_, cols, rank)
+
+    dec._eliminate = spy
+    out = _run(dec, synd, llr, H)
+    assert max(calls) <= 3 and sum(calls) == B
+    assert len(calls) > n_chunks
+    assert torch.equal(out, ref_ev)
+    _same_stats(dec, ref)
+
+
+def _run_partly_converged(dec, synd, llr):
+    """e_v and iter with every other sample marked converged (input e_v
+    random, input iter 1 to 7)."""
+    B, N = llr.shape
+    dev = dec.device
+    io = {
+        "synd": synd.to(dev),
+        "llr": llr.to(dev),
+        "converge": (torch.arange(B, device=dev) % 2).long(),
+        "e_v": torch.randint(
+            0, 2, (B, N), dtype=torch.uint8, generator=torch.Generator().manual_seed(0)
+        ).to(dev),
+        "iter": (torch.arange(B, device=dev) % 7 + 1).long(),
+    }
+    with torch.no_grad():
+        out = dec(io)
+    return out["e_v"].cpu(), out["iter"].cpu()
+
+
+@pytest.mark.parametrize("group", ["pruning_opt", "memory_opt"])
+@pytest.mark.parametrize("case", ["surface10", "inconsistent"])
+def test_group_off(surface10, case, group):
+    """With `group` false, e_v and iter equal the default run with a small
+    prefix (12 columns on surface10, 15 on the inconsistent H), so early stop
+    and the prefix retry take a path there; every other sample is marked
+    converged. Fused and per-step path."""
+    if case == "surface10":
+        cfg, bundle, synd, llr = surface10
+        k = 12
+    else:
+        rng = np.random.default_rng(4)
+        M, N, B = 30, 240, 12
+        Hm = (rng.random((M, N)) < 0.1).astype(np.uint8)
+        Hm[1] = Hm[0]
+        bundle = _Bundle(Hm)
+        s = rng.integers(0, 2, (B, M))
+        s[:, 1] = 1 - s[:, 0]
+        synd = torch.from_numpy(s).to(torch.uint8)
+        llr = torch.from_numpy(rng.random((B, N)))
+        cfg, k = CUDA_CFG, 15
+    for per_step in (False, True):
+        on = osd_gpu.create(dict(cfg, force_per_step=per_step), bundle=bundle)
+        on.prefix = k
+        widths, solve = [], on._solve
+        on._solve = lambda s, o: widths.append(o.shape[1]) or solve(s, o)
+        want = _run_partly_converged(on, synd, llr)
+        assert len(widths) > 1  # the prefix retry ran
+        off = osd_gpu.create(
+            dict(cfg, force_per_step=per_step, **{group: False}), bundle=bundle
+        )
+        assert off.prefix == off.N
+        got = _run_partly_converged(off, synd, llr)
+        for a, b in zip(got, want):
+            assert torch.equal(a, b), f"per_step={per_step}"
+
+
+def test_knob_resolution():
+    """osd_early_stop false turns osd_prefix_scan off; a key written explicitly
+    wins over its group key; groups without OSD members are ignored."""
+    H = (np.random.default_rng(2).random((30, 90)) < 0.1).astype(np.uint8)
+    bundle = _Bundle(H)
+    dec = osd_gpu.create(dict(CUDA_CFG, osd_early_stop=False), bundle=bundle)
+    assert not dec.osd_prefix_scan and dec.osd_solve_by_pivots
+    dec = osd_gpu.create(
+        dict(CUDA_CFG, pruning_opt=False, osd_skip_converged=True, fusion_opt=False),
+        bundle=bundle,
+    )
+    assert not (dec.osd_early_stop or dec.osd_prefix_scan or dec.osd_solve_by_pivots)
+    assert dec.osd_skip_converged and dec.osd_column_scan
+    dec = osd_gpu.create(dict(CUDA_CFG, memory_opt=False), bundle=bundle)
+    assert not dec.osd_column_scan and dec.workspace_bytes == 1 << 60
