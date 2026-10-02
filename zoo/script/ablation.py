@@ -37,7 +37,7 @@ every pass has at least 16 batches and the BP cap can warm up) whose one-batch
 decode with that row's config fits in GPU memory and in the row timeout.
 
 Usage:
-    conda run -n syndrilla python zoo/script/ablation.py [--distances 3 9 15 21 27] [--ps 5e-4 1e-3 5e-3 1e-2] [--shots 4096] [--batch-size 64] [--row-timeout 1800] ...
+    conda run -n syndrilla python zoo/script/ablation.py [--distances 3 9 15 21 27] [--ps 1e-3 1e-2 1e-1] [--shots 4096] [--batch-size 64] [--row-timeout 1800] ...
 """
 import argparse
 import csv
@@ -450,7 +450,7 @@ def main():
         default=16,
         help="auto batch size only: B is at most --shots // this, so a pass has at least this many batches",
     )
-    ap.add_argument("--ps", type=float, nargs="+", default=[5e-4, 1e-3, 5e-3, 1e-2])
+    ap.add_argument("--ps", type=float, nargs="+", default=[1e-3, 1e-2, 1e-1])
     ap.add_argument(
         "--paths", nargs="+", default=["cuda", "pytorch"], choices=["cuda", "pytorch"]
     )
