@@ -104,7 +104,7 @@ Following is a table for detailed explaination on each command line arguments:
 | `-ckpt`  | Path to checkpoint YAML file to resume; with `-t`, the training run's `*_result.yaml`, given alongside its `-tckpt` | `-ckpt=tests/test_outputs/result_phy_err_0.1.yaml` |
 | `-bs`    | Number of samples in each batch             | `-bs=10000`                                       |
 | `-te`    | Total number of errors to stop decoding, default `1000`; ignored with `-t` | `-te=1000`                                         |
-| `-tb`    | Target number of batches to stop decoding, instead of an error target; wins over `-te` with a warning if both are given, ignored with `-t` | `-tb=500`                                         |
+| `-tb`    | Target number of batches to stop decoding, instead of an error target; batches that decode deferred samples again do not count; wins over `-te` with a warning if both are given, ignored with `-t` | `-tb=500`                                         |
 | `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-tr`    | Path to training YAML file                   | `-tr=examples/alist/train_saq_hx.training.yaml`   |
@@ -268,8 +268,10 @@ The following table details the configuration parameters used in the decoder mod
 | `decoding.device.device_idx`       | Index of the device where the decoding will happen. This option only works when `device_type = cuda`.                                      | 0                           |
 | `decoding.dtype`        | Data type for decoding computations                                         | `float32`, `float64`                              |
 | `decoding.force_pytorch`| (optional) Run the plain PyTorch module even on a CUDA device                | `false`                                            |
-| `decoding.rebatch_speedup`| (optional) Adaptive batch-shrinking cap; see [Decoder module](docs/decoder.md) | `{kl_eps: 0.001}`                                |
+| `decoding.rebatch_opt`  | (optional) Iteration cap, boolean, default `true`; `false` means no iteration cap; see [Decoder module](docs/decoder.md) | `false`                                |
+| `decoding.rebatch_opt_params`| (optional) Block overriding the cap's class defaults `kl_eps`, `kl_window`, `kl_min`, `candidates`; see [Decoder module](docs/decoder.md) | `{kl_eps: 0.001}`                                |
 | `decoding.config`       | Algorithm-specific settings (e.g. `max_iter`, or a learned decoder's `checkpoint`). A mapping configures the first algorithm; a list gives one entry per entry of `decoding.algorithm` | `max_iter: 181`             |
+| `decoding.config.compile` | (optional, `bp_norm_min_sum` only) Run the PyTorch module's iteration body through `torch.compile`; set `false` to run eager. Applies only to the PyTorch module on a CUDA device (`force_pytorch: true`, or the CUDA port unavailable); ignored on CPU | `true` |
 
 The keys above the last one are framework-wide and apply to the whole block; anything only one algorithm understands (`max_iter`, quantization widths, relay_bp's leg schedule) goes under `decoding.config`. Written as a plain mapping, as above, it configures the first algorithm, so `max_iter` reaches `bp_norm_min_sum` and `osd_0`, which takes no settings of its own, runs on its defaults. Written as a list it is matched to `decoding.algorithm` by position, which is how a chain configures a stage other than its first. A key written at the top level that belongs under `decoding.config`, or the reverse, is rejected with a message naming the block it belongs in. See [Decoder module](docs/decoder.md) for the full rule.
 
@@ -454,7 +456,7 @@ The following table provides a detailed explanation of the metrics in the output
 | `converge success rate`          | Ratio of samples that successfully converge without a logical error |
 | `decoder invoke rate`            | Ratio of samples for which the decoder is invoked                           |
 | `average iteration`              | Average number of iterations per sample                                    |
-| `sample count`                   | Total number of samples this decoder metered. Per-sample rates are accumulated weighted by this count (not by batch count), so they stay correct when batches differ in size — e.g. under the adaptive iteration speedup (`rebatch_speedup`), where a batch may meter only its converged samples. For equal-size batches it equals `batch count` × `batch size`. |
+| `sample count`                   | Total number of samples this decoder metered. Per-sample rates are accumulated weighted by this count (not by batch count), so they stay correct when batches differ in size, e.g. under the adaptive iteration speedup (`rebatch_opt`), where a batch may meter only its converged samples. For equal-size batches it equals `batch count` × `batch size`. |
 | `iteration distribution`         | Once the error budget is reached, the per-percentile iteration counts (101 values, 0–100% at 1% intervals); before then, the raw per-iteration histogram |
 | `iteration count`                | Raw per-iteration histogram (samples stopping at each iteration index), always saved un-percentiled regardless of completion |
 | `total time (s)`                 | Total time taken by the decoder in seconds                                  |

@@ -1,302 +1,112 @@
+import functools
+import types
+
 import torch
-from loguru import logger
 
-from syndrilla.decoder.decoder import RebatchSpeedup
-from syndrilla.utils import fp2fxp, parse_device_dtype
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _NmsPy
+from syndrilla.utils import fp2fxp
 
 
-class create(torch.nn.Module):
+def _cn_quant(a, syndrome_odd, beta, mask_dummy, iw, fw):
+    """Quantized check-node update on the [batch, n_checks, degree] v->c messages
+    `a` (already rounded): magnitude fp2fxp(beta) * fp2fxp(minimum |a| over the
+    other edges), sign from the edge's own sign bit, the parity of non-positive
+    inputs on the check and the syndrome bit, dummy slots 0, then the signed
+    message rounded with fp2fxp. `beta` is already rounded. Functional."""
+    neg = a <= 0.0
+    parity = (neg.sum(dim=2, keepdim=True, dtype=torch.uint8) & 1).bool()
+    flip = neg ^ (parity ^ syndrome_odd)
+    mag = a.abs()
+    min_0, arg_0 = mag.min(dim=2, keepdim=True)
+    min_1 = mag.scatter(2, arg_0, float("inf")).amin(dim=2, keepdim=True)
+    m_0 = beta * fp2fxp(min_0, iw, fw)
+    m_1 = beta * fp2fxp(min_1, iw, fw)
+    msg = torch.where(flip, -m_0, m_0)
+    msg = msg.scatter(2, arg_0, torch.where(flip.gather(2, arg_0), -m_1, m_1))
+    return fp2fxp(msg.masked_fill(mask_dummy, 0.0), iw, fw)
+
+
+def _step(l_v, c2v_prev, u_init, syndrome_odd, beta, col, vn_adj, mask_dummy, iw, fw):
+    """bp_norm_min_sum's compiled iteration body with the quantized check-node
+    update: v->c message fp2fxp(l_v - c2v), then _cn_quant. The c2v sum, LLR
+    update, hard decision and syndrome are bp_norm_min_sum's. On iteration 1 the
+    rounding of u_init (already rounded) changes only the dummy slots (+inf to the
+    largest value), which never changes the rounded minimum."""
+    B, N1 = l_v.shape
+    M, D = mask_dummy.shape
+    a = fp2fxp(l_v[:, col].view(B, M, D) - c2v_prev, iw, fw)
+    msg = _cn_quant(a, syndrome_odd, beta, mask_dummy, iw, fw)
+    flat = torch.cat([msg.view(B, -1), msg.new_zeros(B, 1)], 1)
+    g = flat[:, vn_adj].view(B, -1, N1)
+    s = torch.zeros_like(l_v)
+    for k in range(g.shape[1]):
+        s = s + g[:, k]
+    l_new = s + u_init
+    e = l_new <= 0.0
+    s_est = e.to(torch.uint8)[:, col].view(B, M, D).sum(dim=2, dtype=torch.uint8) & 1
+    return msg, l_new, e.to(l_v.dtype), s_est.to(l_v.dtype)
+
+
+class create(_NmsPy):
     """
-    This class creates a bp decoder on a single GPU
+    Quantized BP normalized min-sum: bp_norm_min_sum (eager or compiled step, row
+    compaction, hooks) with fixed-point rounding fp2fxp (floor, saturating) of
+    Q(int_width).(frac_width) on the channel LLR, the v->c message, beta, the
+    check-node minimum, the c->v message and the returned llr. The posterior LLR
+    is a sum of rounded values, so its hard decision equals that of its rounded
+    value.
+
+    Accepts every bp_norm_min_sum key plus
+        int_width : int (default 3)   integer bits of the fixed-point format
+        frac_width: int (default 4)   fractional bits
     """
-    def __init__(self,
-                 decoding_cfg,
-                 **kwargs) -> None:
-        """
-        Initialization for bp decoder
-        Input:
-            decoding_cfg: the information that come from config file (yaml)
 
-        Parameters:
-            max_iter: the number of maximum iteration of bp decoder
-            i: the number of iterations running the decoder
+    def __init__(self, decoding_cfg, **kwargs) -> None:
+        super().__init__(decoding_cfg, **kwargs)
+        self.intwidth = decoding_cfg.get("int_width", 3)
+        self.fracwidth = decoding_cfg.get("frac_width", 4)
+        self.algo = "bp_norm_min_sum_quant"
+        if self.compile:
+            step = types.FunctionType(
+                _step.__code__.replace(), _step.__globals__, _step.__name__
+            )
+            self._step = functools.partial(
+                torch.compile(step), iw=self.intwidth, fw=self.fracwidth
+            )
+            self.betas = self._q(self.betas)
 
-            H_matrix: loaded ldpc matrix, either hx or hz, as 2d tensor
-
-            V_c_row: the row index of all the variable nodes for each check node
-            V_c_col: the column index of all the variable nodes for each check node
-
-            degree: the maximum number of 1s in all check nodes in H_matrix
-        """
-
-        super(create, self).__init__()
-
-        logger.info('Creating bp decoder.')
-
-        # set up default device
-        self.device, _ = parse_device_dtype(decoding_cfg)
-
-        # set up default max_iter
-        self.max_iter = decoding_cfg.get('max_iter', 50)
-        if self.max_iter <= 0 or not isinstance(self.max_iter, int):
-            logger.warning(f'Invalid input maximum iteration <{self.max_iter}>, default to <50>.')
-            self.max_iter = 50
-
-        # set up default dtype
-        self.dtype = decoding_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
-            logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
-            self.dtype = 'float64'
-        self.dtype = torch.__dict__[self.dtype]
-
-        self.batch_size = 1
-
-        self.check_type = decoding_cfg.get('check_type', 'hx')
-        if self.check_type.lower() not in {'hx', 'hz'}:
-            logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
-            self.check_type = 'hx'
-
-        bundle = kwargs.get('bundle')
-        if bundle is None:
-            raise ValueError('bp_norm_min_sum_quant requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
-        self.Hx_matrix = bundle.Hx_matrix
-        self.Hz_matrix = bundle.Hz_matrix
-        self.lx_matrix = bundle.lx_matrix
-        self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type, dense=False)
-
-        self.mask_dummy = (self.V_c_col == self.H_shape[1])
-
-        # set iteration
-        self.i = 0
-
-        # convert to as the parameters in a model
-        self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
-        self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
-
-        self.intwidth = decoding_cfg.get('int_width', 3)
-        self.fracwidth = decoding_cfg.get('frac_width', 4)
-
-        self.algo = 'bp_norm_min_sum_quant'
-        self.num_max_iter = self.max_iter
-
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get('rebatch_speedup'))
-        self.cap_bypass = False       # set by main: True -> decode this batch uncapped
-        self.cap_active_last = False  # set per forward: True if the cap was applied
-
-        logger.info('Complete.')
-
+    def _q(self, t):
+        return fp2fxp(t, self.intwidth, self.fracwidth)
 
     def forward(self, io_dict):
-        """Iterative bp (normalized min sum) decoding algorithm
-        Input:
-            syndrome: estimated syndrome for c-th code node
-
-        Output:
-            e_v: estimated error for c-th code node at i-th iteration
-
-        Parameters:
-            llr:  Log-likelihood Ratio (LLR) for each v-th variable node (initialization)
-            l_v: Log-likelihood Ratio (LLR) for v-th variable node at i-th iteration
-            u_init: Log-likelihood Ratio (LLR) for v-th variable node (initialization)
-
-            a_v2c: Message from the v-th variable node to c-th check node at i-th iteration
-            b_c2v: Message from the c-th check node to v-th variable node at i-th iteration
-            message: used to represent both a_v2c and b_c2v
-
-            s_est:  estimated syndrome for c-th code node at i-th iteration
-        """
-        logger.info('Initializing bp (normailized min sum) decoding.')
-        syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
-
-        self.batch_size, _ = syndrome.size()
-
-        # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
-        N_extended = self.H_shape[1] + 1
-        l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
-
-        # add dummy column
-        dummy_column = torch.full([self.batch_size,1], float('inf'), dtype=self.dtype, device=self.device)
-        u_init = torch.cat((fp2fxp(io_dict['llr0'].to(self.device).to(self.dtype), self.intwidth, self.fracwidth), dummy_column), dim=1)
-        e_out = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        l_out = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        num_iters = torch.full([self.batch_size], -1, device=self.device)
-        converges = torch.full([self.batch_size], 0, device=self.device)
-
-        # set up initialization for all parameters for decoding process
-        # message is a in place version of a_v2c and b_c2v
-        message = u_init[:, self.V_c_col]
-
-        # compute syndrome for multiplication
-        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype).unsqueeze(2)
-
-        logger.info('Complete.')
-
-        logger.info('Starting decoding iterations.')
-
-        # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
-        # soon as that fraction has converged (unless main asked for an uncapped pass).
-        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
-        cap_frac = self.cap.frac if self.cap_active_last else None
-
-        self.i = 0
-        while self.i < self.max_iter:
-            self.i += 1
-
-            # v2c: gather the per-variable LLR into the check-grouped layout
-            l_v_v2c = self.v2c(l_v)
-
-            # variable node update (quantization inside the function to avoid extra computation)
-            message = self.vn_update(message, l_v_v2c)
-
-            # check node update (min-sum); masks the dummy edges and quantizes the
-            # multiplication result inside the function
-            message = self.cn_update(message)
-
-            # c2v: convert the check messages back to the per-variable layout
-            message_c2v = self.c2v(message)
-
-            # elementwise LLR update
-            # no quantization since most hardware designs do LLR update and vn update together
-            l_v = self.llr_update(u_init, message_c2v)
-
-            # hard decision: map the (quantized) posterior LLR to a binary error estimate
-            e_v = self.hard_decision(l_v)
-
-            s_est = self.syndrome_estimation(e_v)
-
-            # different samples from the same batch may terminated at different iteration (pick the smallest one)
-            indices = torch.all(s_est == syndrome, 1).nonzero()
-            checker = torch.where(num_iters == -1.0)[0]
-            indices = indices[torch.isin(indices, checker)]
-            if indices.size()[0] > 0:
-                num_iters[indices] = self.i
-                e_out[indices] = e_v[indices]
-                l_out[indices] = fp2fxp(l_v[indices], self.intwidth, self.fracwidth)
-                converges[indices] = 1
-
-            # do the early termination if all batch satisfy the condition
-            if checker.size()[0] == 0:
-                break
-
-            # adaptive cap: stop once >= cap_frac of the batch has converged; the
-            # unconverged remainder (converge == 0) becomes main's deferred tail.
-            if cap_frac is not None and int((num_iters != -1).sum()) >= cap_frac * self.batch_size:
-                break
-
-        checker = torch.where(num_iters == -1)[0]
-        e_out[checker] = e_v[checker]
-        l_out[checker] = fp2fxp(l_v[checker], self.intwidth, self.fracwidth)
-        num_iters[checker] = self.i
-        e_out = e_out[:, :-1]
-        l_out = l_out[:, :-1]
-
-        # warm-up: observe this batch's iteration distribution (decides k + the cap).
-        if self.cap is not None and not self.cap.done and not self.cap_bypass:
-            self.cap.observe(num_iters, self.max_iter, self.batch_size)
-
-        logger.info('Complete.')
-        logger.info(f'Decoding iterations: <{(self.i)}>.')
-        io_dict.update({
-            'e_v': e_out,
-            'iter': num_iters,
-            'llr': l_out,
-            'converge': converges
-        })
+        """bp_norm_min_sum decoding of the rounded channel LLR; io_dict keeps its
+        own llr0."""
+        llr0 = self._q(io_dict["llr0"].to(self.device).to(self.dtype))
+        out = super().forward({**io_dict, "llr0": llr0})
+        io_dict.update({k: out[k] for k in ("e_v", "iter", "llr", "converge")})
         return io_dict
 
-
-    def v2c(self, l_v):
-        """Format conversion (variable -> check layout).
-
-        Gathers the per-variable LLR vector `l_v` ([batch, N+1]) into the
-        check-node-grouped layout ([batch, n_checks, degree]) that the variable-node
-        and check-node updates operate on. Each edge (c, v) picks up `l_v[:, v]`.
-        """
-        return l_v[:, self.V_c_col]
-
+    def _exit_hook(self, l_v, e_v, num_iters, converges) -> None:
+        """Rounds the returned llr."""
+        l_v.copy_(self._q(l_v))
+        super()._exit_hook(l_v, e_v, num_iters, converges)
 
     def vn_update(self, b_c2v, l_v_v2c):
-        # updating the a_v2c by b_c2v
-        if self.i == 1:
-            return b_c2v
-        else:
-            # do quantization here to avoid extra quantization operation on initialization
-            return fp2fxp(l_v_v2c - b_c2v, self.intwidth, self.fracwidth)
+        """Eager v->c message: the initial message on iteration 1, afterwards
+        fp2fxp(l_v - c2v)."""
+        a = super().vn_update(b_c2v, l_v_v2c)
+        return a if self.i == 1 else self._q(a)
 
-
-    def cn_update(self, a_v2c):
-        base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype)
-
-        # Compute the power in PyTorch:
-        beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
-
-        # compute sgn
-        sign = torch.sgn(a_v2c)
-        sign = torch.where(sign == 0.0, -1.0, sign)
-        sign_prod = torch.prod(sign, dim=2, keepdim=True)
-        Q_sign = self.syndrome_neg * sign_prod
-
-        # compute min
-        abs_a_v2c = torch.abs(a_v2c)
-        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
-        min_0 = mins[:, :, 0].unsqueeze(2)
-        min_1 = mins[:, :, 1].unsqueeze(2)
-        min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
-
-        # quantization on both beta and min result computation before final multiplication
-        message = (fp2fxp(beta, self.intwidth, self.fracwidth) * sign * Q_sign  * fp2fxp(min_result, self.intwidth, self.fracwidth))
-        message[:, self.mask_dummy] = 0.0
-        # quantization since the output is a multiplication result
-        message = fp2fxp(message, self.intwidth, self.fracwidth)
-        return message
-
-
-    def c2v(self, b_c2v):
-        """Format conversion (check -> variable layout).
-
-        Scatters the check-node-grouped c->v messages ([batch, n_checks, degree])
-        back into the per-variable layout ([batch, N+1]) that the LLR update sums
-        over: every edge (c, v) accumulates its message into column `v`.
-        """
-        # set up the format for both data and partition so they can matching each other
-        data_flat = b_c2v.flatten(start_dim=1)
-        sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
-
-        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
-        return sum_b_c2v
-
-
-    def llr_update(self, u_init, b_c2v):
-        """Elementwise LLR update: posterior LLR = channel LLR + sum of incoming c->v.
-
-        Takes the already c2v-converted per-variable messages and adds the channel
-        (initialization) LLR. The dummy variable (last column) is pinned to +inf so
-        it is never decoded as an error. No quantization here, since most hardware
-        designs do the LLR update and the variable-node update together.
-        """
-        l_v = u_init + b_c2v
-        l_v[:, -1] = float('inf')
-        return l_v
-
-
-    def hard_decision(self, l_v):
-        """Hard decision: map the quantized posterior LLR to a binary error estimate.
-
-        The posterior LLR is quantized (fixed-point) before thresholding: a
-        non-positive value (<= 0) means the bit is more likely 1, so it is set to 1;
-        otherwise 0. Returns the estimate in the decoder's dtype.
-        """
-        return torch.where(fp2fxp(l_v, self.intwidth, self.fracwidth) <= 0.0, 1.0, 0.0).to(self.dtype)
-
-
-    def syndrome_estimation(self, e_v):
-        # calculate the syndrome by summing the number of 1s in each column in e
-        temp_e = e_v
-        temp_e[:, -1] = 0.0
-        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
-
-        return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0).to(self.dtype)
+    def cn_update(self, a_v2c, syndrome_odd, out):
+        """Eager quantized check-node update (_cn_quant), written into `out`."""
+        beta = self._q(
+            torch.tensor(1.0, dtype=self.dtype)
+            - torch.pow(
+                torch.tensor(2.0, dtype=self.dtype),
+                torch.tensor(-self.i, dtype=self.dtype),
+            )
+        )
+        msg = _cn_quant(
+            a_v2c, syndrome_odd, beta, self.mask_dummy, self.intwidth, self.fracwidth
+        )
+        return out.copy_(msg)

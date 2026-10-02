@@ -1,95 +1,58 @@
 import torch
 from loguru import logger
 
+from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.osd_0.osd_0_cuda import create as _osd_0_cuda
 from syndrilla.utils import parse_device_dtype
 
 
-class COOMatrixGF2Batch:
-    def __init__(self, H: torch.Tensor, B: int):
-        """
-        H: GF(2) matrix of shape [M, N], dense or sparse COO, dtype=torch.uint8 or torch.bool
-        B: Number of batches
-        """
-        assert H.dim() == 2, 'H must be a 2D matrix'
-        assert H.dtype in [torch.bool, torch.uint8], 'H must be of dtype bool or uint8'
-
-        M, N = H.shape
-        self.shape = (B, M, N)
-        self.B = B
-
-        # Find non-zero positions, row-major order for both layouts
-        if H.is_sparse:
-            H = H.coalesce()
-            nz = H.indices()[:, H.values().bool()].t()  # [nnz, 2], each row is [row, col]
-        else:
-            nz = H.nonzero(as_tuple=False)  # [nnz, 2], each row is [row, col]
-        self.nnz = nz.size(0)
-
-        # Repeat for all batches
-        self.batch_idx = torch.arange(B).repeat_interleave(self.nnz)
-        self.row_idx = nz[:, 0].repeat(B)
-        self.col_idx = nz[:, 1].repeat(B)
-        self.values = torch.ones(B * self.nnz, dtype=torch.uint8)
-
-
-    def from_sparse_batch(cls, sparse_batch: list[list[list[int]]], n_row: int, n_col: int):
-        """
-        Initialize from a list-of-list-of-lists sparse format:
-        sparse_batch[b][r] = list of col indices where entry is 1
-        """
-        batch_idx = []
-        row_idx = []
-        col_idx = []
-
-        for b, batch in enumerate(sparse_batch):
-            for r, row in enumerate(batch):
-                for c in row:
-                    batch_idx.append(b)
-                    row_idx.append(r)
-                    col_idx.append(c)
-
-        batch_idx = torch.tensor(batch_idx, dtype=torch.int32)
-        row_idx = torch.tensor(row_idx, dtype=torch.int16)
-        col_idx = torch.tensor(col_idx, dtype=torch.int16)
-        values = torch.ones_like(batch_idx, dtype=torch.bool)
-
-        obj = cls.__new__(cls)
-        obj.shape = (len(sparse_batch), n_row, n_col)
-        obj.B = len(sparse_batch)
-        obj.batch_idx = batch_idx
-        obj.row_idx = row_idx
-        obj.col_idx = col_idx
-        obj.values = values
-        obj.nnz = len(values)
-        return obj
-
-
-    def create_empty_batch(B: int, n_row: int, n_col: int):
-        """
-        Returns an empty COO sparse matrix batch.
-        """
-        obj = COOMatrixGF2Batch.__new__(COOMatrixGF2Batch)
-        obj.shape = (B, n_row, n_col)
-        obj.B = B
-        obj.batch_idx = torch.empty(0, dtype=torch.int32)
-        obj.row_idx = torch.empty(0, dtype=torch.int16)
-        obj.col_idx = torch.empty(0, dtype=torch.int16)
-        obj.values = torch.empty(0, dtype=torch.bool)
-        obj.nnz = 0
-        return obj
-
-
-    def to_dense(self, device=None):
-        """
-        Convert to dense [B, M, N] torch bool tensor.
-        """
-        B, M, N = self.shape
-        dense = torch.zeros((B, M, N), dtype=torch.bool, device=self.batch_idx.device)
-        dense[self.batch_idx, self.row_idx.to(torch.int64), self.col_idx.to(torch.int64)] = self.values.to(torch.bool)
-        return dense
-
-
 class create(torch.nn.Module):
+    """
+    OSD-0 post-decoder in plain PyTorch (CPU or GPU), the same algorithm as osd_0_cuda.
+
+    Columns are taken in stable ascending LLR order. A greedy scan picks each
+    column that is independent of the pivot columns found so far, with the
+    lowest row without a pivot that holds a bit as its pivot row. The scan
+    keeps the row transform T (the eliminated matrix is T @ H), bit-packed and
+    transposed, and the reduced syndrome T @ s, and eliminates only the rows
+    without a pivot. It stops once T @ s is zero on every row without a pivot:
+    s then lies in the span of the pivots found and the solution on them is
+    unique. Back substitution on the pivot rows, which are upper triangular in
+    pivot order, gives the estimate (see _scan).
+
+    A syndrome outside the column space of H never stops early and scans the
+    whole order; its estimate is the solution on the pivot rows only.
+
+    Outputs: e_v (uint8) with the OSD estimate on the samples the previous
+    decoder did not converge on; iter, the input iter (zeros [B] int64 when
+    absent) with N on those samples; converge, all ones. Rows where the
+    optional bool [B] io_dict['defer'] is True are not decoded and keep their
+    input e_v, iter and converge; defer passes through unchanged.
+
+    Config keys beyond the shared ones:
+        workspace_bytes : int (optional, default 4 GiB; samples are sorted and
+                          scanned in chunks whose working memory fits it, see
+                          _scan_chunks; inputs and the [B, N] outputs are outside it)
+        osd_early_stop  : bool (default true; false scans the whole order and
+                          turns osd_prefix_scan off)
+        osd_prefix_scan : bool (default true; false sorts the whole order once)
+        osd_solve_by_pivots : bool (default true; false back-substitutes over
+                          M pivot slots instead of the largest pivot count)
+        osd_skip_converged : bool (default true; false decodes every sample and
+                          keeps the result only where converge is 0)
+        osd_column_scan : bool (default true; false runs a dense Gauss-Jordan
+                          on [H | s] over the whole order, see _gauss_jordan)
+        osd_packed_transform : bool (default true; false keeps T as a dense
+                          bool matrix, see _scan_dense)
+        pruning_opt     : bool (default true; false makes the defaults of
+                          osd_early_stop, osd_prefix_scan, osd_solve_by_pivots
+                          and osd_skip_converged false)
+        memory_opt      : bool (default true; false makes the defaults of
+                          osd_column_scan and osd_packed_transform false and of
+                          workspace_bytes 1 << 60)
+        fusion_opt, mapping_opt, gather_opt : no OSD members, ignored
+    """
+
     def __init__(self,
                     decoding_cfg,
                     **kwargs) -> None:
@@ -114,6 +77,18 @@ class create(torch.nn.Module):
         check_type = decoding_cfg.get('check_type', 'hx')
         H_shape = bundle.select(check_type)[0]
         self.num_max_iter = H_shape[1]
+        self.cols = self._column_rows(bundle.select(check_type)[3].to(self.device))
+        self.workspace_bytes = int(knob(decoding_cfg, 'workspace_bytes', 4 << 30))
+        self.osd_early_stop = bool(knob(decoding_cfg, 'osd_early_stop', True))
+        self.osd_prefix_scan = bool(knob(decoding_cfg, 'osd_prefix_scan', True)) and self.osd_early_stop
+        self.osd_solve_by_pivots = bool(knob(decoding_cfg, 'osd_solve_by_pivots', True))
+        self.osd_skip_converged = bool(knob(decoding_cfg, 'osd_skip_converged', True))
+        self.osd_column_scan = bool(knob(decoding_cfg, 'osd_column_scan', True))
+        self.osd_packed_transform = bool(knob(decoding_cfg, 'osd_packed_transform', True))
+        # Columns of the reliability order the scan tries first, as in
+        # osd_0_cuda; the whole order without osd_prefix_scan or osd_column_scan.
+        N = int(H_shape[1])
+        self.prefix = N // 16 if N >= 1 << 14 and self.osd_prefix_scan and self.osd_column_scan else N
 
         logger.info('Complete.')
 
@@ -122,566 +97,269 @@ class create(torch.nn.Module):
         logger.info('Initializing osd-0 decoding.')
 
         device = io_dict['synd'].device
-        not_converged_mask = (io_dict['converge'] == 0)
-        idx = not_converged_mask.nonzero(as_tuple=True)[0].to(device)
-        soft_decision_sub = io_dict['llr'][idx]
-        synd_sub = io_dict['synd'][idx]
+        converge = io_dict['converge']
+        B = converge.shape[0]
+        iter_out = io_dict['iter'].clone() if 'iter' in io_dict else torch.zeros(B, dtype=torch.long, device=device)
+        # rows marked in io_dict['defer'] are re-decoded by the batch loop, OSD skips them
+        defer = io_dict['defer'].to(device=converge.device, dtype=torch.bool) if 'defer' in io_dict else None
+        nc = converge == 0 if defer is None else (converge == 0) & ~defer
+        idx = nc.nonzero(as_tuple=True)[0].to(device)
+        # samples OSD decodes: all non-deferred ones without osd_skip_converged
+        if self.osd_skip_converged:
+            run = idx
+        else:
+            run = torch.arange(B, device=device) if defer is None else (~defer).nonzero(as_tuple=True)[0].to(device)
+        llr_sub = io_dict['llr'].to(self.dtype)[run]
+        synd_sub = io_dict['synd'][run].to(torch.bool)
+        N = self.cols.shape[0] - 1
 
         logger.info('Complete.')
 
         logger.info('Starting decoding.')
 
-        _, cols_batch = torch.sort(soft_decision_sub, descending=False, stable=True)
-
-        H = io_dict['H_matrix'].to(dtype=torch.bool)
-
-        L_batch, U_batch, rows_lu_batch, cols_lu_batch, max_iter = self.LU_decomposition_batch(H, cols_batch)
-
-        del H, cols_batch
-        torch.cuda.empty_cache()
-
-        OSD_sub_result = self.LU_forward_backward_solve_batch(L_batch, U_batch, rows_lu_batch, cols_lu_batch, synd_sub)
-        del L_batch, U_batch, rows_lu_batch, cols_lu_batch, synd_sub
-        torch.cuda.empty_cache()
+        # The scan first runs on the first k = prefix columns of the order. A
+        # sample that does not stop inside them is solved again on the first
+        # 4k columns (skipped when 4k >= N), then on the full order.
+        prev = min(self.prefix, N)
+        e_sub, stopped = self._scan_chunks(llr_sub, synd_sub, prev)
+        if prev < N:
+            for width in ([4 * prev] if 4 * prev < N else []) + [N]:
+                redo = (~stopped).nonzero(as_tuple=True)[0]
+                if not redo.numel():
+                    break
+                e_sub[redo], stopped[redo] = self._scan_chunks(llr_sub[redo], synd_sub[redo], width)
 
         final_result = io_dict['e_v'].clone().to(dtype=torch.uint8, device=device)
-        final_result[idx] = OSD_sub_result.to(device)
-        del OSD_sub_result
-        torch.cuda.empty_cache()
+        final_result[idx] = e_sub if self.osd_skip_converged else e_sub[nc.to(device)[run]]
+        if idx.numel() > 0:
+            iter_out = iter_out.to(device)
+            iter_out[idx] = self.num_max_iter
 
         logger.info('Complete.')
 
-        ones_converge = torch.ones_like(io_dict['converge'])
         io_dict.update({
             'e_v': final_result,
-            'iter': max_iter,
-            'converge': ones_converge
+            'iter': iter_out,
+            'converge': torch.ones_like(converge) if defer is None else torch.where(defer, converge, torch.ones_like(converge))
         })
         return io_dict
 
 
-    def LU_decomposition_batch(self, H, cols_batch):
-        """
-        Perform LU decomposition on GF(2) for a batch of column orderings.
-
-        Args:
-            H (torch.Tensor): [M, N] binary matrix (same for all batches)
-            cols_batch (torch.Tensor): [B, N]
-
-        Returns:
-            L_batch: [B, M, A_rank]
-            U_batch: [B, A_rank, N]
-            rows_batch: [B, M]
-            cols_batch_out: [B, N]
-        """
-        B, N = cols_batch.shape
-        M = H.shape[0]
-
-        device = H.device
-        A_rank= self.gf2_rank(H)
-        B_batch_sparse = COOMatrixGF2Batch(H, B)
-        del H
-        torch.cuda.empty_cache()
-
-        L_batch_sparse = COOMatrixGF2Batch.create_empty_batch(B, M, A_rank)
-        U_batch_sparse = COOMatrixGF2Batch.create_empty_batch(B, A_rank, N)
-
-        arange_M = torch.arange(M, device=device, dtype=torch.int32)
-        arange_N = torch.arange(N, device=device, dtype=torch.int32)
-        arange_B = torch.arange(B, device=device, dtype=torch.int32)
-
-        rows_batch = arange_M.unsqueeze(0).expand(B, M).clone()  # [B, M]
-        rinv_batch = arange_M.unsqueeze(0).expand(B, M).clone()  # [B, M]
-
-        cinv_batch = torch.zeros((B, N), dtype=torch.int32, device=device)
-        cols_batch = cols_batch.to(torch.int32)
-        cinv_batch[arange_B.unsqueeze(1), cols_batch] = arange_N.unsqueeze(0)
-
-        cols_batch_out = cols_batch
-
-        # cinv construct
-        batch_indices = torch.arange(B, device=device, dtype=torch.int32).unsqueeze(1).expand(B, N)
-        cinv_batch[batch_indices, cols_batch] = torch.arange(N, device=device, dtype=torch.int32).unsqueeze(0).expand(B, N)
-
-        B_idx_full = torch.arange(B, device=device, dtype=torch.int32)            # shape [B]
-        M_idx_full = torch.arange(M, device=device, dtype=torch.int32)            # shape [M]
-        N_idx_full = torch.arange(N, device=device, dtype=torch.int32)            # shape [N]
-
-        batch_indices_base = torch.arange(B, device=device, dtype=torch.int32).view(B, 1)
-        row_indices = M_idx_full.view(1, 1, -1)
-        row_indices = row_indices.to(dtype=torch.int16)
-        B_idx = B_idx_full.view(B, 1).expand(B, M)            # [B, M]
-        M_idx = M_idx_full.view(1, M).expand(B, M)          # [B, M]
-        used_col_count = torch.zeros(B, dtype=torch.int16, device=device)
-
-        for i in range(A_rank):
-            # Step 1: For each batch, find the first valid pivot starting from row i,
-            # where the pivot condition is B[b, :, cols[b, k]] == 1 and rinv >= i
-
-            # curr_cols: [B, N-i]
-            curr_cols = cols_batch_out[:, i:N]  # columns from i to N-1
-            B, ni = curr_cols.shape
-
-            query_b = batch_indices_base.expand(B, ni).reshape(-1).to(device)   # [B * (N-i)]
-            query_c = curr_cols.reshape(-1).to(device)                          # [B * (N-i)]
-            # [Q, NNZ] = [B*(N-i), B*nnz]
-            coo_b = B_batch_sparse.batch_idx.to(device)
-            coo_r = B_batch_sparse.row_idx.to(device)
-            coo_c = B_batch_sparse.col_idx.to(device)
-            coo_v = B_batch_sparse.values.to(device)
-
-            # key: (b * N + c)
-            query_j = torch.arange(ni, device=device).repeat(B).to(device)        # [Q]
-            query_key = query_b * N + query_c                         # [Q]
-            coo_key = coo_b * N + coo_c                               # [NNZ]
-
-            coo_key_sorted, sort_idx = torch.sort(coo_key)            # [NNZ]
-            coo_r_sorted = coo_r[sort_idx]
-
-            lower = torch.searchsorted(coo_key_sorted, query_key, side='left')   # [Q]
-            upper = torch.searchsorted(coo_key_sorted, query_key, side='right')  # [Q]
-
-            repeats = upper - lower
-            mask = repeats > 0
-            query_idx = torch.arange(query_key.size(0), device=device)
-
-            query_idx_valid = query_idx[mask]
-            repeats_valid = repeats[mask]
-            lower_valid = lower[mask]
-
-            q_idx_expanded = query_idx_valid.repeat_interleave(repeats_valid)         # [M]
-            total_matches = repeats_valid.sum()
-            offsets = lower_valid.repeat_interleave(repeats_valid)  # [M]
-
-            range_increments = torch.arange(total_matches, device=device) - torch.cumsum(
-                torch.nn.functional.pad(repeats_valid, (1, 0))[:-1], dim=0).repeat_interleave(repeats_valid)
-            coo_idx = offsets + range_increments  # [M]
-
-            r_idx = coo_r_sorted[coo_idx]
-            b_idx = query_b[q_idx_expanded]
-            j_idx = query_j[q_idx_expanded]
-
-            del query_j, query_key, coo_key
-            del curr_cols, query_b, query_c
-            del query_idx_valid, repeats_valid, lower_valid
-            del q_idx_expanded, total_matches, offsets, range_increments, coo_idx
-            del lower, upper, repeats, mask, query_idx
-            del coo_key_sorted, sort_idx, coo_r_sorted
-            torch.cuda.empty_cache()
-
-            candidate_mask = torch.zeros((B, ni, rinv_batch.shape[1]), dtype=torch.bool, device=device)
-            candidate_mask.index_put_((b_idx, j_idx, r_idx), torch.ones_like(r_idx, dtype=torch.bool), accumulate=True)
-
-            rinv_expand = rinv_batch.unsqueeze(1).expand(B, ni, rinv_batch.shape[1])  # [B, ni, N]
-            candidate_mask &= (rinv_expand >= i)
-
-            del rinv_expand
-            del b_idx, j_idx, r_idx
-            torch.cuda.empty_cache()
-
-            valid_rows = torch.where(candidate_mask, row_indices, M)  # [B, N-i, M]
-
-            del candidate_mask
-            torch.cuda.empty_cache()
-            # For each column, find the first valid row with a pivot
-            min_rows, _ = valid_rows.min(dim=2)  # [B, N-i]
-
-            # Determine which column gives the earliest valid row (i.e., first pivot)
-            row_found_mask = min_rows < M
-            valid_col_indices = N_idx_full[i:].view(1, -1).expand(B, N - i)  # [B, N-i]
-            valid_col_vals = torch.where(row_found_mask, valid_col_indices, N)  # [B, N-i]
-            min_col_vals, min_col_idx = valid_col_vals.min(dim=1)  # [B]
-            min_row_vals = min_rows[B_idx_full, min_col_idx]  # [B]
-
-            used_col_count = torch.maximum(used_col_count, min_col_vals + 1)
-            # Write results
-            pivot_row = torch.full((B,), -1, dtype=torch.long, device=device)
-            pivot_col = torch.full((B,), -1, dtype=torch.long, device=device)
-
-            pivot_col = cols_batch_out[B_idx_full, min_col_vals]  # [B]
-            pivot_row = min_row_vals  # [B]
-            # Step 2: swap cols[i] <-> pivot_col
-            old_col_i = cols_batch_out[:, i].clone()
-
-            pivot_cinv = cinv_batch[B_idx_full, pivot_col]
-
-            # swap cols
-            cols_batch_out[:, i] = pivot_col
-            cols_batch_out[B_idx_full, pivot_cinv] = old_col_i
-
-            # update cinv
-            cinv_batch[B_idx_full, old_col_i] = pivot_cinv
-            cinv_batch[B_idx_full, pivot_col] = i
-
-            # Step 3: swap rows
-            row_i = rows_batch[:, i].clone()
-
-            pivot_row = pivot_row.to(dtype=torch.long)
-
-            pivot_ri = rinv_batch[B_idx_full, pivot_row]
-
-            # swap rows
-            rows_batch[:, i] = pivot_row
-            rows_batch[B_idx_full, pivot_ri] = row_i
-
-            # update rinv
-            rinv_batch[B_idx_full, row_i] = pivot_ri
-            rinv_batch[B_idx_full, pivot_row] = i
-
-            # B_idx: [B, M], M_idx: [B, M], pivot_col: [B]
-            pivot_col_expand = pivot_col.view(B, 1).expand(B, M)       # [B, M]
-            B_idx_flat = B_idx.reshape(-1)  # [B*M]
-            M_idx_flat = M_idx.reshape(-1)  # [B*M]
-            pivot_col_flat = pivot_col_expand.reshape(-1)  # [B*M]
-
-            query_tuples = torch.stack([
-                B_idx_flat,
-                M_idx_flat,
-                pivot_col_flat
-            ], dim=1)
-
-            del B_idx_flat, M_idx_flat, pivot_col_flat
-            del old_col_i, pivot_cinv, row_i, pivot_ri
-            del valid_rows, min_rows, row_found_mask, valid_col_indices, valid_col_vals
-            del min_col_vals, min_col_idx, min_row_vals
-            torch.cuda.empty_cache()
-
-            coo_tuples = torch.stack([
-            coo_b,
-            coo_r,
-            coo_c
-            ], dim=1)
-            coo_keys = self.tuple_hash(coo_tuples)        # [nnz_total]
-            query_keys = self.tuple_hash(query_tuples)    # [B*M]
-
-            row_val_flat = torch.isin(query_keys, coo_keys).to(torch.bool)  # [B*M]
-            row_val = row_val_flat.view(B, M)  # [B, M]
-
-            rinv_r = rinv_batch[B_idx, M_idx]                     # [B, M]
-            gt_mask = (rinv_r > i) & (row_val == 1)
-            eq_mask = (rinv_r == i) & (row_val == 1)
-            lt_mask = (rinv_r < i) & (row_val == 1)
-
-            # XOR elimination: B[r] ^= B[pivot_row]
-            pivot_rows = pivot_row.view(B, 1, 1).expand(B, 1, N)   # [B, 1, N]
-            pivot_B = torch.zeros(B, N, dtype=torch.uint8, device=device)
-
-            target_r = pivot_row[coo_b]  # shape: [nnz]
-            mask = coo_r == target_r
-
-            pb = coo_b[mask]
-            pc = coo_c[mask]
-            pv = coo_v[mask]
-
-            pivot_B[pb, pc] = pv
-            pivot_B = pivot_B.unsqueeze(1)
-
-            del pivot_rows, target_r, pb, pc, pv, coo_keys, query_keys, row_val_flat
-            del query_tuples, coo_tuples
-            torch.cuda.empty_cache()
-
-            coo_b, coo_r, coo_c, coo_v = self.apply_xor_sparse(
-                coo_b, coo_r, coo_c, coo_v,
-                gt_mask=gt_mask,
-                pivot_row=pivot_row,
-                pivot_row_tensor=pivot_B.squeeze(1)  # shape [B, N]
-            )
-            B_batch_sparse.batch_idx = coo_b
-            B_batch_sparse.row_idx = coo_r
-            B_batch_sparse.col_idx = coo_c
-            B_batch_sparse.values = coo_v
-
-            # find index
-            eq_b, eq_m = torch.nonzero(eq_mask, as_tuple=True)
-            gt_b, gt_m = torch.nonzero(gt_mask, as_tuple=True)
-            lt_b, lt_m = torch.nonzero(lt_mask, as_tuple=True)
-            # --- Update L_sparse ---
-            L_b = torch.cat([eq_b, gt_b]).to(device)
-            L_r = torch.cat([eq_m, gt_m]).to(device)
-            L_c = torch.full_like(L_r, i, dtype=torch.int32, device = device)
-            L_v = torch.ones_like(L_r, dtype=torch.uint8, device = device)
-
-            L_batch_sparse.batch_idx = torch.cat([L_batch_sparse.batch_idx.to(device), L_b])
-            L_batch_sparse.row_idx   = torch.cat([L_batch_sparse.row_idx.to(device), L_r])
-            L_batch_sparse.col_idx   = torch.cat([L_batch_sparse.col_idx.to(device), L_c])
-            L_batch_sparse.values    = torch.cat([L_batch_sparse.values.to(device), L_v])
-
-            # --- Update U_sparse ---
-            # term1: U[lt_b, rinv_r[lt_b, lt_m], pivot_col_expand[lt_b, lt_m]]
-            U_b1 = lt_b.to(device)
-            U_r1 = rinv_r[lt_b, lt_m].to(device)
-            U_c1 = pivot_col_expand[lt_b, lt_m].to(device)
-
-            # term2: U[eq_b, i, pivot_col_expand[eq_b, eq_m]]
-            U_b2 = eq_b.to(device)
-            U_r2 = torch.full_like(eq_b, i, dtype=torch.int32, device = device)
-            U_c2 = pivot_col_expand[eq_b, eq_m].to(device)
-
-            U_b = torch.cat([U_b1, U_b2]).to(device)
-            U_r = torch.cat([U_r1, U_r2]).to(device)
-            U_c = torch.cat([U_c1, U_c2]).to(device)
-            U_v = torch.ones_like(U_b, dtype=torch.uint8, device = device)
-
-            U_batch_sparse.batch_idx = torch.cat([U_batch_sparse.batch_idx.to(device), U_b])
-            U_batch_sparse.row_idx   = torch.cat([U_batch_sparse.row_idx.to(device), U_r])
-            U_batch_sparse.col_idx   = torch.cat([U_batch_sparse.col_idx.to(device), U_c])
-            U_batch_sparse.values    = torch.cat([U_batch_sparse.values.to(device), U_v])
-
-            del pivot_row, pivot_col, pivot_col_expand
-            del coo_b, coo_r, coo_c, coo_v
-            del rinv_r, gt_mask, eq_mask, lt_mask
-            del eq_b, eq_m, gt_b, gt_m, lt_b, lt_m
-            del L_b, L_r, L_c, L_v
-            del U_b1, U_r1, U_c1, U_b2, U_r2, U_c2
-            del U_b, U_r, U_c, U_v
-
-            # torch.cuda.empty_cache()
-
-        L_batch_dense = L_batch_sparse.to_dense()
-        U_batch_dense = U_batch_sparse.to_dense()
-        del B_batch_sparse, L_batch_sparse, U_batch_sparse, cols_batch, B_idx_full, M_idx_full, N_idx_full, batch_indices, batch_indices_base, B_idx, M_idx, row_indices
-        torch.cuda.empty_cache()
-
-        return L_batch_dense, U_batch_dense, rows_batch, cols_batch_out, used_col_count
-
-    def mod2sparse_forward_sub_batch(self, L_batch, rows_batch, x_batch):
-        """
-        Batch version of mod2 forward substitution solving L y = x over GF(2)
-
-        Args:
-            L_batch: [B, M, K], lower-triangular binary matrix
-            rows_batch: [B, K], row permutation
-            x_batch: [B, M], right-hand side
-
-        Returns:
-            y_batch: [B, K]
-        """
-        device = L_batch.device
-        B, M, K = L_batch.shape
-        y_batch = torch.zeros((B, K), dtype=torch.uint8, device=device)
-        x_batch = x_batch.to(device)
-
-        for i in range(K):
-            ii = rows_batch[:, i]  # [B]
-            ii = ii.to(device)
-            # Gather L[ii, :] → shape: [B, K]
-            L_rows_i = L_batch[torch.arange(B, device=device), ii]  # [B, K]
-            L_rows_i = L_rows_i.to(device)
-            batch_indices = torch.arange(B, device=device)
-            batch_indices = batch_indices.to(device)
-            x_i = x_batch[batch_indices, ii]       # [B]
-
-            # mask for lower-triangular elements (j < i)
-            lower_mask = torch.arange(K, device=device).view(1, K) < i  # [1, K]
-            lower_mask = lower_mask.to(device)
-            L_lower = L_rows_i & lower_mask  # [B, K], mask out upper part
-
-            # XOR accumulate: b = dot(L[ii, :i], y[:i])
-            b = torch.sum(L_lower & y_batch, dim=1) % 2  # [B]
-
-            # Get diagonal value: L[ii, i]
-            d = L_rows_i[:, i]  # [B]
-
-            # Check solvability
-            if torch.any((d == 0) & (b != x_i)):
-                logger.warning('No solution in forward substitution')
-
-            y_batch[:, i] = b ^ x_i
-
-        del x_batch, batch_indices, x_i, b, lower_mask, L_rows_i, ii, L_batch, rows_batch
-        torch.cuda.empty_cache()
-        return y_batch
-
-
-    def mod2sparse_backward_sub_batch(self, U_batch, cols_batch, y_batch):
-        """
-        Batch version of backward substitution solving U z = y over GF(2)
-
-        Args:
-            U_batch: [B, K, rr], upper-triangular matrix
-            cols_batch: [B, K], column permutation
-            y_batch: [B, K], right-hand side
-
-        Returns:
-            z_batch: [B, rr]
-        """
-        B, K, rr = U_batch.shape
-        device = U_batch.device
-        z_batch = torch.zeros((B, rr), dtype=torch.uint8, device=device)
-
-        for i in reversed(range(K)):
-            ii = cols_batch[:, i]  # [B]
-            U_i = U_batch[:, i, :]  # [B, rr]
-            y_i = y_batch[:, i]     # [B]
-            ii = ii.to(device)
-            # Create a one-hot mask corresponding to ii: shape [B, rr]
-            onehot = torch.zeros_like(U_i)
-            onehot[torch.arange(B, device=device), ii] = 1
-
-            # d: Whether the diagonal element U[i, ii] == 1 exists
-            d = (U_i & onehot).sum(dim=1)  # [B], result is either 0 or 1
-
-            # b: XOR sum over columns other than ii (i.e., z[j] where j ≠ ii and U[i, j] == 1)
-            b = torch.sum(U_i & z_batch, dim=1) % 2  # [B]
-            b = b ^ (U_i[torch.arange(B), ii] & z_batch[torch.arange(B), ii]) # subtract the duplicated z[ii]
-
-            # check if it's solvable
-            unsolvable = (d == 0) & (b != y_i)
-            if torch.any(unsolvable):
-                logger.warning('No solution in backward substitution')
-
-            # solve z[ii] = b ^ y[i]
-            z_batch[torch.arange(B, device=device), ii] = (b ^ y_i).to(torch.uint8)
-
-        del onehot, b, d, U_i, y_i, U_batch, cols_batch, y_batch
-        torch.cuda.empty_cache()
-        return z_batch
-
-
-    def LU_forward_backward_solve_batch(self, L, U, rows, cols, synd):
-        forward_b = self.mod2sparse_forward_sub_batch(L, rows, synd)
-        osd0_decoding = self.mod2sparse_backward_sub_batch(U, cols, forward_b)
-
-        return osd0_decoding
-
-
-    def gf2_rank(self, matrix):
-        """
-        Function: gf2_rank
-            Computes the rank of a binary matrix over GF(2).
-        
-        Input:
-            matrix (torch.Tensor): A 2D tensor with shape (n_rows, n_cols),
-            containing only 0s and 1s (binary values).
-        
-        Output:
-            rank (int): The rank of the input matrix over the finite field GF(2),
-            determined using Gaussian elimination with XOR operations.
-        """
-        # ponytail: a sparse matrix is densified to a host bool copy, O(M*N) host memory per forward call; switch to sparse elimination if OSD is ever run at d>=15
-        mat = matrix.to_dense().cpu() if matrix.is_sparse else matrix.clone()
-        n_rows, n_cols = mat.shape
-        rank = 0
-
-        for col in range(n_cols):
-            pivot_row = None
-
-            for row in range(rank, n_rows):
-                if mat[row, col] == 1:
-                    pivot_row = row
-                    break
-
-            if pivot_row is not None:
-                if pivot_row != rank:
-                    mat[[rank, pivot_row]] = mat[[pivot_row, rank]]
-
-                for row in range(rank + 1, n_rows):
-                    if mat[row, col] == 1:
-                        mat[row] ^= mat[rank]
-                rank += 1
-
-        return rank
-
-
-    def print_row_ones(matrix: torch.Tensor):
-        """
-        'Print which columns have a value of 1 in each row.'
-        Args:
-            matrix (torch.Tensor): A 2D tensor with binary values (0/1).
-        """
-        if matrix.dim() != 2:
-            logger.warning('Input must be a 2D tensor.')
-
-        for row_idx, row in enumerate(matrix):
-            ones_idx = (row == 1).nonzero(as_tuple=True)[0]
-            if len(ones_idx) == 0:
-                logger.info(f"{row_idx}: (none)")
-            else:
-                ones_list = ones_idx.tolist()
-                logger.info(f"{row_idx}: {', '.join(map(str, ones_list))}")
-
-
-    def H_to_sparse(self, H_dense):
-        """
-        Convert a binary matrix to sparse format.
-        Args:
-            H (torch.Tensor): A 2D tensor with binary values (0/1).
-        Returns:
-            sparse_H : Sparse representation of H.
-        """
-        if H_dense.dim() != 2:
-            logger.warning('Input must be a 2D tensor.')
-
-        n_row, _ = H_dense.shape
-        sparse_H = [
-            torch.nonzero(H_dense[i], as_tuple=False).squeeze(-1).tolist()
-            for i in range(n_row)
-        ]
-        return sparse_H
-
-
-    def tuple_hash(self, t):
-        # Assume B < 65536, M < 65536, N < 65536
-        return (t[:, 0].to(torch.int64) << 32) | (t[:, 1].to(torch.int64) << 16) | t[:, 2].to(torch.int64)
-
-
-    def apply_xor_sparse(self, coo_b, coo_r, coo_c, coo_v, gt_mask, pivot_row, pivot_row_tensor):
-        device = coo_b.device
-        B, N = pivot_row_tensor.shape
-        B_idx_xor, M_idx_xor = torch.nonzero(gt_mask, as_tuple=True)
-
-        if B_idx_xor.numel() == 0:
-            return coo_b, coo_r, coo_c, coo_v
-
-        # === Step 1: Expand pivot row to get new (b, r, c)
-        pivot_vals = pivot_row_tensor[B_idx_xor]  # shape [P, N]
-        row_sums = pivot_vals.sum(dim=1)
-        repeat_idx = torch.arange(pivot_vals.size(0), device=device).repeat_interleave(row_sums)
-
-        new_b = B_idx_xor[repeat_idx]
-        new_r = M_idx_xor[repeat_idx]
-        new_c = torch.nonzero(pivot_vals, as_tuple=True)[1]
-        new_v = torch.ones_like(new_b, dtype=torch.uint8)
-
-        # === Step 2: Concatenate and sort hashed keys (low-memory variant)
-        base = 1_000_000
-        def tuple_hash(b, r, c):
-            return b * base * base + r * base + c
-
-        old_key = tuple_hash(coo_b, coo_r, coo_c)
-        new_key = tuple_hash(new_b, new_r, new_c)
-
-        all_key = torch.cat([old_key, new_key])
-        all_val = torch.cat([coo_v, new_v]).to(torch.int32)
-
-        # === Step 3: Sort keys for memory-efficient unique
-        sorted_key, sorted_idx = torch.sort(all_key)
-        sorted_val = all_val[sorted_idx]
-
-        # === Step 4: XOR accumulation via unique_consecutive
-        is_new = torch.ones_like(sorted_key, dtype=torch.bool)
-        is_new[1:] = sorted_key[1:] != sorted_key[:-1]
-
-        segment_ids = torch.cumsum(is_new, dim=0) - 1
-        num_segments = segment_ids[-1] + 1
-
-        # Segment XOR: use bincount and modulo 2 to simulate GF(2)
-        xor_counts = torch.bincount(segment_ids, weights=sorted_val, minlength=num_segments)
-        keep = xor_counts % 2 == 1
-        kept_keys = sorted_key[is_new][keep]
-
-        if kept_keys.numel() == 0:
-            return (
-                torch.empty(0, dtype=torch.int32, device=device),
-                torch.empty(0, dtype=torch.int32, device=device),
-                torch.empty(0, dtype=torch.int32, device=device),
-                torch.empty(0, dtype=torch.uint8, device=device),
-            )
-
-        # Decode keys
-        b = kept_keys // (base * base)
-        r = (kept_keys // base) % base
-        c = kept_keys % base
-        v = torch.ones_like(b, dtype=torch.uint8)
-
-        return b, r, c, v
+    @staticmethod
+    def _column_rows(H):
+        """[N + 1, D] row indices of each column of H (dense or sparse COO), padded
+        with M; the extra column N is all padding. D is the largest column weight
+        rounded up to a power of two."""
+        M, N = H.shape
+        if H.is_sparse:
+            H = H.coalesce()
+            r, c = H.indices()[:, H.values().bool()]
+        else:
+            r, c = H.nonzero(as_tuple=True)
+        c, by_col = torch.sort(c, stable=True)
+        r = r[by_col]
+        count = torch.bincount(c, minlength=N + 1)
+        start = torch.cumsum(count, 0) - count
+        D = 1 << (max(int(count.max()), 1) - 1).bit_length()
+        table = torch.full((N + 1, D), M, dtype=torch.long, device=H.device)
+        table[c, torch.arange(c.numel(), device=H.device) - start[c]] = r
+        return table
+
+
+    def _scan_chunks(self, llr, synd, width):
+        """_scan over the batch in chunks of samples whose working memory fits
+        workspace_bytes. Per sample, with U = ceil((M + 1) / 64) words (bytes): the
+        packed transposed row transform, 8*(M+1)*U, plus the row-update
+        temporaries, 4*(M+1)*U; the gathered column words and their XOR fold,
+        16*D*U; the per-row vectors (a T column, its nonzero indices, the pivot
+        rows and columns), 64*(M+1); the packed per-sample vectors, 48*U; and
+        the order (its sort and the kept int64 copy) plus the uint8 estimate,
+        60*N. Without osd_packed_transform the chunks run _scan_dense, without
+        osd_column_scan _gauss_jordan, each sized by the bytes in its docstring."""
+        M = synd.shape[1]
+        N, D = self.cols.shape[0] - 1, self.cols.shape[1]
+        U = (M >> 6) + 1  # bit M exists and stays zero
+        cols = self.cols.to(synd.device)
+        if not self.osd_column_scan:
+            scan, per_sample = self._gauss_jordan, 3 * M * (N + 1) + 60 * N
+        elif not self.osd_packed_transform:
+            scan, per_sample = self._scan_dense, 2 * M * (M + 1) + M * D + 24 * M + 48 * N
+        else:
+            scan = self._scan
+            per_sample = 12 * (M + 1) * U + 16 * D * U + 64 * (M + 1) + 48 * U + 60 * N
+        step = max(1, self.workspace_bytes // per_sample)
+        parts = [scan(cols, llr[i:i + step], synd[i:i + step], width)
+                 for i in range(0, max(len(llr), 1), step)]
+        return torch.cat([e for e, _ in parts]), torch.cat([d for _, d in parts])
+
+
+    def _scan(self, cols, llr, synd, width):
+        """OSD-0 over the first width columns of each sample's reliability
+        order, in two phases. Returns e [B, N] uint8 and stopped [B] bool.
+
+        Scan: T is kept transposed and bit-packed, TuT[b, k] = column k of T as
+        bits over rows u (bit u of word u >> 6). Column c of T @ H is the XOR of
+        TuT at c's rows. The pivot is the lowest row without a pivot that holds
+        a bit; every other such row u gets T_u ^= T_p, which is TuT[k] ^= v for
+        each k in T_p. Pivot rows are not updated, so the pivot rows of T @ H
+        are upper triangular in pivot order. The reduced syndrome T @ s follows
+        the same row operations, and a sample stops once it is zero on every
+        row without a pivot (never without osd_early_stop).
+
+        Solve: back substitution on the pivot rows. y starts as T @ s; the
+        last pivot (in scan order) whose row holds a bit of y is final, so its
+        column is set in e and y ^= T @ h_c. This repeats until y is zero on
+        every pivot row: the loop runs the batch maximum of popcount(e) steps,
+        with one host sync each. It reads the first K pivot slots, K the batch
+        maximum pivot count (M without osd_solve_by_pivots); the slots past a
+        sample's pivot count hold row M and column N, which are inert."""
+        order = _osd_0_cuda._order_prefix(llr, width).long()
+        B, W = order.shape
+        N, M = cols.shape[0] - 1, synd.shape[1]
+        U = (M >> 6) + 1  # bit M exists and stays zero
+        dev = synd.device
+        ar = torch.arange(B, device=dev)
+        b64 = torch.arange(64, device=dev)
+        k = torch.arange(M, device=dev)
+        one = torch.ones((), dtype=torch.long, device=dev)
+
+        def pack(bits):
+            """[B, M] -> [B, U] int64, bit u in word u >> 6; bits M and up
+            are zero (bit M is read for the padding row M)."""
+            x = torch.zeros(B, U * 64, dtype=torch.long, device=dev)
+            x[:, :M] = bits
+            return (x.view(B, U, 64) << b64).sum(2)  # distinct bits: sum is OR
+
+        def column(c):
+            """[B, U] T @ h_c, the XOR of TuT at c's rows (D a power of two)."""
+            g = TuT[ar[:, None], cols[c]]
+            while g.shape[1] > 1:
+                h = g.shape[1] >> 1
+                g = g[:, :h] ^ g[:, h:]
+            return g[:, 0]
+
+        # row M stays zero: the padding of cols gathers it
+        TuT = torch.zeros(B, M + 1, U, dtype=torch.long, device=dev)
+        TuT[:, k, k >> 6] = one << (k & 63)
+        sres = pack(synd)
+        alive = pack(torch.ones(B, M, dtype=torch.long, device=dev))
+        piv_r = torch.full((B, M + 1), M, dtype=torch.long, device=dev)
+        piv_c = torch.full((B, M + 1), N, dtype=torch.long, device=dev)
+        found = torch.zeros(B, dtype=torch.long, device=dev)
+        live = (sres != 0).any(1) | (not self.osd_early_stop)  # not yet stopped
+        piece = max(1, B * (M + 1) // 4)  # T rows per update step
+        j = 0
+        while j < W and (j & 7 or bool(live.any())):
+            c = order[:, j]
+            v = column(c) & alive & -live.long()[:, None]
+            nz = v != 0
+            has = nz.any(1)
+            w = nz.to(torch.uint8).argmax(1)
+            bit = ((v[ar, w][:, None] >> b64) & 1).argmax(1)
+            alive[ar, w] ^= has.long() << bit
+            v &= alive  # without the pivot row
+            sp = (sres[ar, w] >> bit) & 1
+            sres ^= v & -sp[:, None]
+            piv_r[ar, found] = torch.where(has, (w << 6) + bit, M)
+            piv_c[ar, found] = torch.where(has, c, N)
+            found += has
+            upd = ((TuT[ar, :, w] >> bit[:, None]) & 1).bool() & (v != 0).any(1)[:, None]
+            bi, ki = upd.nonzero(as_tuple=True)
+            for a in range(0, bi.numel(), piece):
+                b_, k_ = bi[a:a + piece], ki[a:a + piece]
+                TuT[b_, k_] ^= v[b_]
+            live &= ((sres & alive) != 0).any(1) | (not self.osd_early_stop)
+            j += 1
+
+        e = torch.zeros(B, N + 1, dtype=torch.uint8, device=dev)
+        K = (int(found.max()) if self.osd_solve_by_pivots else M) if B else 0
+        pr, pc = piv_r[:, :K], piv_c[:, :K]  # padded with row M / column N
+        y = sres
+        while K:
+            hit = ((y.gather(1, pr >> 6) >> (pr & 63)) & 1).bool()
+            last = hit.any(1)
+            if not bool(last.any()):
+                break
+            i = K - 1 - hit.flip(1).to(torch.uint8).argmax(1)
+            c = torch.where(last, pc[ar, i], N)
+            e[ar, c] = 1
+            y ^= column(c)
+        return e[:, :N], ~live
+
+
+    def _scan_dense(self, cols, llr, synd, width):
+        """_scan with T as a dense bool [M, M + 1] matrix and Gauss-Jordan on
+        every row: the pivot rows of T @ H form the identity on the pivot
+        columns, and the estimate is T @ s on the pivot rows. Same pivots, stop
+        rule and outputs as _scan. Bytes per sample: T and the same-size
+        temporary of each update, 2*M*(M+1); the gathered column bits, M*D;
+        the per-row vectors, 24*M; and the order plus the estimate, 48*N."""
+        order = _osd_0_cuda._order_prefix(llr, width).long()
+        B, W = order.shape
+        N, M = cols.shape[0] - 1, synd.shape[1]
+        dev = synd.device
+        ar = torch.arange(B, device=dev)
+        # column M stays zero: the padding of cols gathers it
+        T = torch.eye(M, M + 1, dtype=torch.bool, device=dev).repeat(B, 1, 1)
+        sres = synd.clone()  # T @ s
+        alive = torch.ones(B, M, dtype=torch.bool, device=dev)  # rows without a pivot
+        # H column of each pivot row; N for rows without a pivot
+        row_col = torch.full((B, M), N, dtype=torch.long, device=dev)
+        done = ~sres.any(1) & self.osd_early_stop
+        j = 0
+        while j < W and not bool(done.all()):
+            c = order[:, j]
+            # Column c of T @ H: XOR of T's columns at c's rows.
+            g = T.gather(2, cols[c][:, None, :].expand(B, M, cols.shape[1]))
+            v = (g.sum(2, dtype=torch.uint8) & 1).bool() & ~done[:, None]
+            cand = v & alive
+            has = cand.any(1)
+            if bool(has.any()):
+                # lowest row without a pivot that has the bit
+                p = cand.to(torch.uint8).argmax(1)
+                v[ar, p] = False
+                v &= has[:, None]
+                T ^= v[:, :, None] & T[ar, p][:, None, :]
+                sres ^= v & sres[ar, p][:, None]
+                alive[ar[has], p[has]] = False
+                row_col[ar[has], p[has]] = c[has]
+                done |= ~(sres & alive).any(1) & self.osd_early_stop
+            j += 1
+        e = torch.zeros(B, N + 1, dtype=torch.uint8, device=dev)
+        # rows without a pivot land in column N
+        e.scatter_(1, row_col, sres.to(torch.uint8))
+        return e[:, :N], done
+
+
+    def _gauss_jordan(self, cols, llr, synd, width):
+        """Dense Gauss-Jordan on [H | s] over the first width columns of each
+        sample's reliability order, no early stop. The pivot of a column is the
+        lowest row without a pivot that holds a bit, as in _scan, so the pivot
+        rows and the estimate (s reduced, on the pivot rows) are the same.
+        Returns e [B, N] uint8 and stopped [B] bool (all true). Bytes per
+        sample: [H | s], the same-size temporary of each update and the
+        gathered H, 3*M*(N+1); the order plus the estimate, 60*N."""
+        order = _osd_0_cuda._order_prefix(llr, width).long()
+        B, W = order.shape
+        N, M = cols.shape[0] - 1, synd.shape[1]
+        dev = synd.device
+        ar = torch.arange(B, device=dev)
+        H = torch.zeros(M + 1, N + 1, dtype=torch.bool, device=dev)
+        H[cols, torch.arange(N + 1, device=dev)[:, None]] = True  # row M: padding
+        A = torch.cat([H[:M, order].permute(1, 0, 2), synd[:, :, None]], 2)  # [B, M, W + 1]
+        alive = torch.ones(B, M, dtype=torch.bool, device=dev)  # rows without a pivot
+        # H column of each pivot row; N for rows without a pivot
+        row_col = torch.full((B, M), N, dtype=torch.long, device=dev)
+        for j in range(W):
+            v = A[:, :, j].clone()
+            cand = v & alive
+            has = cand.any(1)
+            p = cand.to(torch.uint8).argmax(1)  # lowest row without a pivot
+            v[ar, p] = False
+            v &= has[:, None]
+            A ^= v[:, :, None] & A[ar, p][:, None, :]
+            alive[ar[has], p[has]] = False
+            row_col[ar[has], p[has]] = order[ar[has], j]
+        e = torch.zeros(B, N + 1, dtype=torch.uint8, device=dev)
+        e.scatter_(1, row_col, A[:, :, W].to(torch.uint8))
+        return e[:, :N], torch.ones(B, dtype=torch.bool, device=dev)

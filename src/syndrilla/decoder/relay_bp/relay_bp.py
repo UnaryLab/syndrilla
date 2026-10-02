@@ -1,8 +1,43 @@
+import types
+
 import torch
 from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _NmsPy
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import _build_vn_adj
+
+
+def _step(l_v, c2v_prev, bias, syndrome_odd, alpha, col, vn_adj, mask_dummy):
+    """One relay iteration for the compiled path, with the arithmetic of the eager
+    methods: v2c message l_v[col] - c2v_prev, check-node update with alpha,
+    marginal bias + c2v (bias first, then the edges in (c, k) order), hard decision
+    and syndrome. Functional: returns new (c2v_msg, l_v, e_v, s_est). At a leg
+    start `l_v` is u_init and `c2v_prev` is zero.
+    """
+    B, N1 = l_v.shape
+    M, D = mask_dummy.shape
+    a = l_v[:, col].view(B, M, D) - c2v_prev
+    neg = a <= 0.0
+    parity = (neg.sum(dim=2, keepdim=True, dtype=torch.uint8) & 1).bool()
+    flip = neg ^ (parity ^ syndrome_odd)
+    mag = a.abs()
+    min_0, arg_0 = mag.min(dim=2, keepdim=True)
+    min_1 = mag.scatter(2, arg_0, float("inf")).amin(dim=2, keepdim=True)
+    m_0 = alpha * min_0
+    m_1 = alpha * min_1
+    msg = torch.where(flip, -m_0, m_0)
+    msg = msg.scatter(2, arg_0, torch.where(flip.gather(2, arg_0), -m_1, m_1))
+    msg = msg.masked_fill(mask_dummy, 0.0)
+    flat = torch.cat([msg.view(B, -1), msg.new_zeros(B, 1)], 1)
+    g = flat[:, vn_adj].view(B, -1, N1)
+    l_new = bias
+    for k in range(g.shape[1]):
+        l_new = l_new + g[:, k]
+    e = l_new <= 0.0
+    s_est = e.to(torch.uint8)[:, col].view(B, M, D).sum(dim=2, dtype=torch.uint8) & 1
+    return msg, l_new, e.to(l_v.dtype), s_est.to(l_v.dtype)
 
 
 class create(torch.nn.Module):
@@ -33,6 +68,10 @@ class create(torch.nn.Module):
             V_c_col: the column index of all the variable nodes for each check node
 
             degree: the maximum number of 1s in all check nodes in H_matrix
+
+            compile: decoder config key, default True. Runs the iteration body
+                through torch.compile, as bp_norm_min_sum does, on a CUDA device
+                only; ignored on CPU or without dynamo and Triton.
         """
 
         super(create, self).__init__()
@@ -127,20 +166,55 @@ class create(torch.nn.Module):
         self.Hz_matrix = bundle.Hz_matrix
         self.lx_matrix = bundle.lx_matrix
         self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type, dense=False)
+        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type)
 
-        self.mask_dummy = (self.V_c_col == self.H_shape[1])
+        self.mask_dummy = (self.V_c_col == self.H_shape[1]).to(self.device)
+
+        # variable -> check table for the c2v sum, slot-major ([VD * (N+1)]): slot vd
+        # of variable n holds the flat edge id c * degree + k of its vd-th edge in
+        # (c, k) order, padded with n_checks * degree, the id of the zero column
+        # appended to the flat message
+        n_checks, degree = self.V_c_col.shape
+        adj_c, adj_k, _ = _build_vn_adj(self.V_c_col.cpu().numpy(), self.H_shape[1])
+        adj_c, adj_k = torch.from_numpy(adj_c), torch.from_numpy(adj_k)
+        vn_adj = torch.where(adj_c >= 0, adj_c * degree + adj_k, n_checks * degree)
+        self.vn_adj = vn_adj.t().flatten().to(self.device)
 
         # convert to as the parameters in a model
         self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
-        self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
+        self.V_c_col = torch.nn.Parameter(self.V_c_col.to(self.device), requires_grad=False)
 
         self.algo = 'bp_relay'
         self.num_max_iter = self.iteration_initial + (self.legs - 1) * self.iteration_count
 
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get('rebatch_speedup'))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
         self.cap_bypass = False       # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
+
+        # torch.compile of the iteration body, on by default, CUDA only; eager
+        # fallback (one DEBUG line) on CPU or when dynamo/Triton is unavailable
+        self.compile = bool(decoding_cfg.get('compile', True))
+        if self.compile:
+            try:
+                from torch.utils._triton import has_triton
+
+                if self.device.type != 'cuda':
+                    reason = f'device is {self.device.type}'
+                elif not torch._dynamo.is_dynamo_supported():
+                    reason = 'torch.compile (dynamo) is not supported'
+                elif not has_triton():
+                    reason = 'Triton is not available'
+                else:
+                    reason = None
+            except Exception as e:
+                reason = f'compile check failed: {e!r}'
+            if reason is not None:
+                logger.debug(f'compile is on but runs eager: {reason}.')
+                self.compile = False
+        if self.compile:
+            # a copy of the code object gives each decoder its own dynamo cache
+            step = types.FunctionType(_step.__code__.replace(), _step.__globals__, _step.__name__)
+            self._step = torch.compile(step)
 
         logger.info('Complete.')
 
@@ -169,12 +243,29 @@ class create(torch.nn.Module):
         num_iters = torch.full([self.batch_size], 1, device=self.device)
         converges = torch.full([self.batch_size], 0, device=self.device)
 
-        # set up initialization for all parameters for decoding process
-        # message is a in place version of a_v2c and b_c2v
-        message = u_init[:, self.V_c_col]
+        # syndrome bit per check (True where nonzero), flips the check message sign
+        syndrome_odd = (syndrome != 0.0).unsqueeze(2)
 
-        # compute syndrome for multiplication
-        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype).unsqueeze(2)
+        # buffers reused by every iteration (eager): the flat c->v messages plus one
+        # zero column that the c2v padding ids point at, the posterior LLR, the hard
+        # decision, and one work buffer shared by the v2c message and the c2v gather,
+        # whose lifetimes do not overlap
+        n_checks, degree = self.V_c_col.shape
+        l_v = torch.empty_like(u_init)
+        if self.compile:
+            col = self.V_c_col.detach().flatten()
+            if self.batch_size > 1:
+                for t in (u_init, syndrome_odd):
+                    torch._dynamo.mark_dynamic(t, 0)
+        else:
+            c2v_flat = torch.zeros([self.batch_size, n_checks * degree + 1], dtype=self.dtype, device=self.device)
+            c2v_msg = c2v_flat[:, :-1].view(self.batch_size, n_checks, degree)
+            e_v = torch.empty_like(u_init)
+            n_v2c = self.batch_size * n_checks * degree
+            n_gather = self.batch_size * self.vn_adj.numel()
+            work = torch.empty(max(n_v2c, n_gather), dtype=self.dtype, device=self.device)
+            v2c_buf = work[:n_v2c].view(self.batch_size, n_checks, degree)
+            c2v_buf = work[:n_gather].view(self.batch_size, -1)
 
         logger.info('Complete.')
 
@@ -182,7 +273,7 @@ class create(torch.nn.Module):
 
         # adaptive cap: once warm-up has chosen a stop fraction, end the leg ensemble as soon
         # as that fraction has converged (unless main asked for an uncapped pass).
-        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
+        self.cap_active_last = bool(self.cap is not None and self.cap.done and self.cap.frac is not None and not self.cap_bypass)
         cap_frac = self.cap.frac if self.cap_active_last else None
 
         self.r = 0
@@ -197,11 +288,17 @@ class create(torch.nn.Module):
                 self.max_iter = self.iteration_initial
                 memory_strengths = torch.full([self.batch_size, N_extended], self.init_mem_strength, dtype=self.dtype, device=self.device)
                 # full prior LLR as its bias, matching the crate's set_posterior_ratios_to_priors.
-                l_v = u_init.clone()
+                l_v.copy_(u_init)
             else:
                 self.max_iter = self.iteration_count
                 memory_strengths = self.create_memory_strengths(self.batch_size, N_extended, self.center, self.width)
-                message = u_init[:, self.V_c_col]
+            # leg start: zero c->v messages, so the first v->c message is u_init - 0 = u_init
+            if self.compile:
+                c2v_msg = torch.zeros([self.batch_size, n_checks, degree], dtype=self.dtype, device=self.device)
+                if self.batch_size > 1:
+                    torch._dynamo.mark_dynamic(c2v_msg, 0)
+            else:
+                c2v_flat.zero_()
 
             while self.i < self.max_iter:
                 # variable node update update v2c
@@ -210,18 +307,29 @@ class create(torch.nn.Module):
                 # memory bias (variable prior with disordered memory), from the
                 # posterior of the previous iteration
                 bias = self.bias_update(memory_strengths, l_v, u_init)
+                alpha = self.compute_alpha()
+                l_src = u_init if self.i == 1 else l_v
 
-                # check node update c2v: consumes the variable->check messages carried
-                # from the previous iteration (dummy edges zeroed inside cn_update).
-                c2v = self.cn_update(message)
+                if self.compile:
+                    if self.batch_size > 1:
+                        torch._dynamo.mark_dynamic(bias, 0)
+                    c2v_msg, l_v, e_v, s_est = self._step(
+                        l_src, c2v_msg, bias, syndrome_odd, alpha.to(self.device),
+                        col, self.vn_adj, self.mask_dummy)
+                else:
+                    # variable node update: v->c message l_v[col] - c2v (extrinsic)
+                    message = torch.sub(self.v2c(l_src, v2c_buf), c2v_msg, out=v2c_buf)
 
-                # marginal / posterior LLR update (dummy variable pinned to +inf inside)
-                l_v = self.marginal_update(c2v, bias)
+                    # check node update c2v (dummy edges zeroed inside cn_update)
+                    self.cn_update(message, syndrome_odd, alpha, c2v_msg)
 
-                # hard decision: map posterior LLRs to a binary error estimate
-                e_v = self.hard_decision(l_v)
+                    # marginal / posterior LLR update (dummy variable +inf from bias)
+                    self.marginal_update(bias, c2v_flat, l_v, c2v_buf)
 
-                s_est = self.syndrome_estimation(e_v)
+                    # hard decision: map posterior LLRs to a binary error estimate
+                    self.hard_decision(l_v, e_v)
+
+                    s_est = self.syndrome_estimation(e_v)
 
                 # different samples from the same batch may terminated at different iteration (pick the smallest one)
                 indices = torch.all(s_est == syndrome, 1).nonzero()
@@ -237,10 +345,6 @@ class create(torch.nn.Module):
                 # do the early termination if all batch satisfy the condition
                 if checker.size()[0] == indices.size()[0]:
                     break
-
-                # variable node update: produce the variable->check messages for the
-                # next iteration (extrinsic: bias + sum of OTHER incoming c2v messages)
-                message = self.vn_update(c2v, bias)
 
             valid_mask = (converges == 1) & (solutions < self.solution)
 
@@ -281,14 +385,9 @@ class create(torch.nn.Module):
         return io_dict
 
 
-    def sum_func(self, bias, b_c2v):
-        data_flat = b_c2v.flatten(start_dim=1)
-        return bias.index_add(1, self.V_c_col.flatten(), data_flat)
-
-
-    def vn_update(self, b_c2v, bias):
-        sum_b_c2v = self.sum_func(bias, b_c2v)
-        return sum_b_c2v[:, self.V_c_col] - b_c2v
+    v2c = _NmsPy.v2c
+    hard_decision = _NmsPy.hard_decision
+    syndrome_estimation = _NmsPy.syndrome_estimation
 
 
     def compute_alpha(self):
@@ -301,46 +400,43 @@ class create(torch.nn.Module):
         return torch.tensor(alpha, dtype=self.dtype)
 
 
-    def cn_update(self, a_v2c):
-        # normalization factor (alpha); for alpha == 0 this is the adaptive 1 - 2^(-i) schedule
-        beta = self.compute_alpha()
+    def cn_update(self, a_v2c, syndrome_odd, alpha, out):
+        """Check-node update (normalized min-sum with factor alpha), the
+        bp_norm_min_sum cn_update: magnitude alpha * (minimum |a_v2c| over the other
+        edges of the check); an input <= 0 counts as negative, and the message is
+        negative when the edge's own sign bit, the parity of negative inputs on the
+        check and the syndrome bit XOR to 1. Dummy slots are set to 0. Overwrites
+        `a_v2c` with |a_v2c|. Writes into and returns `out`.
+        """
+        neg = a_v2c <= 0.0
+        parity = (neg.sum(dim=2, keepdim=True, dtype=torch.uint8) & 1).bool()
+        flip = neg ^ (parity ^ syndrome_odd)
 
-        # compute sgn
-        sign = torch.sgn(a_v2c)
-        sign = torch.where(sign == 0.0, -1.0, sign)
-        sign_prod = torch.prod(sign, dim=2, keepdim=True)
-        Q_sign = self.syndrome_neg * sign_prod
+        mag = a_v2c.abs_()
+        min_0, arg_0 = mag.min(dim=2, keepdim=True)
+        mag.scatter_(2, arg_0, float('inf'))
+        min_1 = mag.amin(dim=2, keepdim=True)
+        m_0 = alpha * min_0
+        m_1 = alpha * min_1
 
-        # compute min
-        abs_a_v2c = torch.abs(a_v2c)
-        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
-        min_0 = mins[:, :, 0].unsqueeze(2)
-        min_1 = mins[:, :, 1].unsqueeze(2)
-        min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
-
-        message = beta * sign * Q_sign * min_result
-        message[:, self.mask_dummy] = 0.0          # non-existent (padded) edges carry no message
-        return message
-
-
-    def marginal_update(self, b_c2v, bias):
-        sum_b_c2v = self.sum_func(bias, b_c2v)
-        sum_b_c2v[:, -1] = float('inf')            # dummy variable never decoded as an error
-        return sum_b_c2v
+        torch.where(flip, -m_0, m_0, out=out)
+        out.scatter_(2, arg_0, torch.where(flip.gather(2, arg_0), -m_1, m_1))
+        out.masked_fill_(self.mask_dummy, 0.0)
+        return out
 
 
-    def hard_decision(self, l_v):
-        """Hard decision: a non-positive posterior LLR (<= 0) decodes to 1, else 0."""
-        return torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
-
-
-    def syndrome_estimation(self, e_v):
-        # calculate the syndrome by summing the number of 1s in each column in e
-        temp_e = e_v
-        temp_e[:, -1] = 0.0
-        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
-
-        return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0).to(self.dtype)
+    def marginal_update(self, bias, c2v_flat, out, gathered):
+        """Posterior LLR: bias + sum of the c->v messages of each variable, adding
+        the bias first and then the edges in (c, k) order through one gather of
+        `c2v_flat` ([batch, n_checks * degree + 1], zero last column) into
+        `gathered`. The dummy variable gets the +inf of its bias. Writes into and
+        returns `out`.
+        """
+        torch.gather(c2v_flat, 1, self.vn_adj.expand(self.batch_size, -1), out=gathered)
+        out.copy_(bias)
+        for slot in gathered.view(self.batch_size, -1, out.shape[1]).unbind(1):
+            out.add_(slot)
+        return out
 
 
     def bias_update(self, memory_strengths, marginals, u_init):

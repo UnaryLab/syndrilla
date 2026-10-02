@@ -25,11 +25,13 @@ void osd_step_cuda(torch::Tensor ws, torch::Tensor colw, torch::Tensor row_pcol,
                    torch::Tensor pivbuf, torch::Tensor found, int64_t j, int64_t K);
 
 // Order positions of each sample's pivot columns; stops early once the packed
-// syndrome (empty tensor: never) lies in the span of the pivots found.
-void osd_scan_cuda(torch::Tensor Tr, torch::Tensor TuT, torch::Tensor colptr,
-                   torch::Tensor rowidx, torch::Tensor order, torch::Tensor piv_pos,
-                   torch::Tensor found, torch::Tensor synd, torch::Tensor stopped,
-                   torch::Tensor scan_end);
+// syndrome (empty tensor: never) lies in the span of the pivots found. T is held
+// in per-sample row pools Pr / Pc; a sample that runs out of slots sets overflow.
+void osd_scan_cuda(torch::Tensor Pr, torch::Tensor Pc, torch::Tensor rslot,
+                   torch::Tensor cslot, torch::Tensor colptr, torch::Tensor rowidx,
+                   torch::Tensor order, torch::Tensor piv_pos, torch::Tensor found,
+                   torch::Tensor synd, torch::Tensor stopped, torch::Tensor scan_end,
+                   torch::Tensor overflow);
 
 // Read out the OSD-0 estimate from the pivot rows.
 void osd_solve_ws_cuda(torch::Tensor ws, torch::Tensor row_pos, torch::Tensor order,

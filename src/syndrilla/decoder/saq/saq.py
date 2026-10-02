@@ -203,7 +203,9 @@ class create(nn.Module):
             raise ValueError(
                 "saq requires a pre-loaded MatrixBundle via the `bundle` kwarg."
             )
-        H_shape, _, V_c_col, H_matrix = bundle.select(self.check_type, dense=False)
+        H_shape, _, V_c_col, H_matrix = (
+            (bundle.Hx_matrix if self.check_type.lower() == "hx" else bundle.Hz_matrix).get_index()
+        )
         # a circuit-level DEM's columns are fault mechanisms rather than qubits, which is
         # what `metric` names the result file by
         source = (

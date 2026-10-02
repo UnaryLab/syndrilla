@@ -1,13 +1,91 @@
+import types
+
 import torch
 from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
 
+# compact the per-iteration state to the unconverged samples once fewer than this
+# fraction of the rows decoded since the last compaction are still unconverged
+COMPACT_FRAC = 0.75
+
+
+def _step(
+    message, oldbitnode, chan, check_node, d, eps, col, vn_adj, mask_dummy, synd_bits
+):
+    """One bp4 iteration after the variable-node update: check-node update, c2v,
+    posterior normalization, hard decision, syndrome check, then the variable-node
+    update that gives the next iteration's v->c messages. Functional; used by the
+    eager path and, compiled, on CUDA.
+
+      message    [B, 2, M, D] v->c LLRs (channel 0: X checks, 1: Z checks)
+      oldbitnode [B, 4, N+1]  damped posterior memory; chan [B, 4, N+1] channel prior
+      check_node [B, 2, M, 1] 1 - 2 * syndrome
+      col        [2 * M * D]  variable of each edge, (channel, check, slot) order
+      vn_adj     [VD * (N+1)] slot-major edge ids per variable (see create.__init__)
+      synd_bits  [B, 2, M]    syndrome as bool
+
+    Returns (next message, normalized posterior, converged [B] bool).
+    """
+    B, C, M, D = message.shape
+
+    # check-node update (quaternary min-sum); dummy slots (Hx padding) set to 0
+    sign = torch.sgn(message)
+    sign_prod = torch.prod(sign, dim=3, keepdim=True)
+    mag = torch.abs(message)
+    srt, _ = torch.sort(mag, dim=3)
+    min_result = torch.where(mag == srt[..., :1], srt[..., 1:2], srt[..., :1])
+    msg = (check_node * sign_prod * sign * min_result).masked_fill(mask_dummy, 0.0)
+
+    # c2v: per-edge quaternary factors [B, 4 (I, X, Y, Z), 2, M, D], multiplied
+    # into the damped prior of each variable in (channel, check, slot) order
+    err_neg = 0.5 / (1.0 + torch.exp(-msg))
+    err_pos = 0.5 / (1.0 + torch.exp(msg))
+    n0, n1 = err_neg.unbind(1)
+    p0, p1 = err_pos.unbind(1)
+    err = torch.stack(
+        [torch.stack(pair, 1) for pair in ((n0, n1), (n0, p1), (p0, p1), (p0, n1))], 1
+    )
+    flat = torch.cat([err.view(B, 4, -1), err.new_ones(B, 4, 1)], 2)
+    g = flat[:, :, vn_adj].view(B, 4, -1, chan.shape[2])
+    bitnode = torch.pow(chan, 1.0 - d) * torch.pow(oldbitnode, d)
+    for k in range(g.shape[2]):
+        bitnode = bitnode * g[:, :, k]
+    normalized = bitnode / bitnode.sum(dim=1, keepdim=True).clamp_min(eps)
+
+    # hard decision and syndrome: X checks see the Z bits and Z checks the X bits
+    qubits = torch.argmax(bitnode, dim=1)
+    x_bits = ((qubits == 1) | (qubits == 2)).to(torch.uint8)
+    z_bits = ((qubits == 2) | (qubits == 3)).to(torch.uint8)
+    col3 = col.view(C, M, D)
+    x_checks = z_bits[:, col3[0]].sum(dim=2, dtype=torch.uint8) & 1
+    z_checks = x_bits[:, col3[1]].sum(dim=2, dtype=torch.uint8) & 1
+    converged = (x_checks.bool() == synd_bits[:, 0]).all(1) & (
+        z_checks.bool() == synd_bits[:, 1]
+    ).all(1)
+
+    # variable-node update: divide each edge's own factor out of the posterior and
+    # map back to X / Z LLRs
+    gathered = bitnode[:, :, col].view(B, 4, C, M, D) / err.clamp_min(eps)
+    num0 = gathered[:, 0, 0] + gathered[:, 1, 0] + eps
+    den0 = gathered[:, 2, 0] + gathered[:, 3, 0] + eps
+    num1 = gathered[:, 0, 1] + gathered[:, 3, 1] + eps
+    den1 = gathered[:, 1, 1] + gathered[:, 2, 1] + eps
+    message = torch.stack([torch.log(num0 / den0), torch.log(num1 / den1)], 1)
+    return message, normalized, converged
+
 
 class create(torch.nn.Module):
     """
-    This class creates a bp decoder on a single GPU
+    This class creates a quaternary bp (bp4) decoder.
+
+    Each iteration runs `_step` (eager, or through torch.compile on CUDA). The
+    per-variable product of the check factors is a gather through a fixed
+    variable-to-edge table, multiplied in (channel, check, slot) order, so the
+    result does not depend on the device's scatter order. Rows are compacted to the
+    unconverged samples as in bp_norm_min_sum. The returned e_v and llr are zeros of
+    shape [B, 2, N]; iter and converge come from the syndrome check.
     """
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
@@ -26,6 +104,10 @@ class create(torch.nn.Module):
             V_c_col: the column index of all the variable nodes for each check node
 
             degree: the maximum number of 1s in all check nodes in H_matrix
+
+            compile: decoder config key, default True. Runs `_step` through
+                torch.compile on a CUDA device when dynamo and Triton are
+                available; eager otherwise.
         """
 
         super(create, self).__init__()
@@ -90,97 +172,110 @@ class create(torch.nn.Module):
             torch.stack((self.Hx_V_c_col, self.Hz_V_c_col)), requires_grad=False
         )
 
+        # variable -> edge table for c2v: row n holds the flat edge ids
+        # (channel * M + check) * D + slot of variable n's edges in that order,
+        # padded with 2 * M * D, the id of the ones column appended to the flat
+        # factors. The dummy variable N has no edges: its prior is +inf, then NaN
+        # after normalization, and a positive finite factor leaves either as is.
+        edge_var = self.V_c_col.detach().flatten().long()
+        edge_id = (edge_var < self.H_shape[1]).nonzero().squeeze(1)
+        var = edge_var[edge_id]
+        order = torch.argsort(var, stable=True)
+        edge_id, var = edge_id[order], var[order]
+        counts = torch.bincount(var, minlength=self.H_shape[1] + 1)
+        slot = torch.arange(var.numel(), device=var.device)
+        slot -= (torch.cumsum(counts, 0) - counts)[var]
+        vn_adj = torch.full(
+            [self.H_shape[1] + 1, int(counts.max())],
+            edge_var.numel(),
+            dtype=torch.long,
+            device=var.device,
+        )
+        vn_adj[var, slot] = edge_id
+        # slot-major, so one gather yields VD contiguous [batch, 4, N+1] slices
+        self.vn_adj = vn_adj.t().flatten()
+
         self.algo = "bp4"
         self.num_max_iter = self.max_iter
 
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get("rebatch_speedup"))
+        self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap was applied
+
+        # torch.compile of _step, used when forward runs on CUDA
+        self._compiled = None
+        if decoding_cfg.get("compile", True):
+            try:
+                from torch.utils._triton import has_triton
+
+                if torch._dynamo.is_dynamo_supported() and has_triton():
+                    # a copy of the code object gives each decoder its own compile cache
+                    self._compiled = torch.compile(
+                        types.FunctionType(
+                            _step.__code__.replace(), _step.__globals__, _step.__name__
+                        )
+                    )
+            except Exception as e:
+                logger.debug(f"compile is on but runs eager: {e!r}.")
 
         logger.info("Complete.")
 
     def forward(self, io_dict):
         """Iterative bp4 (Quaternary BP) decoding algorithm
         Input:
-            syndrome: estimated syndrome for c-th code node
+            synd: [B, 2, M] syndrome of the X and Z checks
+            llr0: [B, 4, N] channel probabilities of I, X, Y, Z
 
         Output:
-            e_v: estimated error for c-th code node at i-th iteration
-
-        Parameters:
-            llr:  Log-likelihood Ratio (LLR) for each v-th variable node (initialization)
-            l_v: Log-likelihood Ratio (LLR) for v-th variable node at i-th iteration
-            u_init: Log-likelihood Ratio (LLR) for v-th variable node (initialization)
-
-            a_v2c: Message from the v-th variable node to c-th check node at i-th iteration
-            b_c2v: Message from the c-th check node to v-th variable node at i-th iteration
-            message: used to represent both a_v2c and b_c2v
-
-            s_est:  estimated syndrome for c-th code node at i-th iteration
+            e_v, llr: [B, 2, N] zeros
+            iter: iteration at which the sample converged (the stop iteration if not)
+            converge: 1 where the hard decision matches both syndromes
         """
         logger.info("Initializing bp4 (Quaternary BP) decoding.")
 
         syndrome = io_dict["synd"].to(dtype=self.dtype).to(self.device)
 
         self.batch_size, self.number_channel, _ = syndrome.size()
+        B = self.batch_size
+        dev = syndrome.device
 
         # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
         self.N_extended = self.H_shape[1] + 1
-        l_v = torch.zeros(
-            [self.batch_size, self.number_channel, self.N_extended],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        e_v = torch.zeros(
-            [self.batch_size, self.number_channel, self.N_extended],
-            dtype=self.dtype,
-            device=self.device,
-        )
 
-        # add dummy column
-        dummy_column = torch.full(
-            [self.batch_size, 4, 1], float("inf"), dtype=self.dtype, device=self.device
-        )
+        dummy_column = torch.full([B, 4, 1], float("inf"), dtype=self.dtype, device=dev)
+        chan = torch.cat((io_dict["llr0"].to(dev).to(self.dtype), dummy_column), dim=2)
+        oldbitnode = chan
+        num_iters = torch.full([B], -1, device=dev)
+        converges = torch.full([B], 0, device=dev)
 
-        u_init = torch.cat(
-            (io_dict["llr0"].to(self.device).to(self.dtype), dummy_column), dim=2
-        )
-        e_out = torch.zeros(
-            [self.batch_size, self.number_channel, self.N_extended],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        l_out = torch.zeros(
-            [self.batch_size, self.number_channel, self.N_extended],
-            dtype=self.dtype,
-            device=self.device,
-        )
-        num_iters = torch.full([self.batch_size], -1, device=self.device)
-        converges = torch.full([self.batch_size], 0, device=self.device)
-
-        # set up initialization for all parameters for decoding process
-        # message is a in place version of a_v2c and b_c2v
-        message = torch.zeros_like(
-            self.V_c_row.unsqueeze(0), dtype=self.dtype, device=self.device
-        ).repeat(self.batch_size, 1, 1, 1)
-
-        chan = torch.cat(
-            (io_dict["llr0"].to(self.device).to(self.dtype), dummy_column), dim=2
-        )
-        bitnode = torch.cat(
-            (io_dict["llr0"].to(self.device).to(self.dtype), dummy_column), dim=2
-        )
-        oldbitnode = torch.cat(
-            (io_dict["llr0"].to(self.device).to(self.dtype), dummy_column), dim=2
-        )
+        col = self.V_c_col.detach().to(dev)
+        vn_adj = self.vn_adj.to(dev)
+        mask_dummy = self.mask_dummy.to(dev)
+        self.eps = 1e-40
 
         # initialize messages
-        self.eps = 1e-40
-        pI, pX, pY, pZ = u_init[:, 0], u_init[:, 1], u_init[:, 2], u_init[:, 3]
+        pI, pX, pY, pZ = chan[:, 0], chan[:, 1], chan[:, 2], chan[:, 3]
         x_msg = torch.log((pI + pX + self.eps) / (pY + pZ + self.eps))
         z_msg = torch.log((pI + pZ + self.eps) / (pX + pY + self.eps))
-        message[:, 0] = x_msg[:, self.V_c_col[0]]  # channel 0: X
-        message[:, 1] = z_msg[:, self.V_c_col[1]]
+        message = torch.stack((x_msg[:, col[0]], z_msg[:, col[1]]), 1)
+
+        check_node = (1.0 - 2.0 * syndrome).unsqueeze(3)
+        synd_bits = syndrome != 0.0
+        col = col.flatten()
+
+        step = (
+            self._compiled
+            if self._compiled is not None and dev.type == "cuda"
+            else _step
+        )
+        if step is not _step and B > 1:
+            for t in (message, oldbitnode, chan, check_node, synd_bits):
+                torch._dynamo.mark_dynamic(t, 0)
+
+        # the per-iteration state holds only the rows still decoded: row r is sample
+        # rows[r], and it_rows[r] is its convergence iteration (-1 while unconverged)
+        rows = torch.arange(B, device=dev)
+        it_rows = num_iters.clone()
 
         logger.info("Complete.")
 
@@ -189,248 +284,70 @@ class create(torch.nn.Module):
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
         self.cap_active_last = bool(
-            self.cap is not None and self.cap.done and not self.cap_bypass
+            self.cap is not None and self.cap.done and self.cap.frac is not None
+            and not self.cap_bypass
         )
         cap_frac = self.cap.frac if self.cap_active_last else None
 
-        # per-edge extrinsic factors produced by c2v; consumed by the next vn_update
-        new_err = None
         self.i = 0
         while self.i < self.max_iter:
             self.i += 1
 
-            # v2c + variable-node update: recover the v->c messages from the previous
-            # posterior (pass-through on the first iteration, before any posterior exists)
-            message = self.vn_update(message, bitnode, new_err)
+            message, oldbitnode, conv = step(
+                message,
+                oldbitnode,
+                chan,
+                check_node,
+                self.d,
+                self.eps,
+                col,
+                vn_adj,
+                mask_dummy,
+                synd_bits,
+            )
 
-            # check node update (min-sum), still in the [batch, 2, n_checks, degree] layout
-            message = self.cn_update(message, syndrome)
+            # record the rows that converge in this iteration, without a host sync
+            new = conv & (it_rows == -1)
+            it_rows = torch.where(new, self.i, it_rows)
+            num_iters.index_copy_(0, rows, torch.where(new, self.i, num_iters[rows]))
+            converges.index_copy_(0, rows, torch.where(new, 1, converges[rows]))
 
-            # c2v: scatter the check messages into the per-variable posterior (prob domain)
-            bitnode, new_err = self.c2v(message, oldbitnode, chan)
-
-            # damped posterior memory carried into the next iteration
-            oldbitnode = self.normalize_posterior(bitnode)
-
-            # hard decision: map the posterior probabilities to a binary error estimate
-            x_bits, z_bits = self.hard_decision(bitnode)
-
-            convergent_mask = self.syndrome_estimation(x_bits, z_bits, syndrome)
-
-            # different samples from the same batch may terminated at different iteration (pick the smallest one)
-            indices = torch.nonzero(convergent_mask == 1)
-            checker = torch.where(num_iters == -1.0)[0]
-
-            indices = indices[torch.isin(indices, checker)]
-            if indices.size()[0] > 0:
-                num_iters[indices] = self.i
-                e_out[indices] = e_v[indices]
-                l_out[indices] = l_v[indices]
-                converges[indices] = 1
-            # do the early termination if all batch satisfy the condition
-            if checker.size()[0] == 0:
+            n_left = int((it_rows == -1).sum())
+            if n_left == 0:
                 break
 
             # adaptive cap: stop once >= cap_frac of the batch has converged; the
             # unconverged remainder (converge == 0) becomes main's deferred tail.
-            if (
-                cap_frac is not None
-                and int((num_iters != -1).sum()) >= cap_frac * self.batch_size
-            ):
+            if cap_frac is not None and B - n_left >= cap_frac * B:
                 break
 
-        checker = torch.where(num_iters == -1)[0]
-        e_out[checker] = e_v[checker]
-        l_out[checker] = l_v[checker]
-        num_iters[checker] = (
-            self.i
-        )  # actual stop iter (== max_iter unless the cap broke early)
-        e_out = e_out[:, :, :-1]
-        l_out = l_out[:, :, :-1]
+            # compaction: keep only the unconverged rows once they drop below
+            # COMPACT_FRAC of the current rows (never after the last iteration;
+            # compiled, never to one row, which would recompile)
+            if (
+                int(step is not _step) < n_left < COMPACT_FRAC * self.batch_size
+                and self.i < self.max_iter
+            ):
+                keep = (it_rows == -1).nonzero().squeeze(1)
+                rows, it_rows = rows[keep], it_rows[keep]
+                message, oldbitnode, chan = message[keep], oldbitnode[keep], chan[keep]
+                check_node, synd_bits = check_node[keep], synd_bits[keep]
+                self.batch_size = n_left
+
+        # actual stop iter (== max_iter unless the cap broke early)
+        num_iters[num_iters == -1] = self.i
+        self.batch_size = B
+        out = torch.zeros(
+            [B, self.number_channel, self.H_shape[1]], dtype=self.dtype, device=dev
+        )
 
         # warm-up: observe this batch's iteration distribution (decides k + the cap).
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
-            self.cap.observe(num_iters, self.max_iter, self.batch_size)
+            self.cap.observe(num_iters, self.max_iter, B)
 
         logger.info("Complete.")
         logger.info(f"Decoding iterations: <{(self.i)}>.")
         io_dict.update(
-            {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
+            {"e_v": out, "iter": num_iters, "llr": out.clone(), "converge": converges}
         )
         return io_dict
-
-    def cn_update(self, a_v2c, syndrome):
-        """Check-node update (quaternary min-sum) in the [batch, 2, n_checks, degree]
-        layout, then zero the dummy edges padded onto irregular checks."""
-        # checks
-        check_node = 1.0 - 2.0 * syndrome.to(self.dtype)
-        channel_idx = torch.arange(self.number_channel, device=check_node.device)
-        # compute sgn
-        sign = torch.sgn(a_v2c)
-
-        check_node = check_node[:, channel_idx[:, None, None], self.V_c_row]
-
-        sign_prod = torch.prod(sign, dim=3, keepdim=True)
-
-        # compute min
-        abs_a_v2c = torch.abs(a_v2c)
-        sorted, _ = torch.sort(abs_a_v2c, dim=3)
-        min_0 = sorted[:, :, :, 0].unsqueeze(3)
-        min_1 = sorted[:, :, :, 1].unsqueeze(3)
-        min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
-        message = check_node * sign_prod * sign * min_result
-        message[:, :, self.mask_dummy] = float(0.0)
-        return message
-
-    def c2v(self, a_v2c, oldbitnode, chan):
-        """Check-to-variable update: turn the check messages into per-edge quaternary
-        error probabilities and scatter-multiply them into the per-variable posterior
-        (probability domain), seeded by the damped channel/memory prior. Returns the
-        posterior `bitnode` and the per-edge factors `new_err` (consumed by vn_update).
-        """
-        bitnode = torch.pow(chan, 1.0 - self.d) * torch.pow(oldbitnode, self.d)
-        err_neg = 0.5 / (1.0 + torch.exp(-a_v2c))
-        err_pos = 0.5 / (1.0 + torch.exp(a_v2c))
-        new_err = torch.zeros(
-            (self.batch_size, 2, 4, self.H_shape[0], 4),
-            dtype=a_v2c.dtype,
-            device=a_v2c.device,
-        )
-        new_err[:, 0, 0] = err_neg[:, 0]
-        new_err[:, 0, 1] = err_neg[:, 0]
-        new_err[:, 0, 2] = err_pos[:, 0]
-        new_err[:, 0, 3] = err_pos[:, 0]
-
-        new_err[:, 1, 0] = err_neg[:, 1]
-        new_err[:, 1, 1] = err_pos[:, 1]
-        new_err[:, 1, 2] = err_pos[:, 1]
-        new_err[:, 1, 3] = err_neg[:, 1]
-
-        data_flat = (
-            new_err.flatten(start_dim=3)
-            .permute(0, 2, 1, 3)
-            .reshape(self.batch_size, 4, 8 * self.H_shape[0])
-        )
-
-        partitions_flat = self.V_c_col.flatten(start_dim=1).unsqueeze(1).repeat(1, 4, 1)
-        partitions_flat = partitions_flat.unsqueeze(0).repeat(self.batch_size, 1, 1, 1)
-        partitions_flat = partitions_flat.permute(0, 2, 1, 3).reshape(
-            self.batch_size, 4, 8 * self.H_shape[0]
-        )
-        partitions_flat_expanded = partitions_flat.expand(self.batch_size, -1, -1)
-
-        sum_b_c2v = torch.zeros(
-            [self.batch_size, 4, self.H_shape[1] + 1],
-            dtype=self.dtype,
-            device=self.device,
-        )
-
-        sum_b_c2v = bitnode + sum_b_c2v
-        sum_b_c2v.scatter_reduce_(2, partitions_flat_expanded, data_flat, reduce="prod")
-        return sum_b_c2v, new_err
-
-    def normalize_posterior(self, bitnode):
-        """Normalize the quaternary posterior into the damped memory carried to the next
-        iteration: divide each variable's [I, X, Z, Y] probabilities by their sum (clamped
-        to `eps` to avoid divide-by-zero) so they form a per-variable distribution."""
-        return bitnode / bitnode.sum(dim=1, keepdim=True).clamp_min(self.eps)
-
-    def vn_update(self, message, bitnode, new_err):
-        """Variable-node update: produce the v->c messages from the current posterior.
-
-        On the first iteration there is no posterior yet, so the initialized message is
-        passed through. Afterwards each per-edge v->c LLR is recovered from the posterior
-        `bitnode` by dividing out that edge's own contribution (`new_err`, the quaternary
-        extrinsic information) and mapping back to X/Z log-likelihood ratios."""
-        if self.i == 1:
-            return message
-        idx = self.V_c_col.unsqueeze(0).unsqueeze(2)
-        idx = idx.expand(self.batch_size, 2, 4, self.H_shape[0], 4)
-
-        bitnode_expanded = (
-            bitnode.unsqueeze(1).unsqueeze(3).expand(-1, 2, -1, self.H_shape[0], -1)
-        )
-        bitnode_gathered = torch.gather(bitnode_expanded, dim=-1, index=idx)
-        bitnode_gathered = bitnode_gathered / new_err.clamp_min(self.eps)
-
-        num0 = (
-            bitnode_gathered[:, 0, 0, :, :] + bitnode_gathered[:, 0, 1, :, :] + self.eps
-        )
-        den0 = (
-            bitnode_gathered[:, 0, 2, :, :] + bitnode_gathered[:, 0, 3, :, :] + self.eps
-        )
-
-        num1 = (
-            bitnode_gathered[:, 1, 0, :, :] + bitnode_gathered[:, 1, 3, :, :] + self.eps
-        )
-        den1 = (
-            bitnode_gathered[:, 1, 1, :, :] + bitnode_gathered[:, 1, 2, :, :] + self.eps
-        )
-
-        # message: [batch, 2, 9, 4]
-        message = torch.empty(
-            (
-                bitnode_gathered.size(0),
-                2,
-                bitnode_gathered.size(3),
-                bitnode_gathered.size(4),
-            ),
-            device=bitnode_gathered.device,
-            dtype=bitnode_gathered.dtype,
-        )
-
-        message[:, 0] = torch.log(num0 / den0)
-        message[:, 1] = torch.log(num1 / den1)
-        return message
-
-    def hard_decision(self, bitnode):
-        qubits = torch.argmax(bitnode, dim=1)
-        x_bits = torch.zeros(
-            (self.batch_size, self.N_extended),
-            dtype=bitnode.dtype,
-            device=bitnode.device,
-        )
-        z_bits = torch.zeros(
-            (self.batch_size, self.N_extended),
-            dtype=bitnode.dtype,
-            device=bitnode.device,
-        )
-        x_bits[(qubits == 1) | (qubits == 2)] = 1
-        z_bits[(qubits == 2) | (qubits == 3)] = 1
-        return x_bits, z_bits
-
-    def syndrome_estimation(self, x_bits, z_bits, syndrome):
-        # Output check tensors
-        x_checks = torch.zeros(
-            (self.batch_size, self.H_shape[0]), dtype=x_bits.dtype, device=x_bits.device
-        )
-        z_checks = torch.zeros(
-            (self.batch_size, self.H_shape[0]), dtype=x_bits.dtype, device=x_bits.device
-        )
-
-        # Expand row indices per batch
-        idx0 = self.V_c_row[0].flatten().unsqueeze(0).expand(self.batch_size, -1)
-        idx1 = self.V_c_row[1].flatten().unsqueeze(0).expand(self.batch_size, -1)
-
-        # Gather source bits per batch
-        src0 = z_bits.gather(
-            1, self.V_c_col[0].flatten().unsqueeze(0).expand(self.batch_size, -1)
-        )
-        src1 = x_bits.gather(
-            1, self.V_c_col[1].flatten().unsqueeze(0).expand(self.batch_size, -1)
-        )
-
-        # XOR accumulation (sum then mod 2)
-        x_checks.scatter_add_(1, idx0, src0)
-        z_checks.scatter_add_(1, idx1, src1)
-
-        x_checks %= 2
-        z_checks %= 2
-
-        x_match = (x_checks == syndrome[:, 0, :]).all(dim=1)
-        z_match = (z_checks == syndrome[:, 1, :]).all(dim=1)
-
-        # A batch is convergent if both match
-        convergent_mask = x_match & z_match
-
-        return convergent_mask.int()

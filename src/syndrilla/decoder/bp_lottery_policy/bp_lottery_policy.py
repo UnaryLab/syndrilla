@@ -1,345 +1,94 @@
 import torch
 from loguru import logger
 
-from syndrilla.utils import parse_device_dtype
-from syndrilla.decoder.decoder import RebatchSpeedup
-from syndrilla.decoder.bp_lottery.bp_lottery import cn_row_mask, vn_unsat_count
+from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _NmsPy
+from syndrilla.decoder.bp_lottery.bp_lottery import (
+    cn_row_mask,
+    flip_rows,
+    rand_rows,
+    vn_unsat_count,
+)
 
 
-class create(torch.nn.Module):
+class create(_NmsPy):
     """
-    This class creates a lotterybp decoder on a single GPU
+    Lottery BP decoder with a selectable sign-flip policy: bp_norm_min_sum (eager
+    or compiled step, row compaction) with the policy's sign-flip in _iter_hook
+    every iteration.
+
+    Accepts every bp_norm_min_sum key plus
+        random_machine  : 'sobol' (default) | 'system'
+        sign_flip_policy: one of _sign_flip_policies (default Proposed)
     """
+
+    _sign_flip_policies = {
+        'Proposed',
+        'global_optimal',
+        'global_connectivity',
+        'global_weighted_random',
+        'local_random',
+        'local_reliable',
+        'local_connectivity',
+    }
+
     def __init__(self,
                  decoding_cfg,
                  **kwargs) -> None:
-        """
-        Initialization for lotterybp decoder
-        Input:
-            decoding_cfg: the information that come from config file (yaml)
-
-        Parameters:
-            max_iter: the number of maximum iteration of lotterybp decoder
-            i: the number of iterations running the decoder
-
-            H_matrix: loaded ldpc matrix, either hx or hz, as 2d tensor
-
-            V_c_row: the row index of all the variable nodes for each check node
-            V_c_col: the column index of all the variable nodes for each check node
-
-            degree: the maximum number of 1s in all check nodes in H_matrix
-        """
-
-        super(create, self).__init__()
-
-        logger.info('Creating lotterybp decoder.')
-
-        # set up default device
-        self.device, _ = parse_device_dtype(decoding_cfg)
-
-        # set up default max_iter
-        self.max_iter = decoding_cfg.get('max_iter', 50)
-        if self.max_iter <= 0 or not isinstance(self.max_iter, int):
-            logger.warning(f'Invalid input maximum iteration <{self.max_iter}>, default to <50>.')
-            self.max_iter = 50
-
-        # set up default dtype
-        self.dtype = decoding_cfg.get('dtype', 'float64')
-        if self.dtype not in {'float32', 'float64', 'bfloat16', 'float16'}:
-            logger.warning(f'Invalid input data type <{self.dtype}>, default to <torch.float64>.')
-            self.dtype = 'float64'
-        self.dtype = torch.__dict__[self.dtype]
-
-        self.batch_size = 1
-
-        self.check_type = decoding_cfg.get('check_type', 'hx')
-        if self.check_type.lower() not in {'hx', 'hz'}:
-            logger.warning(f'Invalid input check type <{self.check_type}>, default to <hx>.')
-            self.check_type = 'hx'
+        super().__init__(decoding_cfg, **kwargs)
 
         self.random_machine = decoding_cfg.get('random_machine', 'sobol')
         if self.random_machine.lower() not in {'sobol', 'system'}:
             logger.warning(f'Invalid input machine type <{self.random_machine}>, default to <sobol>.')
             self.random_machine = 'sobol'
 
-        # Sign-flip policy:
-        self._sign_flip_policies = {
-            'Proposed',
-            'global_optimal',
-            'global_connectivity',
-            'global_weighted_random',
-            'local_random',
-            'local_reliable',
-            'local_connectivity',
-        }
         self.sign_flip_policy = decoding_cfg.get('sign_flip_policy', 'Proposed')
         if self.sign_flip_policy not in self._sign_flip_policies:
             logger.warning(f'Invalid sign_flip_policy <{self.sign_flip_policy}>, defaulting to <Proposed>. Allowed: {sorted(self._sign_flip_policies)}.')
             self.sign_flip_policy = 'Proposed'
 
-        bundle = kwargs.get('bundle')
-        if bundle is None:
-            raise ValueError('bp_lottery_policy requires a pre-loaded MatrixBundle via the `bundle` kwarg.')
-        self.Hx_matrix = bundle.Hx_matrix
-        self.Hz_matrix = bundle.Hz_matrix
-        self.lx_matrix = bundle.lx_matrix
-        self.lz_matrix = bundle.lz_matrix
-        self.H_shape, self.V_c_row, self.V_c_col, self.H_matrix = bundle.select(self.check_type, dense=False)
-
-        self.mask_dummy = (self.V_c_col == self.H_shape[1])
-
-        # set iteration
-        self.i = 0
-
-        # convert to as the parameters in a model
-        self.V_c_row = torch.nn.Parameter(self.V_c_row, requires_grad=False)
-        self.V_c_col = torch.nn.Parameter(self.V_c_col, requires_grad=False)
-
         self.algo = 'bp_lottery_policy'
-        self.num_max_iter = self.max_iter
-
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg.get('rebatch_speedup'))
-        self.cap_bypass = False       # set by main: True -> decode this batch uncapped
-        self.cap_active_last = False  # set per forward: True if the cap was applied
-
-        logger.info('Complete.')
 
 
     def forward(self, io_dict):
-        """Iterative lotterybp (normalized min sum) decoding algorithm
-        Input:
-            syndrome: estimated syndrome for c-th code node
+        """bp_norm_min_sum decoding with the policy sign-flip in _iter_hook."""
+        self._prepare(io_dict)
+        return super().forward(io_dict)
 
-        Output:
-            e_v: estimated error for c-th code node at i-th iteration
 
-        Parameters:
-            llr:  Log-likelihood Ratio (LLR) for each v-th variable node (initialization)
-            l_v: Log-likelihood Ratio (LLR) for v-th variable node at i-th iteration
-            u_init: Log-likelihood Ratio (LLR) for v-th variable node (initialization)
-
-            a_v2c: Message from the v-th variable node to c-th check node at i-th iteration
-            b_c2v: Message from the c-th check node to v-th variable node at i-th iteration
-            message: used to represent both a_v2c and b_c2v
-
-            s_est:  estimated syndrome for c-th code node at i-th iteration
-        """
-
-        logger.info('Initializing lotterybp (normailized min sum) decoding.')
-        syndrome = io_dict['synd'].to(dtype=self.dtype).to(self.device)
-
-        self.batch_size, _ = syndrome.size()
-
-        # add a dummy element at the end in case the H (ldpc matrix) does not have the same number of 1s in each check node
-        N_extended = self.H_shape[1] + 1
-        l_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        e_v = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        s_est = torch.zeros([self.batch_size, self.H_shape[0]], dtype=self.dtype, device=self.device)
-
-        # add dummy column
-        dummy_column = torch.full([self.batch_size,1], float('inf'), dtype=self.dtype, device=self.device)
-        u_init = torch.cat((io_dict['llr0'].to(self.device).to(self.dtype), dummy_column), dim=1)
-        e_out = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        l_out = torch.zeros([self.batch_size, N_extended], dtype=self.dtype, device=self.device)
-        num_iters = torch.full([self.batch_size], -1, device=self.device)
-        converges = torch.full([self.batch_size], 0, device=self.device)
-
-        # set up initialization for all parameters for decoding process
-        # message is a in place version of a_v2c and b_c2v
-        message = u_init[:, self.V_c_col]
-
-        # compute syndrome for multiplication
-        self.syndrome_neg = torch.where(syndrome == 0.0, 1.0, -1.0).to(self.dtype).unsqueeze(2)
-
+    def _prepare(self, io_dict):
+        """Per-forward state of the flip: the batch size and the Sobol sequence
+        (one value per iteration)."""
+        self._B = io_dict['synd'].shape[0]
         if self.random_machine.lower() == 'sobol':
-            if self.dtype in {'float32', 'float64'}:
-                sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-                self.r = sobol.draw(self.max_iter, dtype=self.dtype).to(self.device).to(self.dtype)
-            else:
-                sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
-                self.r = sobol.draw(self.max_iter, dtype=torch.float32).to(self.device).to(self.dtype)
-
-        logger.info('Complete.')
-
-        logger.info('Starting decoding iterations.')
-
-        # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
-        # soon as that fraction has converged (unless main asked for an uncapped pass).
-        self.cap_active_last = bool(self.cap is not None and self.cap.done and not self.cap_bypass)
-        cap_frac = self.cap.frac if self.cap_active_last else None
-
-        self.i = 0
-        while self.i < self.max_iter:
-            self.i += 1
-
-            # v2c: gather the per-variable LLR into the check-grouped layout
-            l_v_v2c = self.v2c(l_v)
-
-            # variable node update
-            message = self.vn_update(message, l_v_v2c)
-
-            # check node update (min-sum), still in the [batch, n_checks, degree] layout
-            message = self.cn_update(message)
-
-            # c2v: convert the check messages back to the per-variable layout
-            message_c2v = self.c2v(message)
-
-            # elementwise LLR update
-            l_v = self.llr_update(u_init, message_c2v)
-
-            # hard decision: map posterior LLRs to a binary error estimate
-            e_v = self.hard_decision(l_v)
-
-            s_est = self.syndrome_estimation(e_v)
-
-            # different samples from the same batch may terminated at different iteration (pick the smallest one)
-            indices = torch.all(s_est == syndrome, 1).nonzero()
-            checker = torch.where(num_iters == -1.0)[0]
-            indices = indices[torch.isin(indices, checker)]
-            if indices.size()[0] > 0:
-                num_iters[indices] = self.i
-                e_out[indices] = e_v[indices]
-                l_out[indices] = l_v[indices]
-                converges[indices] = 1
-
-            # do the early termination if all batch satisfy the condition
-            if checker.size()[0] == 0:
-                break
-
-            # adaptive cap: stop once >= cap_frac of the batch has converged; the
-            # unconverged remainder (converge == 0) becomes main's deferred tail.
-            if cap_frac is not None and int((num_iters != -1).sum()) >= cap_frac * self.batch_size:
-                break
-
-            if self.sign_flip_policy == 'Proposed':
-                l_v = self.sign_flip_lottery(syndrome, s_est, l_v)
-            elif self.sign_flip_policy == 'global_optimal':
-                l_v = self.sign_flip_global_optimal(syndrome, s_est, l_v)
-            elif self.sign_flip_policy == 'global_connectivity':
-                l_v = self.sign_flip_global_connectivity(syndrome, s_est, l_v)
-            elif self.sign_flip_policy == 'global_weighted_random':
-                l_v = self.sign_flip_global_weighted_random(syndrome, s_est, l_v)
-            elif self.sign_flip_policy == 'local_random':
-                l_v = self.sign_flip_local_random(syndrome, s_est, l_v)
-            elif self.sign_flip_policy == 'local_reliable':
-                l_v = self.sign_flip_local_reliable(syndrome, s_est, l_v)
-            elif self.sign_flip_policy == 'local_connectivity':
-                l_v = self.sign_flip_local_connectivity(syndrome, s_est, l_v)
-
-        checker = torch.where(num_iters == -1)[0]
-        e_out[checker] = e_v[checker]
-        l_out[checker] = l_v[checker]
-        num_iters[checker] = self.i
-        e_out = e_out[:, :-1]
-        l_out = l_out[:, :-1]
-
-        # warm-up: observe this batch's iteration distribution (decides k + the cap).
-        if self.cap is not None and not self.cap.done and not self.cap_bypass:
-            self.cap.observe(num_iters, self.max_iter, self.batch_size)
-
-        logger.info('Complete.')
-        logger.info(f'Decoding iterations: <{(self.i)}>.')
-        io_dict.update({
-            'e_v': e_out,
-            'iter': num_iters,
-            'llr': l_out,
-            'converge': converges
-        })
-        return io_dict
+            sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
+            self.r = sobol.draw(self.max_iter, dtype=torch.float32).to(self.device).to(self.dtype)
 
 
-    def v2c(self, l_v):
-        """Format conversion (variable -> check layout).
-
-        Gathers the per-variable LLR vector `l_v` ([batch, N+1]) into the
-        check-node-grouped layout ([batch, n_checks, degree]) that the variable-node
-        and check-node updates operate on. Each edge (c, v) picks up `l_v[:, v]`.
-        """
-        return l_v[:, self.V_c_col]
+    def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
+        """Policy sign-flip at the end of iteration i on the unconverged rows; the
+        next iteration reads the flipped l_v."""
+        self.i = i
+        self._active = active
+        self._apply_policy(syndrome, self.syndrome_estimation(e_v), l_v)
 
 
-    def vn_update(self, b_c2v, l_v_v2c):
-        """Variable-node update: produce the v->c messages a_v2c.
-
-        On the first iteration there is no incoming c->v message yet, so the
-        initialized message is passed through. Afterwards each v->c message is the
-        current per-variable LLR (already v2c-gathered into the check layout) minus
-        the incoming c->v message on that same edge (extrinsic information).
-        """
-        if self.i == 1:
-            return b_c2v
-        else:
-            return l_v_v2c - b_c2v
-
-
-    def cn_update(self, a_v2c):
-        base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype)
-
-        # Compute the power in PyTorch:
-        beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
-        # compute sgn
-        sign = torch.sgn(a_v2c)
-        sign = torch.where(sign == 0.0, -1.0, sign)
-        sign_prod = torch.prod(sign, dim=2, keepdim=True)
-        Q_sign = self.syndrome_neg * sign_prod
-
-        # compute min
-        abs_a_v2c = torch.abs(a_v2c)
-        mins, _ = torch.topk(abs_a_v2c, 2, dim=2, largest=False)
-        min_0 = mins[:, :, 0].unsqueeze(2)
-        min_1 = mins[:, :, 1].unsqueeze(2)
-        min_result = torch.where(abs_a_v2c == min_0, min_1, min_0)
-
-        message = beta * sign * Q_sign * min_result
-        message[:, self.mask_dummy] = 0.0
-        return message
-
-
-    def c2v(self, b_c2v):
-        """Format conversion (check -> variable layout).
-
-        Scatters the check-node-grouped c->v messages ([batch, n_checks, degree])
-        back into the per-variable layout ([batch, N+1]) that the LLR update sums
-        over: every edge (c, v) accumulates its message into column `v`.
-        """
-        # set up the format for both data and partition so they can matching each other
-        data_flat = b_c2v.flatten(start_dim=1)
-        sum_b_c2v = torch.zeros([self.batch_size, self.H_shape[1] + 1], dtype=self.dtype, device=self.device)
-
-        sum_b_c2v.index_add_(1, self.V_c_col.flatten(), data_flat)
-
-        return sum_b_c2v
-
-
-    def llr_update(self, u_init, b_c2v):
-        """Elementwise LLR update: posterior LLR = channel LLR + sum of incoming c->v.
-
-        Takes the already c2v-converted per-variable messages and adds the channel
-        (initialization) LLR. The dummy variable (last column) is pinned to +inf so
-        it is never decoded as an error.
-        """
-        l_v = u_init + b_c2v
-        l_v[:, -1] = float('inf')
+    def _apply_policy(self, syndrome, s_est, l_v):
+        p = self.sign_flip_policy
+        if p == 'Proposed':
+            return self.sign_flip_lottery(syndrome, s_est, l_v)
+        if p == 'global_optimal':
+            return self.sign_flip_global_optimal(syndrome, s_est, l_v)
+        if p == 'global_connectivity':
+            return self.sign_flip_global_connectivity(syndrome, s_est, l_v)
+        if p == 'global_weighted_random':
+            return self.sign_flip_global_weighted_random(syndrome, s_est, l_v)
+        if p == 'local_random':
+            return self.sign_flip_local_random(syndrome, s_est, l_v)
+        if p == 'local_reliable':
+            return self.sign_flip_local_reliable(syndrome, s_est, l_v)
+        if p == 'local_connectivity':
+            return self.sign_flip_local_connectivity(syndrome, s_est, l_v)
         return l_v
-
-
-    def hard_decision(self, l_v):
-        """Hard decision: map posterior LLRs to a binary error estimate.
-
-        A non-positive LLR (<= 0) means the bit is more likely 1, so it is set to
-        1; otherwise 0. Returns the estimate in the decoder's dtype.
-        """
-        return torch.where(l_v <= 0.0, 1.0, 0.0).to(self.dtype)
-
-
-    def syndrome_estimation(self, e_v):
-        # calculate the syndrome by summing the number of 1s in each column in e
-        temp_e = e_v
-        temp_e[:, -1] = 0.0
-        estimated_syndrome = temp_e[:, self.V_c_col].sum(dim = 2).to(dtype = self.dtype)
-
-        return torch.where((estimated_syndrome%2) > 0.0, 1.0, 0.0).to(self.dtype)
 
 
     def sign_flip_global_weighted_random(self, syndrome, s_est, l_v):
@@ -356,7 +105,7 @@ class create(torch.nn.Module):
         valid_mask = total_ones > 0
 
         if self.random_machine.lower() == 'system':
-            r = torch.rand(self.batch_size, device=self.device, dtype=self.dtype)
+            r = rand_rows(self, self.batch_size)
         elif self.random_machine.lower() == 'sobol':
             r = self.r[(self.i-1)].repeat(self.batch_size)
 
@@ -368,7 +117,7 @@ class create(torch.nn.Module):
         mask = cumsum_x >= target + 1
         selected_indices = torch.argmax(mask.float(), dim=1)
 
-        l_v[valid_mask, selected_indices[valid_mask]] *= -1.0
+        flip_rows(l_v, selected_indices, valid_mask & self._active)
         return l_v
 
 
@@ -396,7 +145,7 @@ class create(torch.nn.Module):
 
         selected_indices = torch.argmin(masked_abs_llr, dim=1)
 
-        l_v[valid_mask, selected_indices[valid_mask]] *= -1.0
+        flip_rows(l_v, selected_indices, valid_mask & self._active)
         return l_v
 
 
@@ -416,7 +165,7 @@ class create(torch.nn.Module):
         candidates_mask = (temp_ls == max_vals) & (temp_ls > 0)
 
         if self.random_machine.lower() == 'system':
-            r = torch.rand(self.batch_size, device=self.device, dtype=self.dtype)
+            r = rand_rows(self, self.batch_size)
         elif self.random_machine.lower() == 'sobol':
             r = self.r[(self.i-1)].repeat(self.batch_size)
 
@@ -433,7 +182,7 @@ class create(torch.nn.Module):
 
         selected_indices = torch.argmax(selected_mask.float(), dim=1)
 
-        l_v[valid_mask, selected_indices[valid_mask]] *= -1.0
+        flip_rows(l_v, selected_indices, valid_mask & self._active)
 
         return l_v
 
@@ -448,7 +197,7 @@ class create(torch.nn.Module):
         batch_size, M = unsat_cn_mask.shape
 
         if self.random_machine.lower() == 'system':
-            r1 = torch.rand(batch_size, device=self.device, dtype=self.dtype)
+            r1 = rand_rows(self, batch_size)
         elif self.random_machine.lower() == 'sobol':
             r1 = self.r[(self.i-1)].repeat(batch_size)
 
@@ -468,9 +217,9 @@ class create(torch.nn.Module):
         num_connected_vns = connected_vn_mask.sum(dim=1) # [B]
 
         if self.random_machine.lower() == 'system':
-            r2 = torch.rand(batch_size, device=self.device, dtype=self.dtype)
+            r2 = rand_rows(self, batch_size)
         elif self.random_machine.lower() == 'sobol':
-            r2 = torch.rand(batch_size, device=self.device, dtype=self.dtype)
+            r2 = rand_rows(self, batch_size)
 
 
         rand_pos_vn = torch.floor(r2 * num_connected_vns).long() + 1
@@ -481,7 +230,7 @@ class create(torch.nn.Module):
         selected_vn_idx = torch.argmax(chosen_vn_onehot.float(), dim=1) # [B]
 
 
-        l_v[valid_mask, selected_vn_idx[valid_mask]] *= -1.0
+        flip_rows(l_v, selected_vn_idx, valid_mask & self._active)
 
         return l_v
 
@@ -499,7 +248,7 @@ class create(torch.nn.Module):
         batch_size, M = unsat_cn_mask.shape
 
         if self.random_machine.lower() == 'system':
-            r = torch.rand(batch_size, device=self.device, dtype=self.dtype)
+            r = rand_rows(self, batch_size)
         elif self.random_machine.lower() == 'sobol':
             r = self.r[(self.i-1)].repeat(batch_size)
 
@@ -519,7 +268,7 @@ class create(torch.nn.Module):
 
         selected_vn = torch.argmin(masked_llr, dim=1)
 
-        l_v[torch.arange(batch_size), selected_vn] *= -1.0
+        flip_rows(l_v, selected_vn, self._active)
 
         return l_v
 
@@ -542,7 +291,7 @@ class create(torch.nn.Module):
 
         # random
         if self.random_machine.lower() == 'system':
-            r = torch.rand(batch_size, device=self.device, dtype=self.dtype)
+            r = rand_rows(self, batch_size)
         else: # sobol
             r = self.r[(self.i-1)].repeat(batch_size)
 
@@ -564,7 +313,7 @@ class create(torch.nn.Module):
 
         selected_vn = torch.argmax(masked_score, dim=1)
 
-        l_v[torch.arange(batch_size), selected_vn] *= -1.0
+        flip_rows(l_v, selected_vn, self._active)
 
         return l_v
 
@@ -580,7 +329,7 @@ class create(torch.nn.Module):
         batch_size, M = unsat_cn_mask.shape
 
         if self.random_machine.lower() == 'system':
-            r = torch.rand(batch_size, device=self.device, dtype=self.dtype)
+            r = rand_rows(self, batch_size)
         else: # sobol
             r = self.r[(self.i-1)].repeat(batch_size)
 
@@ -604,6 +353,6 @@ class create(torch.nn.Module):
 
         selected_vn = torch.argmax(masked_score, dim=1)
 
-        l_v[torch.arange(batch_size), selected_vn] *= -1.0
+        flip_rows(l_v, selected_vn, self._active)
 
         return l_v

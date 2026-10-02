@@ -11,11 +11,17 @@ sys.path.append(os.getcwd())
 
 from syndrilla.decoder import create_decoder
 from syndrilla.error_model import create_error_model
+from syndrilla.logical_check import create_check
+from syndrilla.matrix import load_matrices
 from syndrilla.syndrome import create_syndrome
+from syndrilla.utils import get_path, parse_device_dtype, read_yaml
 
 
-def test_batch_alist_hx(batch_size=1000, target_error=1000):
-    decoders = create_decoder(yaml_path='examples/alist/bposd_hx.decoding.yaml')
+def test_batch_alist_hx(batch_size=1000, target_error=1000, max_batches=10):
+    decoding_cfg = read_yaml(get_path('examples/alist/bposd_hx.decoding.yaml'))['decoding']
+    matrix_cfg = read_yaml(get_path('examples/alist/surface_11.matrix.yaml'))['matrix']
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(decoding_cfg))
+    decoders = create_decoder(cfg=decoding_cfg, bundle=bundle)
 
     num_decoders = len(decoders)
     for decoder in decoders:
@@ -24,11 +30,12 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
     shape = decoders[0].H_shape
     dtype = decoders[0].dtype
     decoder_device = decoders[0].device
-    H_matrix = decoders[0].H_matrix
+    H_matrix = bundle.select(decoding_cfg['check_type'])[3]
+    l_matrix = bundle.get_l_matrix(decoding_cfg['check_type'], 1)
 
     # create bposd decoder by bposd repo
     bp_osd = BpOsdDecoder(
-        H_matrix.cpu().numpy(),
+        H_matrix.to_dense().cpu().numpy().astype(np.uint8),
         error_rate = 0.01,
         bp_method = 'product_sum',
         max_iter = 131,
@@ -51,7 +58,9 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
     # create syndrome
     syndrome_generator = create_syndrome(yaml_path='examples/alist/perfect.syndrome.yaml')
 
-    while num_err <= target_error:
+    logical_check = create_check(yaml_path='examples/alist/lx.check.yaml')
+
+    while num_err <= target_error and num_batches < max_batches:
         # create error
         e_v_all = [torch.empty((0, shape[1]), dtype=dtype, device=decoder_device) for _ in range(num_decoders)]
         e_all = torch.empty((0, shape[1]), dtype=dtype, device=decoder_device)
@@ -114,9 +123,14 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000):
                     cbposd.append(are_equal)
                 logger.info(f'comparing to bposd the e_v result is not the same for {sum(not val for val in cbposd)} in {batch_size} number of test cases.')
 
+        check = logical_check.check(e_v_all[num_decoders-1], e_all, l_matrix, converge_all[num_decoders])
+        num_err += int(torch.sum(check))
+        logger.info(f'batch {num_batches}/{max_batches} (cap), logical errors {num_err}/{target_error}')
+
 
 if __name__ == '__main__':
     target_error = 1000
     batch_size = 10000
-    test_batch_alist_hx(batch_size, target_error)
+    max_batches = 10
+    test_batch_alist_hx(batch_size, target_error, max_batches)
 

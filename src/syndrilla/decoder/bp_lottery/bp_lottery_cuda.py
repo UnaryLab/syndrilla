@@ -2,11 +2,16 @@ import torch
 from loguru import logger
 
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _BaseCuda
-from syndrilla.decoder.bp_lottery.bp_lottery import cn_row_mask, vn_unsat_count
+from syndrilla.decoder.bp_lottery.bp_lottery import (
+    cn_row_mask,
+    flip_rows,
+    vn_unsat_count,
+)
 
 
 class create(_BaseCuda):
-    """BP Normalized Min-Sum lottery decoder on CUDA kernels (per-step path).
+    """BP Normalized Min-Sum lottery decoder on CUDA kernels: the
+    bp_norm_min_sum_cuda per-step loop with the sign-flip in _iter_hook.
 
     Accepts every bp_norm_min_sum_cuda key plus the lottery knobs:
         random_machine : 'sobol' (default) | 'system'   RNG for the flip pick
@@ -15,10 +20,6 @@ class create(_BaseCuda):
 
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__(decoding_cfg, **kwargs)
-
-        # The sign-flip is a host op between BP steps; the fused kernel cannot
-        # express it, so always take the per-step kernel path.
-        self._use_fused = False
 
         # lottery knobs
         self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()
@@ -32,40 +33,24 @@ class create(_BaseCuda):
         self.algo = "bp_lottery"
         logger.info("bp_lottery_cuda decoder ready (per-step path + sign-flip).")
 
+    def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
+        """Lottery sign-flip at the end of iteration i > flip_start_iter, on the
+        rows still unconverged; the next iteration's check update reads the
+        flipped l_v. With random_machine system, a call with no unconverged row
+        returns before drawing (one host sync per call), so the global RNG
+        advances as if the loop had stopped when the last row converged."""
+        if i <= self.flip_start_iter:
+            return
+        if self.random_machine == "system" and not active.any():
+            return
+        self.i = i
+        s_est = (e_v[:, self.V_c_col].sum(dim=2, dtype=torch.uint8) & 1).to(self.dtype)
+        self._active = active
+        self.sign_flip_cn_rand_new(syndrome, s_est, l_v)
+
     def forward(self, io_dict: dict) -> dict:
-        """Per-step CUDA BP decode with the lottery sign-flip between iterations.
-
-        Mirrors bp_norm_min_sum_cuda's per-step path, inserting
-        ``sign_flip_cn_rand_new`` after ``flip_start_iter`` so the modified l_v
-        feeds the next iteration's vn_update — exactly as bp_lottery does.
-        """
-        dev = self.device
-        syndrome = io_dict["synd"].to(dtype=self.dtype, device=dev).contiguous()
-        B, M = syndrome.shape
-        self.batch_size = B
-
-        llr0 = io_dict["llr0"].to(dtype=self.dtype, device=dev).contiguous()
-        dummy_col = torch.full((B, 1), float("inf"), dtype=self.dtype, device=dev)
-        u_init = torch.cat([llr0, dummy_col], dim=1)  # [B, N_ext]
-
-        syndrome_neg_bc = torch.where(
-            syndrome == 0.0, torch.ones_like(syndrome), -torch.ones_like(syndrome)
-        )
-
-        e_out = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        l_out = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        num_iters = torch.full((B,), -1, dtype=torch.int64, device=dev)
-        converges = torch.zeros(B, dtype=torch.int64, device=dev)
-
-        # adaptive cap (built by bp_norm_min_sum_cuda.__init__ from the rebatch_speedup
-        # block; None when that block is absent → uncapped)
-        cap = getattr(self, "cap", None)
-        self.cap_active_last = bool(
-            cap is not None and cap.done and not getattr(self, "cap_bypass", False)
-        )
-        cap_frac = cap.frac if self.cap_active_last else None
-
-        # Sobol draw for the flip pick — one quasi-random value per iteration.
+        """bp_norm_min_sum_cuda per-step decode with the lottery sign-flip in
+        _iter_hook. Builds the Sobol sequence (one value per iteration) first."""
         if self.random_machine == "sobol":
             sobol = torch.quasirandom.SobolEngine(dimension=1, scramble=False)
             draw_dtype = (
@@ -73,75 +58,17 @@ class create(_BaseCuda):
                 if self.dtype in {torch.float32, torch.float64}
                 else torch.float32
             )
-            self.r = sobol.draw(self.max_iter, dtype=draw_dtype).to(dev, self.dtype)
-
-        D = int(self.V_c_col.shape[1])
-        a_v2c = torch.zeros(B, M, D, dtype=self.dtype, device=dev)
-        b_c2v = torch.zeros(B, M, D, dtype=self.dtype, device=dev)
-        l_v = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        e_v = torch.zeros(B, self.N_ext, dtype=self.dtype, device=dev)
-        s_est = torch.zeros(B, M, dtype=self.dtype, device=dev)
-
-        for i in range(1, self.max_iter + 1):
-            self.i = i
-            beta = 1.0 - 2.0 ** (-i)
-            if i == 1:
-                self._ext.init_messages(u_init, self.V_c_col, a_v2c)
-            else:
-                self._ext.vn_update(l_v, b_c2v, self.V_c_col, a_v2c, self.N)
-            self._ext.cn_update(
-                a_v2c, syndrome_neg_bc, self.V_c_col, b_c2v, beta, self.N
+            self.r = sobol.draw(self.max_iter, dtype=draw_dtype).to(
+                self.device, self.dtype
             )
-            self._ext.llr_update(
-                u_init, b_c2v, self.VN_adj_c, self.VN_adj_k, l_v, self.VD
-            )
-            l_v[:, -1] = float("inf")
-            self._ext.hard_decision(l_v, e_v)
-            self._ext.syndrome_est(e_v, self.V_c_col, s_est, self.N)
-            self._ext.convergence_update(
-                s_est, syndrome, e_v, l_v, e_out, l_out, num_iters, converges, i
-            )
-
-            n_conv = int((num_iters != -1).sum())
-            if n_conv == B:
-                break
-            # adaptive cap: stop once the learned fraction has converged; the
-            # unconverged tail (converge == 0) is deferred to main's extra queue.
-            if cap_frac is not None and n_conv >= cap_frac * B:
-                break
-
-            # lottery sign-flip: nudge stuck (unconverged) samples. Converged
-            # samples have no unsatisfied checks, so they are left untouched.
-            if i > self.flip_start_iter:
-                l_v = self.sign_flip_cn_rand_new(syndrome, s_est, l_v)
-
-        not_conv = num_iters == -1
-        if not_conv.any().item():
-            e_out[not_conv] = e_v[not_conv]
-            l_out[not_conv] = l_v[not_conv]
-            num_iters[not_conv] = (
-                self.i
-            )  # actual stop iter (== max_iter unless the cap broke early)
-
-        if cap is not None and not cap.done and not getattr(self, "cap_bypass", False):
-            cap.observe(num_iters, self.max_iter, B)
-
-        io_dict.update(
-            {
-                "e_v": e_out[:, :-1],
-                "iter": num_iters,
-                "llr": l_out[:, :-1],
-                "converge": converges,
-            }
-        )
-        return io_dict
+        return super().forward(io_dict)
 
     def sign_flip_cn_rand_new(self, syndrome, s_est, l_v):
         """Flip one variable node's LLR sign per stuck sample.
 
         Pick a random unsatisfied check, then among its variable nodes pick the one
         with the highest unsatisfied-check connectivity (ties broken by smallest
-        |LLR|), and flip its posterior LLR sign. Identical to bp_lottery.
+        |LLR|), and flip its posterior LLR sign. Only rows in self._active flip.
         """
         synd_diff = (syndrome + s_est) % 2.0  # [B, M]
         unsat_cn_mask = synd_diff.bool()
@@ -172,5 +99,5 @@ class create(_BaseCuda):
         masked_score = score + (~candidate_vn_mask).float() * -1e9
         selected_vn = torch.argmax(masked_score, dim=1)
 
-        l_v[valid_mask, selected_vn[valid_mask]] *= -1.0
+        flip_rows(l_v, selected_vn, valid_mask & self._active)
         return l_v
