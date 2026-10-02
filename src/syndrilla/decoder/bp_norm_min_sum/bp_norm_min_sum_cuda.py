@@ -336,7 +336,7 @@ class create(nn.Module):
 
         self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
-        self.cap_active_last = False  # set per forward: True if the cap was applied
+        self.cap_active_last = False  # set per forward: True if the cap stopped early
 
         self._ext = _load_ext()
 
@@ -487,6 +487,8 @@ class create(nn.Module):
         iter     : [B]      iteration at which each sample converged (max_iter,
                             or the cap's stop iteration, if not)
         converge : [B]      1 if converged, 0 otherwise
+        defer    : [B]      bool, True on unconverged samples when the cap
+                            stopped the batch before max_iter
         """
         dev = self.device
         # .contiguous() is load-bearing: every kernel indexes raw data pointers
@@ -511,9 +513,13 @@ class create(nn.Module):
         num_iters = torch.zeros(B, dtype=torch.int64, device=dev)
         converges = torch.zeros(B, dtype=torch.int64, device=dev)
 
-        self.cap_active_last = bool(
-            self.cap is not None and self.cap.done and not self.cap_bypass
+        cap_applied = bool(
+            self.cap is not None
+            and self.cap.done
+            and self.cap.frac is not None
+            and not self.cap_bypass
         )
+        cap_stopped = False
         warp, fuse_vn, f64_int, padded, vn_gather = self._kernel_knobs()
         if padded:
             col, vn_eid = self.col_pad, self.VN_eid_pad
@@ -525,9 +531,9 @@ class create(nn.Module):
         l_v = torch.empty(B, self.N_ext, dtype=self.dtype, device=dev)
         e_v = torch.empty(B, self.N_ext, dtype=torch.uint8, device=dev)
 
-        if self._use_persistent(B, self.cap_active_last):
+        if self._use_persistent(B, cap_applied):
             cnt, stop_count = None, 0
-            if self.cap_active_last:
+            if cap_applied:
                 cnt = torch.zeros(
                     2 * (self.max_iter + 1), dtype=torch.int32, device=dev
                 )
@@ -551,9 +557,14 @@ class create(nn.Module):
                 stop_count,
                 **({} if f64_int else {"f64_int": False}),
             )
+            if cap_applied:
+                # the kernel writes the stop iteration to every unconverged row
+                cap_stopped = bool(
+                    ((converges == 0) & (num_iters < self.max_iter)).any()
+                )
         else:
             every = self._host_check_every
-            cap_frac = self.cap.frac if self.cap_active_last else None
+            cap_frac = self.cap.frac if cap_applied else None
             mismatch = torch.zeros(B, dtype=torch.int32, device=dev)
             num_iters.fill_(-1)
             hooked = type(self)._iter_hook is not create._iter_hook
@@ -610,6 +621,7 @@ class create(nn.Module):
                     # once the learned fraction is reached or every sample converges.
                     n_conv = int((num_iters != -1).sum())
                     if n_conv >= cap_frac * B or n_conv == B:
+                        cap_stopped = n_conv < B and i < self.max_iter
                         break
                 elif (
                     every
@@ -627,6 +639,14 @@ class create(nn.Module):
             num_iters.masked_fill_(num_iters == -1, i)
 
         self._exit_hook(l_v, e_v, num_iters, converges)
+        self.cap_active_last = cap_stopped
+        # rows main drops and decodes again: the unconverged rows of a batch the
+        # cap stopped before max_iter
+        defer = (
+            converges.flatten() == 0
+            if cap_stopped
+            else torch.zeros(B, dtype=torch.bool, device=dev)
+        )
 
         # Free the edge buffer before the hard decision is widened to the
         # decoder dtype, so the widening does not raise the peak.
@@ -646,6 +666,7 @@ class create(nn.Module):
                 "iter": num_iters,
                 "llr": l_out[:, :-1],
                 "converge": converges,
+                "defer": defer,
             }
         )
         return io_dict

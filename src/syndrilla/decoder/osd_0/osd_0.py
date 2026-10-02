@@ -25,7 +25,9 @@ class create(torch.nn.Module):
 
     Outputs: e_v (uint8) with the OSD estimate on the samples the previous
     decoder did not converge on; iter, the input iter (zeros [B] int64 when
-    absent) with N on those samples; converge, all ones.
+    absent) with N on those samples; converge, all ones. Rows where the
+    optional bool [B] io_dict['defer'] is True are not decoded and keep their
+    input e_v, iter and converge; defer passes through unchanged.
 
     Config keys beyond the shared ones:
         workspace_bytes : int (optional, default 4 GiB; samples are sorted and
@@ -98,9 +100,15 @@ class create(torch.nn.Module):
         converge = io_dict['converge']
         B = converge.shape[0]
         iter_out = io_dict['iter'].clone() if 'iter' in io_dict else torch.zeros(B, dtype=torch.long, device=device)
-        idx = (converge == 0).nonzero(as_tuple=True)[0].to(device)
-        # samples OSD decodes: all of them without osd_skip_converged
-        run = idx if self.osd_skip_converged else torch.arange(B, device=device)
+        # rows marked in io_dict['defer'] are re-decoded by the batch loop, OSD skips them
+        defer = io_dict['defer'].to(device=converge.device, dtype=torch.bool) if 'defer' in io_dict else None
+        nc = converge == 0 if defer is None else (converge == 0) & ~defer
+        idx = nc.nonzero(as_tuple=True)[0].to(device)
+        # samples OSD decodes: all non-deferred ones without osd_skip_converged
+        if self.osd_skip_converged:
+            run = idx
+        else:
+            run = torch.arange(B, device=device) if defer is None else (~defer).nonzero(as_tuple=True)[0].to(device)
         llr_sub = io_dict['llr'].to(self.dtype)[run]
         synd_sub = io_dict['synd'][run].to(torch.bool)
         N = self.cols.shape[0] - 1
@@ -122,7 +130,7 @@ class create(torch.nn.Module):
                 e_sub[redo], stopped[redo] = self._scan_chunks(llr_sub[redo], synd_sub[redo], width)
 
         final_result = io_dict['e_v'].clone().to(dtype=torch.uint8, device=device)
-        final_result[idx] = e_sub if self.osd_skip_converged else e_sub[idx]
+        final_result[idx] = e_sub if self.osd_skip_converged else e_sub[nc.to(device)[run]]
         if idx.numel() > 0:
             iter_out = iter_out.to(device)
             iter_out[idx] = self.num_max_iter
@@ -132,7 +140,7 @@ class create(torch.nn.Module):
         io_dict.update({
             'e_v': final_result,
             'iter': iter_out,
-            'converge': torch.ones_like(converge)
+            'converge': torch.ones_like(converge) if defer is None else torch.where(defer, converge, torch.ones_like(converge))
         })
         return io_dict
 

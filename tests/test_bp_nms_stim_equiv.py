@@ -317,7 +317,9 @@ def test_cuda_group_off_matches_default(knob_case, groups):
     _assert_equal(_run(off, synd, llr0), ref, f"{groups} off vs on (cuda)")
 
 
-DEFAULT_BLOCK = {"kl_eps": 1e-4, "kl_window": 3, "kl_min": 3}
+# the class defaults plus min_pct 0: this batch has about half its shots at
+# max_iter, so the default min_pct 50 would leave no candidate and decline
+DEFAULT_BLOCK = {"kl_eps": 1e-4, "kl_window": 3, "kl_min": 3, "min_pct": 0}
 # same batch each call: KL falls below kl_eps near call 20, the cap is chosen
 # a few calls later and the remaining calls run capped
 CALLS = 26
@@ -332,8 +334,9 @@ def _calls(dec, synd, llr0):
 
 
 def test_rebatch_opt(knob_case):
-    """rebatch_opt true without a rebatch_opt_params block equals the default block:
-    same warm-up, same chosen cap, same outputs on the capped calls. rebatch_opt
+    """rebatch_opt true without a rebatch_opt_params block builds the class
+    defaults. Two decoders with the same block (min_pct 0) give the same warm-up,
+    the same chosen cap and the same outputs on the capped calls. rebatch_opt
     false builds no cap, with or without a block, and its outputs equal a
     decoder whose cap is None; the warm-up calls of the capped decoder match
     them too."""
@@ -344,7 +347,14 @@ def test_rebatch_opt(knob_case):
     def dec(**kw):
         return bp_py.create(_py_cfg("cuda-eager", **kw), bundle=bundle)
 
-    on, blk = dec(), dec(rebatch_opt_params=dict(DEFAULT_BLOCK))
+    none = dec().cap
+    assert isinstance(none, RebatchSpeedup) and none.min_pct == 50
+    assert none.min_speedup == 1.1
+    assert dec(rebatch_opt_params={"min_speedup": 1.5}).cap.min_speedup == 1.5
+    for k in ("kl_eps", "kl_window", "kl_min"):
+        assert getattr(none, k) == DEFAULT_BLOCK[k], k
+    on = dec(rebatch_opt_params=dict(DEFAULT_BLOCK))
+    blk = dec(rebatch_opt_params=dict(DEFAULT_BLOCK))
     off, off_blk = dec(rebatch_opt=False), dec(
         rebatch_opt=False, rebatch_opt_params=dict(DEFAULT_BLOCK)
     )

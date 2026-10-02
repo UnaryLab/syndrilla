@@ -77,18 +77,28 @@ class RebatchSpeedup:
     """Per-decoder iteration-speedup state: paces ``k`` by KL divergence then picks the cap."""
 
     def __init__(
-        self, kl_eps=1e-4, kl_window=3, kl_min=3, candidates=DEFAULT_CANDIDATES
+        self,
+        kl_eps=1e-4,
+        kl_window=3,
+        kl_min=3,
+        candidates=DEFAULT_CANDIDATES,
+        min_pct=50,
+        min_speedup=1.1,
     ):
         self.kl_eps = float(kl_eps)
         self.kl_window = int(kl_window)
         self.kl_min = int(kl_min)
         self.candidates = tuple(candidates) if candidates else DEFAULT_CANDIDATES
+        self.min_pct = int(min_pct)  # lowest percentile the chooser considers
+        self.min_speedup = float(min_speedup)  # below this projected gain, decline
         self.hists = []  # per-warm-up-batch iteration histograms
         self.pooled = None  # running pooled histogram over warm-up batches
         self.streak = 0  # consecutive settled (low-KL) batches
         self.batch_size = 0
-        self.frac = None  # P/100 once chosen; None while warming up
+        self.max_iter = None  # stop iteration of a shot that never converged
+        self.frac = None  # P/100 once chosen; None while warming up or declined
         self.pct = None
+        self.declined = None  # reason string once warm-up ends without a cap
 
     @classmethod
     def from_cfg(cls, decoding_cfg):
@@ -104,12 +114,13 @@ class RebatchSpeedup:
         if not knob(decoding_cfg, "rebatch_opt", True):
             return None
         cfg = decoding_cfg.get("rebatch_opt_params") or {}
-        keys = ("kl_eps", "kl_window", "kl_min", "candidates")
+        keys = ("kl_eps", "kl_window", "kl_min", "candidates", "min_pct", "min_speedup")
         return cls(**{k: cfg[k] for k in keys if k in cfg})
 
     @property
     def done(self):
-        return self.frac is not None
+        """Warm-up is over: a cap was chosen (``frac`` set) or declined (``frac`` None)."""
+        return self.frac is not None or self.declined is not None
 
     def observe(self, iter_tensor, max_iter, batch_size):
         """Record one warm-up batch's stop-iteration histogram and, once the pooled
@@ -132,6 +143,7 @@ class RebatchSpeedup:
                 .astype(np.float64)
             )
         self.hists.append(h)
+        self.max_iter = int(max_iter)
         self.batch_size = max(self.batch_size, int(batch_size))
         prev, self.pooled = self.pooled, (h if self.pooled is None else self.pooled + h)
         if prev is None:  # first batch: no predecessor for KL
@@ -151,11 +163,38 @@ class RebatchSpeedup:
             self._choose()
 
     def _choose(self):
-        best_p, best_sp = self.candidates[0], -1.0
+        """Pick the candidate percentile with the best projected speedup among
+        ``min_pct <= p <= floor(100 * (1 - f)) - 1``, where ``f`` is the pooled
+        fraction of shots that stopped at ``max_iter`` (never converged), so the
+        cap always lands below the converged share. With no candidate in range, or
+        a best projected speedup under ``min_speedup``, decline: warm-up ends
+        (``done``) with ``frac`` None, so BP runs uncapped."""
+        total = float(self.pooled.sum())
+        f = float(self.pooled[self.max_iter]) / total if total else 0.0
+        hi = int(np.floor(100.0 * (1.0 - f))) - 1
+        best_p, best_sp = None, -1.0
         for p in sorted(self.candidates):  # ascending: ties keep the higher cap
+            if not self.min_pct <= p <= hi:
+                continue
             sp = _projected_speedup(self.hists, p, self.batch_size)
             if sp == sp and sp >= best_sp:  # sp == sp filters NaN
                 best_sp, best_p = sp, p
+        if best_p is None:
+            self.declined = (
+                f"no candidate in p{self.min_pct}..p{hi} "
+                f"({100.0 * f:.1f}% of shots reach max_iter)"
+            )
+        elif best_sp < self.min_speedup:
+            self.declined = (
+                f"best projected speedup {best_sp:.2f}x (p{best_p}) "
+                f"under min_speedup {self.min_speedup:g}x"
+            )
+        if self.declined is not None:
+            logger.warning(
+                f"[rebatch_opt] warm-up done after {len(self.hists)} batches: "
+                f"cap off, {self.declined}"
+            )
+            return
         self.pct, self.frac = best_p, best_p / 100.0
         logger.success(
             f"[rebatch_opt] warm-up done after {len(self.hists)} batches: "

@@ -220,7 +220,7 @@ class create(torch.nn.Module):
 
         self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
-        self.cap_active_last = False  # set per forward: True if the cap was applied
+        self.cap_active_last = False  # set per forward: True if the cap stopped early
 
         # torch.compile of the iteration body, on by default, CUDA only; eager
         # fallback (one DEBUG line) on CPU or when dynamo/Triton is unavailable
@@ -372,10 +372,14 @@ class create(torch.nn.Module):
 
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
-        self.cap_active_last = bool(
-            self.cap is not None and self.cap.done and not self.cap_bypass
+        cap_applied = bool(
+            self.cap is not None
+            and self.cap.done
+            and self.cap.frac is not None
+            and not self.cap_bypass
         )
-        cap_frac = self.cap.frac if self.cap_active_last else None
+        cap_frac = self.cap.frac if cap_applied else None
+        cap_stopped = False
         hooked = type(self)._iter_hook is not create._iter_hook
         self._hook_rows = None
 
@@ -437,11 +441,11 @@ class create(torch.nn.Module):
 
             # adaptive cap: stop once >= cap_frac of the batch has converged; the
             # unconverged remainder (converge == 0) becomes main's deferred tail.
-            if (
-                cap_frac is not None
-                and int((num_iters != -1).sum()) >= cap_frac * B
-            ):
-                break
+            if cap_frac is not None:
+                n_conv = int((num_iters != -1).sum())
+                if n_conv >= cap_frac * B:
+                    cap_stopped = n_conv < B and self.i < self.max_iter
+                    break
 
             if hooked:
                 self._hook_rows = rows
@@ -490,6 +494,14 @@ class create(torch.nn.Module):
         l_out[dst] = l_v[checker]
         num_iters[dst] = self.i  # actual stop iter (== max_iter unless the cap broke early)
         self._exit_hook(l_out, e_out, num_iters, converges)
+        self.cap_active_last = cap_stopped
+        # rows main drops and decodes again: the unconverged rows of a batch the
+        # cap stopped before max_iter
+        defer = (
+            converges.flatten() == 0
+            if cap_stopped
+            else torch.zeros(B, dtype=torch.bool, device=self.device)
+        )
         e_out = e_out[:, :-1]
         l_out = l_out[:, :-1]
         self.batch_size = B
@@ -501,7 +513,13 @@ class create(torch.nn.Module):
         logger.info("Complete.")
         logger.info(f"Decoding iterations: <{(self.i)}>.")
         io_dict.update(
-            {"e_v": e_out, "iter": num_iters, "llr": l_out, "converge": converges}
+            {
+                "e_v": e_out,
+                "iter": num_iters,
+                "llr": l_out,
+                "converge": converges,
+                "defer": defer,
+            }
         )
         return io_dict
 

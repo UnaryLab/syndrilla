@@ -444,7 +444,10 @@ def main():
 
             cap_keep = None
             if cap_on and getattr(inner0, "cap_active_last", False):
-                keep = bt.converge_all[1].flatten() > 0
+                if "defer" in io_dict:
+                    keep = ~io_dict["defer"].flatten()
+                else:
+                    keep = bt.converge_all[1].flatten() > 0
                 queue.defer(~keep, err, llr0, synd, obs_flips)
                 cap_keep = keep.to(bt.e_all.device)
                 bt.keep_samples(cap_keep)

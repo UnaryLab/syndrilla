@@ -284,7 +284,8 @@ class create(torch.nn.Module):
         # adaptive cap: once warm-up has chosen a stop fraction, break this batch as
         # soon as that fraction has converged (unless main asked for an uncapped pass).
         self.cap_active_last = bool(
-            self.cap is not None and self.cap.done and not self.cap_bypass
+            self.cap is not None and self.cap.done and self.cap.frac is not None
+            and not self.cap_bypass
         )
         cap_frac = self.cap.frac if self.cap_active_last else None
 

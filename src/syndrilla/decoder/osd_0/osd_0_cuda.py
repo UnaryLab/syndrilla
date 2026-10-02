@@ -284,9 +284,21 @@ class create(nn.Module):
             else torch.zeros(B, dtype=torch.long, device=dev)
         )
 
-        idx = (converge == 0).nonzero(as_tuple=True)[0].to(dev)
-        # samples OSD decodes: all of them without osd_skip_converged
-        run = idx if self.osd_skip_converged else torch.arange(B, device=dev)
+        # rows marked in io_dict["defer"] are re-decoded by the batch loop, OSD skips them
+        defer = (
+            io_dict["defer"].to(device=converge.device, dtype=torch.bool)
+            if "defer" in io_dict
+            else None
+        )
+        nc = converge == 0 if defer is None else (converge == 0) & ~defer
+        idx = nc.nonzero(as_tuple=True)[0].to(dev)
+        # samples OSD decodes: all non-deferred ones without osd_skip_converged
+        if self.osd_skip_converged:
+            run = idx
+        elif defer is None:
+            run = torch.arange(B, device=dev)
+        else:
+            run = (~defer).nonzero(as_tuple=True)[0].to(dev)
         if run.numel() > 0:
             llr_sub = io_dict["llr"].to(dtype=self.dtype, device=dev)[run]
             synd_sub = io_dict["synd"].to(device=dev)[run]
@@ -316,7 +328,7 @@ class create(nn.Module):
                     last = max(last, self.last_pivot_pos)
                 self.scan_stats, self.last_pivot_pos = stats, last
                 logger.debug("osd_0_cuda: (order width, samples solved): {}", stages)
-            e_v[idx] = e_sub if self.osd_skip_converged else e_sub[idx]
+            e_v[idx] = e_sub if self.osd_skip_converged else e_sub[nc.to(dev)[run]]
             iter_out = iter_out.to(dev)
             iter_out[idx] = self.num_max_iter
 
@@ -324,7 +336,9 @@ class create(nn.Module):
             {
                 "e_v": e_v,
                 "iter": iter_out,
-                "converge": torch.ones_like(converge),
+                "converge": torch.ones_like(converge)
+                if defer is None
+                else torch.where(defer, converge, torch.ones_like(converge)),
             }
         )
         return io_dict

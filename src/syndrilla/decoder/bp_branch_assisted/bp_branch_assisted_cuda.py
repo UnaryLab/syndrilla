@@ -101,7 +101,8 @@ class create(_BranchPy):
 
         cap = getattr(self, "cap", None)
         self.cap_active_last = bool(
-            cap is not None and cap.done and not getattr(self, "cap_bypass", False)
+            cap is not None and cap.done and cap.frac is not None
+            and not getattr(self, "cap_bypass", False)
         )
         cap_frac = cap.frac if self.cap_active_last else None
 
