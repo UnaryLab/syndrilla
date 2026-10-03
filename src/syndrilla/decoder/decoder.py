@@ -292,6 +292,9 @@ MOVED_TO_CONFIG = (
     "alpha",
     "alpha_scaling",
     "type",
+    # bp_lottery
+    "flip_start_iter",
+    "flip_interval",
 )
 
 # The other half of the same rule: these stay at the top of the block, so a `config`

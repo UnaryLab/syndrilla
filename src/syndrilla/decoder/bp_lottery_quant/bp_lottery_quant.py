@@ -3,6 +3,7 @@ import torch
 from syndrilla.decoder.bp_lottery.bp_lottery import (
     create as _LotteryPy,
     flip_rows,
+    is_flip_iter,
     rand_rows,
     vn_unsat_count,
 )
@@ -21,6 +22,7 @@ class create(_LotteryPy, _QuantPy):
     Accepts every bp_norm_min_sum_quant key plus
         random_machine: 'sobol' (default) | 'system'   RNG for the flip pick
         flip_start_iter: int (default 4)                 flips start after this iteration
+        flip_interval: int >= 1 (default 1)              iterations between flips
     """
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
@@ -28,10 +30,10 @@ class create(_LotteryPy, _QuantPy):
         self.algo = "bp_lottery_quant"
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
-        """Sign-flip at the end of iteration i > flip_start_iter on the
+        """Sign-flip at the end of each flip iteration i (is_flip_iter) on the
         unconverged rows; the next iteration reads the flipped l_v. e_v may be in
         the decoder dtype or uint8 (CUDA port)."""
-        if i <= self.flip_start_iter:
+        if not is_flip_iter(self, i):
             return
         self.i = i
         e_b = (e_v != 0).to(torch.uint8)
