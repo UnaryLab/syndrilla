@@ -624,6 +624,7 @@ class MetricState:
         check_num,
         done=0,
         target_batch=None,
+        seed=None,
     ):
         """
         Saves decoding metrics for all decoders into a single YAML file.
@@ -781,6 +782,7 @@ class MetricState:
             "batch count": num_batches,
             "target error": target_error,
             "target batch": target_batch,
+            "seed": seed,
             "target error reached": error_reach,
             "data type": dtype,
             "physical error rate": physical_error_rate,
@@ -892,7 +894,17 @@ class MetricState:
                 float(entry["average time per sample (s)"]) * sc
             )
             state.average_iter[idx] = float(entry["average iteration"]) * sc
-            state.distribution[idx] = torch.tensor(entry["iteration distribution"], dtype=torch.float64)
+            # "iteration count" is the raw histogram; a final yaml's "iteration
+            # distribution" holds percentiles instead
+            hist = entry.get("iteration count", entry["iteration distribution"])
+            if sum(hist) != sc:
+                # an old final yaml without "iteration count" has only percentiles
+                logger.warning(
+                    f"{key}: the saved iteration histogram sums to {sum(hist)}, not the "
+                    f"sample count {sc:g}; the resumed histogram starts from zeros."
+                )
+                hist = [0] * len(hist)
+            state.distribution[idx] = torch.tensor(hist, dtype=torch.float64)
             state.average_time_sample_iter[idx] = (
                 float(entry["average time per iteration (s)"]) * sc
             )

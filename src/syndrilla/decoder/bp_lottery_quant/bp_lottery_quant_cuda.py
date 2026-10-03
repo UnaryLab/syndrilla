@@ -16,6 +16,7 @@ class create(_LotteryCuda, _QuantCuda):
 
     Accepts every bp_norm_min_sum_quant_cuda key plus
         random_machine : 'sobol' (default) | 'system'   RNG for the flip pick
+        flip_start_iter: int (default 4)                 flips start after this iteration
     """
 
     sign_flip = _LotteryQuantPy.sign_flip
@@ -26,10 +27,13 @@ class create(_LotteryCuda, _QuantCuda):
         logger.info("bp_lottery_quant_cuda ready (per-step path + sign-flip).")
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
-        """The bp_lottery_quant flip on the unconverged rows. With random_machine
-        system, a call with no unconverged row returns before drawing (one host
-        sync per call), so the global RNG advances as if the loop had stopped when
-        the last row converged."""
+        """The bp_lottery_quant flip on the unconverged rows after iteration
+        flip_start_iter. With random_machine system, a call with no unconverged
+        row returns before drawing (one host sync per call); forward() makes the
+        one draw the PyTorch path makes at the iteration where the last rows
+        converge."""
+        if i <= self.flip_start_iter:
+            return
         if self.random_machine == "system" and not active.any():
             return
         _LotteryQuantPy._iter_hook(self, i, l_v, e_v, active, syndrome)

@@ -109,6 +109,39 @@ Following is a table for detailed explaination on each command line arguments:
 | `-t`     | Train the decoder instead of decoding        | `-t`                                              |
 | `-tr`    | Path to training YAML file                   | `-tr=examples/alist/train_saq_hx.training.yaml`   |
 | `-tckpt` | Path to a run's `*_last.pt`, to resume training; given alongside the same run's `-ckpt` | `-tckpt=tests/test_outputs/saq_hx_n41_last.pt` |
+| `--save-interval` | Batches between result saves, at least `100`, default `100` | `--save-interval=100` |
+| `--seed` | Seed for decoding, so the same seed and flags draw the same shots; recorded as `seed` in the result YAML; default unseeded; with `-ckpt` the run seeds with a mixed seed derived from the base seed and the checkpoint's `batch count`, so it draws new shots on CPU and CUDA, using the checkpoint's `seed` when `--seed` is not given; ignored with `-t` | `--seed=0` |
+
+To decode on several GPUs at once, ```syndrilla-parallel``` has three subcommands, and a call without one prints them: ```run``` (one launch, below), ```sweep-gen``` and ```sweep``` (see [Sweep configurations](#5-sweep-configurations)). ```syndrilla-parallel run``` runs one or more ```syndrilla``` processes (workers) per GPU and passes every flag it does not define, except ```-ckpt``` and the training flags, to each worker unchanged. Worker j on GPU g writes to ```<-r>/gpu<g>_w<j>/```. The decoding YAML should set ```device_type: cuda``` with ```device_idx: 0```; with ```device_type: cpu```, the launch runs as one worker in ```<-r>/cpu_w0/``` with no ```CUDA_VISIBLE_DEVICES``` set, the probe included, and ```--gpus``` and ```--workers-per-gpu``` are ignored with a note:
+
+```command
+syndrilla-parallel run --gpus 0 1 -r=tests/test_outputs/multi -te=1000 -d=... -i=... -e=... -s=... -bs=10000
+```
+
+| Argument | Subcommands | Description |
+|----------|-------------|-------------|
+| `-r`     | all | `run`: parent run directory; `sweep-gen` and `sweep`: sweep directory; required |
+| `--gpus` | `run`, `sweep` | GPU indices as torch numbers them (positions in `CUDA_VISIBLE_DEVICES` when it is set); default every visible GPU |
+| `--workers-per-gpu` | `run`, `sweep` | Workers per GPU, default `1` |
+| `-te`    | `run`, `sweep` | Pooled number of logical errors to stop at, split over workers when given alone; default `1000` unless `-tb` is given |
+| `-tb`    | `run`, `sweep` | Pooled number of batches to stop at, split over workers when given alone; with `-te`, the run stops at whichever is reached first |
+| `--save-interval` | `run`, `sweep` | Batches between a worker's result saves, at least `100`, passed to every worker when given; default the worker's own, `100` |
+| `--poll-interval` | `run`, `sweep` | Seconds between reads of the worker result YAMLs; default `60` |
+| `--seed` | `run`, `sweep` | Base seed; in `run`, worker k gets `--seed=<seed+k>`; in `sweep`, see below; default unseeded |
+| `--no-probe` | `run`, `sweep` | Skip the probe decode run |
+| `--dry-run` | `run`, `sweep` | Print the commands, then exit without launching; `run` prints the probe line (unless `--no-probe`) and one line per worker with its environment and command; `sweep` prints, for each point to launch, its label and one line per worker with its GPU slot and command (no probe, no environment), and one line per point already done |
+| `-c` | `sweep-gen` | Sweeping configs YAML, required |
+| `--force` | `sweep-gen` | Rewrite the config YAMLs of point folders that already hold a result YAML; the results are kept |
+| `--gpus-per-point` | `sweep` | GPUs per point, one worker on each; default `1` |
+| `--fail-fast` | `sweep` | Stop the sweep at the first failed point |
+
+With only one of ```-te``` and ```-tb```, each worker decodes its share of that target: the shares differ by at most one and add up to the target, and the target must be at least the number of workers. A lone ```-tb``` ends exactly at it; a lone ```-te``` ends at or above it, each worker stopping at its own share.
+With both, the targets are pooled. Every worker gets the full ```-tb```, so a worker's own stop acts only as a safety net. The launcher reads every worker's result YAML each ```--poll-interval``` seconds (a worker saves it every ```--save-interval``` batches), and once the pooled logical errors reach ```-te``` or the pooled batches reach ```-tb```, whichever comes first, it sends SIGTERM to all workers; each then finishes its current batch and saves. The pooled totals end at or above the target: since the counts are read from the saved YAMLs, each worker can run past it by about ```--save-interval``` batches, plus the batches it decodes during one poll interval, plus the batch in flight and the drain of its deferred queue at SIGTERM. A worker that reaches its own target first exits and the others continue.
+Workers run in their own session, so a Ctrl-C in the terminal reaches only the launcher, which sends SIGTERM to every worker, waits for each to save, and exits with status 1 without merging. While it waits, the launcher prints one line per poll in which a YAML changed, with the pooled shots, logical errors, logical error rate and its 95% Wilson interval, pooled shots per second, and the projected seconds to the target.
+
+Before any worker dir is created, the launcher decodes one batch (```-tb=1```) at the given ```-bs``` with the same flags on the first worker's GPU, in a scratch dir under ```-r``` that is removed afterwards. A bad YAML, a decoder that is not on cuda, or an out-of-memory error of one worker at that ```-bs``` then fails in seconds with the last lines of that run's log, and the torch extension cache is built once before the workers start. The probe does not catch memory pressure from several workers sharing a GPU (```--workers-per-gpu``` above 1). A failed probe removes ```-r``` again if the launcher created it, so ```-r``` is left as it was; if ```-r``` existed before, the scratch dir is kept and the launcher prints the path of its ```probe.log```. ```--no-probe``` skips the probe.
+
+A rerun of the same command resumes: each worker dir that already holds a result YAML passes it to its worker as ```-ckpt```, so a stopped launch continues. A resume needs the same ```-te```/```-tb```, ```--gpus``` and ```--workers-per-gpu```; otherwise the launcher exits before starting any worker. A ```-r``` that holds a result YAML but no ```launch.yaml``` and no worker dir, as a single ```syndrilla``` run leaves it, is refused with the ```syndrilla -ckpt``` command that resumes it. The targets of a launch are kept in ```<-r>/launch.yaml```, written before the workers start. A failed or interrupted launch leaves no merged or pooled YAML behind (the worker YAMLs stay, and a rerun resumes and rewrites them). When all workers finish, ```<-r>/merged_result.yaml``` holds the pooled shots, logical errors, logical error rate with its 95% Wilson interval, throughput, the resumed workers, the stop rule that fired (```pooled -te```, ```pooled -tb```, or ```worker targets``` when every worker reached its own target) with the pooled values the launcher read at that moment, the workers that saved no result YAML (left out of the pool), and one row per worker, and ```<-r>/result_phy_err_<rate>.yaml``` holds the pooled result in the single-run result YAML layout (a comment at its top lists what is pooled).
 
 #### Training a learned decoder (`-t`)
 Besides the fixed decoding algorithms above, Syndrilla supports AI decoder models, which learn their parameters from data (currently ```saq```).
@@ -375,7 +408,7 @@ This module does not take any YAML file as inputs, it will report default metric
 The result YAML file will be saved to the path specified by the ```-r``` option. 
 In the example above, the result YAML file can be found in the ```tests/test_outputs``` folder.
 This file includes both the metric results for each decoder and a summary of the full decoding.
-Additionally, the result YAML file is updated every 100 batches, allowing Syndrilla to resume the simulation from the last checkpoint if the error budget was not reached in the previous run.
+Additionally, the result YAML file is updated every ```--save-interval``` batches (default 100), and a run sent SIGTERM stops after the current batch and saves its result YAML, allowing Syndrilla to resume the simulation from the last checkpoint if the error budget was not reached in the previous run.
 
 Example output of a run like the one above, abridged:
 
@@ -475,6 +508,7 @@ The following table provides a detailed explanation of the metrics in the output
 | `target error`                 | Total number of errors to stop decoding                        |
 | `target batch`                 | Batch budget the run was given with `-tb`, `null` under an error target |
 | `target error reached`         | Actual number of logical errors observed                       |
+| `seed`                         | Seed given with `--seed` or kept from the `-ckpt` checkpoint, `null` when unseeded |
 | `data type`                    | Floating point data used                                       |
 | `physical error rate`          | Physical error rate                                            |
 | `logical error rate`           | Logical error rate of the final decoder in the chain across all samples |
@@ -503,14 +537,15 @@ syndrilla -r=tests/test_outputs
 A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to the run's ```*_result.yaml``` and ```-tckpt``` to its ```*_last.pt```, with every other flag left as it was; either flag without the other is refused, as is a resume under a different selection metric. See [Trainer module](docs/trainer.md).
 
 ### 5. Sweep configurations
-Syndrilla also allows sweeping configurations during simulation, which is done in the ```zoo``` folder.
-To generate all the configurations in the zoo directory, user can use the ```generate_sweeping_configs.py``` script. 
+```syndrilla-parallel sweep-gen``` writes one point folder per configuration, and ```syndrilla-parallel sweep``` runs every point folder as one ```syndrilla-parallel run``` launch.
+Run both from the repository root: the templates and the matrix paths in the generated YAMLs are relative to it (```examples/alist/```).
 
 ```command
-python zoo/script/generate_sweeping_configs.py 
+syndrilla-parallel sweep-gen -c zoo/script/sweeping_configs.yaml -r zoo/bposd_quant_sweeping
+syndrilla-parallel sweep -r zoo/bposd_quant_sweeping -te=1000 -bs=10000 -l=SUCCESS
 ```
 
-The configurations to sweep are specified in the ```sweeping_configs.yaml``` file.
+The configurations to sweep are specified in a sweeping configs YAML file.
 It allows specifying decoder (decoder algorithm), code (code type), probability (physical error rate), check_type (check type), distance (code distance), and dtype (data type).
 Below is an example:
 
@@ -527,22 +562,14 @@ This file lives at ```zoo/script/sweeping_configs.yaml```; it ships with the wid
 
 *Note that currently supported data format includes ['bfloat16', 'float16', 'float32', 'float64'].*
 
-Once all configurations are prepared, you can see the corresponding folders in the ```zoo```, and you can now sweep the simulation using the ```run_sweeping.py``` script. 
-This command will generate a corresponding result YAML file within each configuration folder.
-Moreover, if a result YAML file already exists and simulation is terminated by accident, running the script again will, by default, automatically resume from the checkpoint, where the simulated is terminated.
+```sweep-gen``` writes one folder per combination directly under ```-r```, named ```<code>_<check_type>_<probability>_<distance>_<dtype>```, holding ```<decoder>_<check_type>.decoding.yaml```, ```bsc.error.yaml```, ```lx.check.yaml``` (```hx```) or ```lz.check.yaml``` (```hz```), ```perfect.syndrome.yaml``` and ```matrix.yaml```. The ```max_iter``` of the decoding YAML is set from the distance. If a point folder already holds a result YAML, ```sweep-gen``` writes nothing and exits, unless ```--force``` is given, which rewrites the config YAMLs and keeps the results.
+```python zoo/script/generate_sweeping_configs.py``` does the same from ```zoo/script/sweeping_configs.yaml```, writing the points of each decoder to ```zoo/<decoder>_sweeping/```, or all points to ```zoo/<-r>/``` with ```-r```. A point folder holds one decoding YAML, so both refuse a sweep dir given more than one decoder.
 
-```command
-python zoo/script/run_sweeping.py -r=zoo/bposd_sweeping/ -d=bposd
-```
+```sweep``` takes every folder under ```-r``` that holds a ```*.decoding.yaml``` as a point, in sorted name order, and takes ```-d```, ```-e```, ```-c```, ```-s``` and ```-m``` from the point folder's ```*.decoding.yaml```, ```*.error.yaml```, ```*.check.yaml```, ```*.syndrome.yaml``` and ```matrix.yaml```, each of which must match exactly one file; giving any of them, or ```-i```, on the command line is refused. Every other ```run``` flag applies to each point, and unknown flags are passed to every worker. Each point folder is launched exactly like ```run``` with ```-r``` set to that folder: probe, ```launch.yaml```, worker dirs, pooled stop, ```merged_result.yaml``` and the pooled ```result_phy_err_<rate>.yaml```, resume and refusals all work per folder. Every point is planned before the first one starts, so a refusal in any folder stops the sweep before it runs anything.
 
-There are command line arguments to control the script, allowing you to specify the configuration path, select the decoder, define batch sizes, and adjust logging verbosity.
-| Argument | Description                                  | Example                                           |
-|----------|----------------------------------------------|---------------------------------------------------|
-| `-r`     | Path to configuration folder                 | `-r=zoo/bposd_sweeping/`                          |
-| `-d`     | Decoder algorithm to run                     | `-d=bposd`                                        |
-| `-bs`    | Number of samples run each batch             | `-bs=10000`                                       |
-| `-st`    | Syndrome type used for the sweep             | `-st=perfect`                                     |
-| `-l`     | Level of logger                              | `-l=SUCCESS`                                      |
+Points form a queue. A point starts when ```--gpus-per-point``` (k) GPUs each have a free slot, with ```--workers-per-gpu``` slots per GPU, and runs one worker on each of those k GPUs, in worker dirs ```gpu0_w0``` to ```gpu<k-1>_w0``` (the point's GPU slots; ```merged_result.yaml``` lists each worker's physical ```device```). A k above the number of GPUs is refused, and so is a k that differs from the one a started point folder was run with. With ```--seed b```, worker j of point i (in sorted order) gets ```--seed=<b + i*k + j>```. Seeds come from each folder's position in sorted order, so they stay the same across resumes only while the set of point folders is unchanged.
+
+When a point fails (its probe, a worker, or its merge), the sweep goes on with the other points, lists the failed points at the end, and exits with status 1. With ```--fail-fast```, it instead sends SIGTERM to the running points, which save their result YAMLs, starts no further point, and exits with status 1. A Ctrl-C, or any error in the launcher, stops every started worker the same way. In every case ```sweep``` writes ```<-r>/sweep_results.csv``` with one row per point: ```folder```, ```code```, ```check_type```, ```p```, ```d```, ```dtype```, ```shots```, ```fails```, ```LER```, ```Wilson low```, ```Wilson high``` (95% Wilson interval), ```wall s``` (this launch) and ```status``` (```done```, ```failed```, ```stopped``` or ```not run```); a ```stopped``` row holds the counts of the worker YAMLs saved so far. A rerun of the same command skips each point folder that holds ```merged_result.yaml``` (its row is rebuilt from that file, which is kept) and resumes the other point folders.
 
 ## Simulation results
 We show some of the simulation results as below.
@@ -627,7 +654,7 @@ If you use Syndrilla in your research, please cite the following papers:
 ```
 
 ## Contribution
-We warmly welcome contributions to Syndrilla — just open a pull request!
+We warmly welcome contributions to Syndrilla, just open a pull request!
 
 ## License
 Syndrilla is released under the MIT License. See [LICENSE](LICENSE) for the full text.

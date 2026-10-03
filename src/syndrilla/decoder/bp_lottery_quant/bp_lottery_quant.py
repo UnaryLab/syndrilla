@@ -14,11 +14,13 @@ from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant import (
 class create(_LotteryPy, _QuantPy):
     """
     Quantized lottery BP: bp_norm_min_sum_quant (rounding, eager or compiled step,
-    row compaction) with the quantized lottery sign-flip in _iter_hook every
-    iteration. The Sobol value of iteration i is fp2fxp(r[i - 1]).
+    row compaction) with the quantized lottery sign-flip in _iter_hook from
+    iteration flip_start_iter + 1 on. The Sobol value of iteration i is
+    fp2fxp(r[i - 1]).
 
     Accepts every bp_norm_min_sum_quant key plus
         random_machine: 'sobol' (default) | 'system'   RNG for the flip pick
+        flip_start_iter: int (default 4)                 flips start after this iteration
     """
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
@@ -26,9 +28,11 @@ class create(_LotteryPy, _QuantPy):
         self.algo = "bp_lottery_quant"
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
-        """Sign-flip at the end of every iteration i on the unconverged rows; the
-        next iteration reads the flipped l_v. e_v may be in the decoder dtype or
-        uint8 (CUDA port)."""
+        """Sign-flip at the end of iteration i > flip_start_iter on the
+        unconverged rows; the next iteration reads the flipped l_v. e_v may be in
+        the decoder dtype or uint8 (CUDA port)."""
+        if i <= self.flip_start_iter:
+            return
         self.i = i
         e_b = (e_v != 0).to(torch.uint8)
         s_est = (e_b[:, self.V_c_col].sum(dim=2, dtype=torch.uint8) & 1).to(self.dtype)

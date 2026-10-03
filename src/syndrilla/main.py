@@ -1,4 +1,7 @@
 import argparse
+import random
+import signal
+import threading
 import time
 
 import pyfiglet
@@ -28,12 +31,34 @@ def _sync(device):
         torch.mps.synchronize()
 
 
+def _splitmix64(x):
+    m = 2**64 - 1
+    z = ((x & m) + 0x9E3779B97F4A7C15) & m
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & m
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & m
+    return z ^ (z >> 31)
+
+
+def resume_seed(base, n):
+    """Seed for a run resumed at batch count n: base when n is 0, else
+    splitmix64(splitmix64(base) + n), kept below 2^63.
+
+    Base and n are mixed separately, so (base, n) and (base + 1, n - 1) give
+    different seeds, and the mix changes the low 32 bits, which is all torch's
+    CPU generator keeps.
+    """
+    if n == 0:
+        return base
+    return _splitmix64(_splitmix64(base) + n) & (2**63 - 1)
+
+
 def parse_commandline_args():
     """
     parse command line inputs
     """
     parser = argparse.ArgumentParser(
-        description="A PyTorch-based numerical simulator for decoders in quantum error correction."
+        description="A PyTorch-based numerical simulator for decoders in quantum error correction.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "-r",
@@ -115,6 +140,18 @@ def parse_commandline_args():
     )
 
     parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=100,
+        help="Batches between result saves, at least 100. Default 100.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed torch before decoding, so a run with the same seed and flags draws the same shots. Default unseeded. With -ckpt, the run seeds with a mixed seed derived from the base seed and the checkpoint's batch count, so it draws new shots on CPU and CUDA; a resume without --seed uses the checkpoint's seed, and a given --seed wins over it. Ignored with -t, which seeds from the training yaml.",
+    )
+    parser.add_argument(
         "-tckpt",
         "--train_checkpoint",
         type=str,
@@ -122,10 +159,25 @@ def parse_commandline_args():
         help="Path to a run's *.pt, to continue that run where it stopped.",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.save_interval < 100:
+        parser.error(f"--save-interval must be at least 100, got {args.save_interval}")
+    return args
 
 
 def main():
+    """Run syndrilla, putting back this process's SIGTERM handler when it returns or raises."""
+    in_main_thread = threading.current_thread() is threading.main_thread()
+    prev = signal.getsignal(signal.SIGTERM) if in_main_thread else None
+    try:
+        _main(in_main_thread)
+    finally:
+        if in_main_thread:
+            # getsignal gives None for a handler not set from python
+            signal.signal(signal.SIGTERM, signal.SIG_DFL if prev is None else prev)
+
+
+def _main(in_main_thread):
     args = parse_commandline_args()
 
     # set up output log: the same trace either mode writes, every module in it
@@ -196,6 +248,32 @@ def main():
             training_cfg.get("budget"), args.run_dir, args.training_yaml
         )
         torch.manual_seed(metrics.cfg["error_random_seed"])
+        if args.seed is not None:
+            logger.warning(
+                f"--seed <{args.seed}> is ignored with -t; training seeds from the "
+                f"training yaml's error_random_seed."
+            )
+    else:
+        seed = args.seed
+        if args.checkpoint_yaml is not None:
+            # a resume without --seed keeps the checkpoint's seed; a seeded resume
+            # seeds with resume_seed(seed, batch count), so it draws new shots on
+            # CPU and CUDA
+            ckpt_full = read_yaml(get_path(args.checkpoint_yaml))["decoder_full"]
+            ckpt_seed = ckpt_full.get("seed")
+            if args.seed is None:
+                args.seed = ckpt_seed
+            elif args.seed != ckpt_seed:
+                logger.warning(
+                    f"--seed <{args.seed}> differs from the checkpoint's seed "
+                    f"<{ckpt_seed}>; resuming with seed <{args.seed}>."
+                )
+            if args.seed is not None:
+                seed = resume_seed(args.seed, int(ckpt_full.get("batch count", 0)))
+        if seed is not None:
+            logger.info(f"Seeding torch and python random with {seed}.")
+            torch.manual_seed(seed)  # seeds the CPU and every CUDA generator
+            random.seed(seed)  # bp_sf samples flip candidates with python random
 
     if args.interface_yaml is not None:
         logger.success(
@@ -346,8 +424,22 @@ def main():
     # a -tb run has no error target, so only max_batches ends it
     error_budget = float("inf") if args.target_error is None else args.target_error
 
+    # SIGTERM only sets a flag (logging inside a signal handler can deadlock);
+    # budget_left then ends the run, which drains the deferred queue and saves
+    # (only the main thread can set a signal handler; main() puts the old one back)
+    stop = {"requested": False, "logged": False}
+    if in_main_thread:
+        signal.signal(signal.SIGTERM, lambda *_: stop.update(requested=True))
+
     def budget_left():
         """Is there room to generate a fresh batch under this run's stop condition?"""
+        if stop["requested"]:
+            if not stop["logged"]:
+                stop["logged"] = True
+                logger.warning(
+                    f"SIGTERM received at batch {num_batches}; stopping and saving the final result."
+                )
+            return False
         return num_batches < max_batches and num_err <= error_budget
 
     # a periodic save waits until the deferred queue is drained, so a checkpoint
@@ -496,7 +588,7 @@ def main():
                 )
                 metrics.update_metric(i, batch_result)
 
-            if not use_extra and num_batches % 100 == 0:
+            if not use_extra and num_batches % args.save_interval == 0:
                 save_due = True
 
         if use_extra:  # measure density from the FIRST extra batch, then freeze
@@ -520,6 +612,7 @@ def main():
                 H_file_name,
                 check_num,
                 target_batch=args.target_batch,
+                seed=args.seed,
             )
             logger.success(f"Saved log to <{output_log}>.")
             logger.success(f"Saved metric results to <{args.run_dir}>.")
@@ -548,6 +641,7 @@ def main():
         check_num,
         1,
         target_batch=args.target_batch,
+        seed=args.seed,
     )
     logger.success(f"Saved log to <{output_log}>.")
     logger.success(f"Saved metric results to <{args.run_dir}>.")

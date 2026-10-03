@@ -45,9 +45,8 @@ class create(_NmsPy):
 
     Accepts every bp_norm_min_sum key plus
         random_machine: 'sobol' (default) | 'system'   RNG for the flip pick
+        flip_start_iter: int (default 4)                 flips start after this iteration
     """
-
-    flip_start_iter = 4
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__(decoding_cfg, **kwargs)
@@ -58,6 +57,7 @@ class create(_NmsPy):
                 f"Invalid input machine type <{self.random_machine}>, default to <sobol>."
             )
             self.random_machine = "sobol"
+        self.flip_start_iter = int(decoding_cfg.get("flip_start_iter", 4))
 
         self.algo = "bp_lottery"
 
@@ -82,6 +82,12 @@ class create(_NmsPy):
         self._active = active
         self.sign_flip_cn_rand_new(syndrome, self.syndrome_estimation(e_v), l_v)
 
+    def _draw_r(self, n):
+        """[n] uniform draws for the flip pick, one per hook row."""
+        if self.random_machine.lower() == "system":
+            return rand_rows(self, n)
+        return self.r[(self.i - 1)].repeat(n)  # sobol
+
     def sign_flip_cn_rand_new(self, syndrome, s_est, l_v):
         # Syndrome Residual
         synd_diff = (syndrome + s_est) % 2.0  # [B, M]
@@ -93,10 +99,7 @@ class create(_NmsPy):
         valid_mask = total_unsat > 0
 
         # random selection setup
-        if self.random_machine.lower() == "system":
-            r = rand_rows(self, batch_size)
-        else:  # sobol
-            r = self.r[(self.i - 1)].repeat(batch_size)
+        r = self._draw_r(batch_size)
 
         total_unsat_safe = total_unsat + (total_unsat == 0).float()
 
