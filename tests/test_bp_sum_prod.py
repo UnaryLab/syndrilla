@@ -72,6 +72,22 @@ def test_bp_sum_prod_recovers_weight1():
     assert _weight1_exact_match('examples/alist/bp_sum_prod_hx.decoding.yaml') == 1.0
 
 
+def test_bp_sum_prod_float32_saturated_priors_are_finite():
+    torch.manual_seed(0)
+    cfg = read_yaml(get_path('examples/alist/bp_sum_prod_hx.decoding.yaml'))['decoding']
+    cfg['dtype'] = 'float32'
+    cfg['config']['max_iter'] = 5
+    matrix_cfg = read_yaml(get_path('examples/alist/surface_10.matrix.yaml'))['matrix']
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(cfg))
+    decoder = create_decoder(cfg=cfg, bundle=bundle)[0]
+    H = bundle.select('hx')[3].to_dense().to(torch.float32)
+    errors = torch.randint(0, 2, (4, H.shape[1])).to(torch.float32)
+    synd = torch.remainder(errors @ H.t(), 2.0)
+    llr0 = (1.0 - 2.0 * errors) * 40.0
+    out = decoder({'synd': synd, 'llr0': llr0})
+    assert torch.isfinite(out['llr']).all()
+
+
 if __name__ == '__main__':
     batch_size = 200
     target_error = 10

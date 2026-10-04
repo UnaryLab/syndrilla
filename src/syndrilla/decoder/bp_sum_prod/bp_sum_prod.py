@@ -5,9 +5,6 @@ from loguru import logger
 
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _NmsPy
 
-# small constant to keep probabilities away from 0/1 (avoids inf in the prob<->llr maps)
-EPS = 1e-12
-
 
 def _loo_prod(t):
     """Leave-one-out product along dim=2 via exclusive prefix * suffix products."""
@@ -22,11 +19,13 @@ def _loo_prod(t):
 def _cn_q(a, syndrome_odd):
     """Check-node probability Q = (1 - (1 - 2 s_j) * prod_{k!=i} t_k) / 2 on the
     [batch, n_checks, degree] v->c LLRs `a`, with t = 1 - 2 sigmoid(-a), both
-    probabilities clamped to [EPS, 1 - EPS]. Overwrites `a`."""
-    t = a.neg_().sigmoid_().clamp_(EPS, 1.0 - EPS).mul_(-2.0).add_(1.0)
+    probabilities clamped to [eps, 1 - eps], where eps is the dtype epsilon.
+    Overwrites `a`."""
+    eps = torch.finfo(a.dtype).eps
+    t = a.neg_().sigmoid_().clamp_(eps, 1.0 - eps).mul_(-2.0).add_(1.0)
     t_excl = _loo_prod(t)
     q = torch.where(syndrome_odd, t_excl, -t_excl)
-    return q.add_(1.0).div_(2.0).clamp_(EPS, 1.0 - EPS)
+    return q.add_(1.0).div_(2.0).clamp_(eps, 1.0 - eps)
 
 
 def _step(l_v, c2v_prev, u_init, syndrome_odd, beta, col, vn_adj, mask_dummy):

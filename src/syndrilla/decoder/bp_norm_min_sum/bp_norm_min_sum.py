@@ -588,7 +588,7 @@ class create(torch.nn.Module):
         else:
             return torch.sub(l_v_v2c, b_c2v, out=l_v_v2c)
 
-    def cn_update(self, a_v2c, syndrome_odd, out):
+    def cn_update(self, a_v2c, syndrome_odd, out, beta=None):
         """Check-node update (normalized min-sum): produce the c->v messages b_c2v.
 
         Each message has magnitude beta * (minimum |a_v2c| over the other edges of
@@ -596,11 +596,13 @@ class create(torch.nn.Module):
         message is negative when the edge's own sign bit, the parity of negative
         inputs on the check and the syndrome bit XOR to 1. Dummy slots are set to 0.
         Overwrites `a_v2c` with |a_v2c|. Writes into and returns `out`, which must
-        not alias `a_v2c`. With cn_sign_parity False, runs _cn_update_topk.
+        not alias `a_v2c`. With cn_sign_parity False, runs _cn_update_topk;
+        beta defaults to the current iteration's normalization.
         """
-        base = torch.tensor(2.0, dtype=self.dtype)
-        exponent = torch.tensor(-(self.i), dtype=self.dtype)
-        beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
+        if beta is None:
+            base = torch.tensor(2.0, dtype=self.dtype)
+            exponent = torch.tensor(-(self.i), dtype=self.dtype)
+            beta = torch.tensor(1.0, dtype=self.dtype) - torch.pow(base, exponent)
         if not self.cn_sign_parity:
             return self._cn_update_topk(a_v2c, syndrome_odd, out, beta)
 
