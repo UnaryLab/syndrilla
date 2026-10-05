@@ -5,6 +5,8 @@ from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import create as _Ba
 from syndrilla.decoder.bp_lottery.bp_lottery import (
     cn_row_mask,
     flip_rows,
+    is_flip_iter,
+    read_flip_interval,
     vn_unsat_count,
 )
 
@@ -16,6 +18,7 @@ class create(_BaseCuda):
     Accepts every bp_norm_min_sum_cuda key plus the lottery knobs:
         random_machine : 'sobol' (default) | 'system'   RNG for the flip pick
         flip_start_iter: int (default 4)                 flips start after this iteration
+        flip_interval  : int >= 1 (default 1)            iterations between flips
     """
 
     # forward() makes the PyTorch path's last system draw from the global RNG
@@ -32,17 +35,19 @@ class create(_BaseCuda):
             )
             self.random_machine = "sobol"
         self.flip_start_iter = int(decoding_cfg.get("flip_start_iter", 4))
+        self.flip_interval = read_flip_interval(decoding_cfg)
 
         self.algo = "bp_lottery"
         logger.info("bp_lottery_cuda decoder ready (per-step path + sign-flip).")
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
-        """Lottery sign-flip at the end of iteration i > flip_start_iter, on the
-        rows still unconverged; the next iteration's check update reads the
-        flipped l_v. With random_machine system, a call with no unconverged row
-        returns before drawing (one host sync per call); forward() makes the one
-        draw the PyTorch path makes at the iteration where the last rows converge."""
-        if i <= self.flip_start_iter:
+        """Lottery sign-flip at the end of each flip iteration i (is_flip_iter),
+        on the rows still unconverged; the next iteration's check update reads
+        the flipped l_v. With random_machine system, a call with no unconverged
+        row returns before drawing (one host sync per call); forward() makes the
+        one draw the PyTorch path makes when the last rows converge at a flip
+        iteration."""
+        if not is_flip_iter(self, i):
             return
         if self.random_machine == "system" and not active.any():
             return
@@ -73,15 +78,16 @@ class create(_BaseCuda):
         )
         out = super().forward(io_dict)
         # system: the PyTorch path also draws B values at the iteration where the
-        # last rows converge (its loop breaks one iteration later), unless the cap
-        # stopped the loop; draw them here so both paths leave the global RNG equal.
+        # last rows converge (its loop breaks one iteration later) when that is a
+        # flip iteration, unless the cap stopped the loop; draw them here so both
+        # paths leave the global RNG equal.
         if (
             self.random_machine == "system"
             and self._global_last_draw
             and not capped
             and out["converge"].numel() > 0
             and bool(out["converge"].all())
-            and int(out["iter"].max()) > self.flip_start_iter
+            and is_flip_iter(self, int(out["iter"].max()))
         ):
             torch.rand(out["converge"].numel(), device=self.device, dtype=self.dtype)
         return out

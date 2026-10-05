@@ -168,6 +168,10 @@ decoding:
 | Key                       | Description                                                              | Example   |
 |---------------------------|--------------------------------------------------------------------------|-----------|
 | `decoding.config.random_machine`  | Random sampler used to drive sign-flips: `sobol` or `system`             | `sobol`   |
+| `decoding.config.flip_start_iter` | Sign-flips start after this iteration (first flip at iteration `flip_start_iter + 1`) | `4`       |
+| `decoding.config.flip_interval`   | Iterations between sign-flips; a value that is not an int `>= 1` (a float, a bool or a string too) raises `ValueError` | `1`       |
+
+A sign-flip happens at the end of iteration `i` only when `i > flip_start_iter` and `(i - flip_start_iter - 1) % flip_interval == 0`, so the first flip is at iteration `flip_start_iter + 1` and the next ones every `flip_interval` iterations; on the other iterations no random value is drawn.
 
 ### 3.5. bp_lottery_quant
 Lottery BP with fixed-point quantized messages. Example configuration (`lottery_bp_quant_hx.decoding.yaml`):
@@ -190,6 +194,8 @@ decoding:
 | Key                       | Description                                                              | Example   |
 |---------------------------|--------------------------------------------------------------------------|-----------|
 | `decoding.config.random_machine`  | Random sampler used to drive sign-flips: `sobol` or `system`             | `sobol`   |
+| `decoding.config.flip_start_iter` | Sign-flips start after this iteration (first flip at iteration `flip_start_iter + 1`) | `4`       |
+| `decoding.config.flip_interval`   | Iterations between sign-flips, as in `bp_lottery`                        | `1`       |
 | `decoding.config.int_width`       | Integer bit width of the fixed-point message representation              | `3`       |
 | `decoding.config.frac_width`      | Fractional bit width of the fixed-point message representation           | `4`       |
 
@@ -216,6 +222,8 @@ decoding:
 |---------------------------|--------------------------------------------------------------------------|-------------|
 | `decoding.config.random_machine`  | Random sampler used to drive sign-flips: `sobol` or `system`             | `sobol`     |
 | `decoding.config.sign_flip_policy`| Sign-flip policy (see table below)                                        | `Proposed`  |
+
+`bp_lottery_policy` does not read `flip_interval`: it makes a sign-flip at the end of every iteration.
 
 The accepted values for `sign_flip_policy`:
 

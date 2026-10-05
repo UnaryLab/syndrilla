@@ -74,9 +74,8 @@ class create(_Base):
         )
 
     def _init_sf(self, decoding_cfg):
-        """Parse the SF parameters (w_min, w_max, n_sample, topk), set max_iter and
-        num_max_iter to N when SF is on, and build V_v_row. Uses only H_shape,
-        V_c_row, V_c_col, device and max_iter, which bp_norm_min_sum and
+        """Parse the SF parameters (w_min, w_max, n_sample, topk) and build V_v_row.
+        Uses only H_shape, V_c_row, V_c_col and device, which bp_norm_min_sum and
         bp_norm_min_sum_cuda both set."""
         M, N = self.H_shape
         sf_cfg = decoding_cfg.get("sf", decoding_cfg)
@@ -92,14 +91,6 @@ class create(_Base):
         if self.topk <= 0 and self.w_max > 0:
             logger.warning("SF enabled (w_max>0) but topk<=0; defaulting topk to 20.")
             self.topk = 20
-
-        if self.w_max > 0:
-            if self.max_iter != N:
-                logger.info(
-                    f"SF enabled: overriding max_iter <{self.max_iter}> with the "
-                    f"data-qubit count N=<{N}>."
-                )
-            self.max_iter = self.num_max_iter = N
 
         # padded CSC [N, max column degree]: the checks on each variable, padded with
         # the dummy check M; used to compute the syndrome shift of a candidate flip

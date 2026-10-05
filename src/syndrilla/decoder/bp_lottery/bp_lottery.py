@@ -38,6 +38,22 @@ def rand_rows(dec, n):
     return r if n == dec._B else r[dec._hook_rows]
 
 
+def read_flip_interval(decoding_cfg):
+    """decoding_cfg flip_interval as an int >= 1, default 1; another value (a
+    float, a bool or a string too) raises ValueError."""
+    v = decoding_cfg.get("flip_interval", 1)
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        raise ValueError(f"flip_interval must be an int in [1, inf], got <{v!r}>.")
+    return v
+
+
+def is_flip_iter(dec, i):
+    """True when iteration i flips: i > flip_start_iter, and every
+    flip_interval iterations from flip_start_iter + 1 on."""
+    s = dec.flip_start_iter
+    return i > s and (i - s - 1) % dec.flip_interval == 0
+
+
 class create(_NmsPy):
     """
     Lottery BP decoder: bp_norm_min_sum (eager or compiled step, row compaction)
@@ -46,6 +62,7 @@ class create(_NmsPy):
     Accepts every bp_norm_min_sum key plus
         random_machine: 'sobol' (default) | 'system'   RNG for the flip pick
         flip_start_iter: int (default 4)                 flips start after this iteration
+        flip_interval: int >= 1 (default 1)              iterations between flips
     """
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
@@ -58,6 +75,7 @@ class create(_NmsPy):
             )
             self.random_machine = "sobol"
         self.flip_start_iter = int(decoding_cfg.get("flip_start_iter", 4))
+        self.flip_interval = read_flip_interval(decoding_cfg)
 
         self.algo = "bp_lottery"
 
@@ -75,9 +93,9 @@ class create(_NmsPy):
         return super().forward(io_dict)
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
-        """Lottery sign-flip at the end of iteration i > flip_start_iter on the
-        unconverged rows; the next iteration reads the flipped l_v."""
-        if i <= self.flip_start_iter:
+        """Lottery sign-flip at the end of each flip iteration i (is_flip_iter)
+        on the unconverged rows; the next iteration reads the flipped l_v."""
+        if not is_flip_iter(self, i):
             return
         self._active = active
         self.sign_flip_cn_rand_new(syndrome, self.syndrome_estimation(e_v), l_v)
