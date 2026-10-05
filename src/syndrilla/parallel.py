@@ -7,10 +7,10 @@ Each worker is a separate `python -m syndrilla.main` process whose
 CUDA_VISIBLE_DEVICES holds one physical GPU id, taken from this process's
 CUDA_VISIBLE_DEVICES when it is set, so the decoding yaml should use
 device_type cuda with device_idx 0. Each worker writes to
-<run_dir>/gpu<index>_w<j>/ (result yaml, main-*.log and syndrilla.log). Without
+<run_dir>/w<index>/ (result yaml, main-*.log and syndrilla.log). Without
 --seed the workers run unseeded and draw independent shots; with --seed b,
 worker k (in launch order over all workers) gets --seed=b+k. A decoding yaml
-with device_type cpu runs as one worker, in <run_dir>/cpu_w0/, with no
+with device_type cpu runs as one worker, in <run_dir>/w0/, with no
 CUDA_VISIBLE_DEVICES set; --gpus and --workers-per-gpu are then ignored.
 
 Stop: either or both of -te and -tb may be given (-te 1000 when neither is).
@@ -47,8 +47,8 @@ kept and the path of its probe.log is printed. --no-probe skips it.
 
 Resume: a worker dir that already holds a result yaml is resumed: that yaml
 is passed to the worker as -ckpt, so a rerun of the same command continues a
-stopped launch. A resume needs the same -te/-tb, --gpus and --workers-per-gpu;
-otherwise the launcher exits before starting any worker. The targets of a
+stopped launch. A resume needs the same -te/-tb and ordered worker/device list;
+otherwise the launcher exits before starting any worker. The targets and workers of a
 launch are kept in <run_dir>/launch.yaml, written before the workers start. A failed or
 interrupted launch leaves no merged or pooled yaml behind (the worker yamls
 stay, and a rerun resumes and rewrites them). A run dir that holds a result
@@ -79,6 +79,7 @@ import argparse
 import glob
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -324,7 +325,7 @@ def add_run_flags(parser):
         "--dry-run",
         action="store_true",
         help="Print the commands, then exit without launching: run prints the probe and each worker's "
-        "environment and command; sweep prints each point's label and each worker's command with its GPU slot.",
+        "environment and command; sweep prints each point's label and each worker's command with its physical device.",
     )
     for flags, _ in REFUSED:
         parser.add_argument(
@@ -352,7 +353,7 @@ def parse_args():
         "--run_dir",
         type=str,
         required=True,
-        help="Parent run directory; worker j on GPU index g writes to <run_dir>/gpu<g>_w<j>/, "
+        help="Parent run directory; worker i writes to <run_dir>/w<i>/, "
         "and a worker dir that already holds a result yaml is resumed.",
     )
     add_run_flags(run)
@@ -379,18 +380,18 @@ def parse_args():
         "sweep",
         help="Run every point folder of a sweep dir as one launch each.",
         description="Run every point folder under -r, in sorted order, like run with -r set to "
-        "that folder and -d -e -c -s -m taken from its yamls. A point starts when k "
-        "(--gpus-per-point) GPUs each have a free slot (--workers-per-gpu slots per GPU) and runs "
-        "one worker on each. With --seed b, point i, worker j gets --seed=<b + i*k + j>. "
+        "that folder and -d -e -c -s -m taken from its yamls. A point starts when w "
+        "(--workers-per-point) slots are free (--workers-per-gpu slots per GPU). "
+        "With --seed b, point i, worker j gets --seed=<b + i*w + j>. "
         "Writes <run_dir>/sweep_results.csv. Unknown flags are passed to every worker.",
         allow_abbrev=False,
     )
     sw.add_argument("-r", "--run_dir", type=str, required=True, help="Sweep directory.")
     sw.add_argument(
-        "--gpus-per-point",
+        "--workers-per-point",
         type=int,
         default=1,
-        help="GPUs per point, one worker on each; default 1.",
+        help="Workers per point, sharing GPUs when capacity allows; default 1.",
     )
     sw.add_argument(
         "--fail-fast",
@@ -455,40 +456,31 @@ def decoding_device(passthrough):
     )
 
 
-def plan_workers(args, passthrough):
-    """One entry per worker: GPU, dir, seed, resume state, command and environment."""
-    flag, target_key, target = args.worker_target
-    if decoding_device(passthrough) == "cpu":
-        if args.command == "run" and (
-            args.gpus is not None or args.workers_per_gpu != 1
-        ):
-            print(
-                "device_type cpu: one worker on cpu, --gpus and --workers-per-gpu are ignored"
-            )
-        gpus, devices, per_gpu = [None], {None: None}, 1
-    else:
-        gpus = gpu_list(args)
-        devices = dict(
-            zip(gpus, physical_ids(gpus, os.environ.get("CUDA_VISIBLE_DEVICES")))
-        )
-        per_gpu = args.workers_per_gpu
-    workers = [(g, j) for g in gpus for j in range(per_gpu)]
-    if not workers:
-        sys.exit("no GPUs to run on")
+def worker_shares(args, count):
+    flag, _, target = args.worker_target
+    if count < 1:
+        sys.exit("no workers to run")
     if args.pooled:
-        shares = [target] * len(workers)
-    elif target < len(workers):
-        sys.exit(f"{flag} {target} is smaller than the {len(workers)} workers")
-    else:
-        shares = split_target(target, len(workers))
+        return [target] * count
+    if target < count:
+        sys.exit(f"{flag} {target} is smaller than the {count} workers")
+    return split_target(target, count)
 
-    planned = {worker_name(g, j) for g, j in workers}
-    present = {
-        os.path.basename(d)
-        for pattern in ("gpu*_w*", "cpu_w*")
-        for d in glob.glob(os.path.join(args.run_dir, pattern))
-        if os.path.isdir(d)
-    }
+
+def preflight_workers(args, count):
+    """Validate saved layout, targets and shares without assigning any devices.
+
+    Return the recorded ordered worker/device list, or None for a fresh launch.
+    """
+    shares = worker_shares(args, count)
+    planned = {f"w{i}" for i in range(count)}
+    legacy = [d for pattern in ("gpu*_w*", "cpu_w*")
+              for d in glob.glob(os.path.join(args.run_dir, pattern)) if os.path.isdir(d)]
+    if legacy:
+        sys.exit(f"{args.run_dir} holds an old worker layout (gpuG_wJ/cpu_w0); "
+                 "flat-worker launches cannot use it. Use a new -r directory.")
+    present = {os.path.basename(d) for d in glob.glob(os.path.join(args.run_dir, "w*"))
+               if os.path.isdir(d) and re.fullmatch(r"w\d+", os.path.basename(d))}
     launch = os.path.join(args.run_dir, "launch.yaml")
     single = result_file(args.run_dir) if os.path.isdir(args.run_dir) else None
     if single and not present and not os.path.isfile(launch):
@@ -498,42 +490,73 @@ def plan_workers(args, passthrough):
             f"or use a new -r for syndrilla-parallel."
         )
     if present and present != planned:
-        sys.exit(
-            f"{args.run_dir} holds worker dirs from a different layout; a resume needs "
-            f"the same --gpus and --workers-per-gpu (--gpus-per-point in sweep). Present, not planned: "
-            f"{sorted(present - planned)}. Planned, not present: {sorted(planned - present)}."
-        )
-
+        sys.exit(f"{args.run_dir} holds worker dirs from a different layout. "
+                 f"Present, not planned: {sorted(present - planned)}. "
+                 f"Planned, not present: {sorted(planned - present)}.")
+    recorded = None
     if os.path.isfile(launch):
         with open(launch) as f:
             old = yaml.safe_load(f)
-        if old != launch_targets(args):
-            sys.exit(
-                f"{launch} records targets {old}, but this launch gives "
-                f"{launch_targets(args)}; a resume needs the same -te/-tb. "
-                f"Use a new -r for different targets."
-            )
+        if not isinstance(old, dict) or not isinstance(old.get("workers"), list):
+            sys.exit(f"{launch} has an old worker layout without recorded devices; use a new -r directory.")
+        recorded = old["workers"]
+        if (len(recorded) != count or any(
+            not isinstance(w, dict) or set(w) != {"name", "device"}
+            or w["name"] != f"w{i}" or not isinstance(w["device"], str) or not w["device"]
+            for i, w in enumerate(recorded)
+        )):
+            sys.exit(f"{launch} records a different worker layout; a resume needs the same ordered workers.")
+        targets = launch_targets(args)
+        if any(old.get(key) != value for key, value in targets.items()):
+            sys.exit(f"{launch} records different targets; a resume needs the same -te/-tb. "
+                     "Use a new -r for different targets.")
+    elif present:
+        sys.exit(f"{args.run_dir} has worker directories without a launch.yaml worker/device list; use a new -r directory.")
+    flag, target_key, _ = args.worker_target
+    for i, share in enumerate(shares):
+        checkpoint = result_file(os.path.join(args.run_dir, f"w{i}"))
+        if checkpoint is not None:
+            with open(checkpoint) as f:
+                full = yaml.safe_load(f)["decoder_full"]
+            if full.get(target_key) != share:
+                sys.exit(f"{checkpoint} was run with {target_key} {full.get(target_key)}, but this "
+                         f"launch gives w{i} {flag}={share}; a resume needs the same targets and worker layout.")
+    return recorded
+
+
+def plan_workers(args, passthrough, devices=None):
+    """Plan flat workers using actual physical device IDs, or the CPU sentinel."""
+    flag, _, _ = args.worker_target
+    cpu = decoding_device(passthrough) == "cpu"
+    if cpu:
+        if args.command == "run" and (args.gpus is not None or args.workers_per_gpu != 1):
+            print("device_type cpu: one worker on cpu, --gpus and --workers-per-gpu are ignored")
+        devices = ["cpu"]
+    elif devices is None:
+        if args.workers_per_gpu < 1:
+            sys.exit("--workers-per-gpu must be positive")
+        ids = physical_ids(gpu_list(args), os.environ.get("CUDA_VISIBLE_DEVICES"))
+        devices = [device for device in ids for _ in range(args.workers_per_gpu)]
+    workers = [{"name": f"w{i}", "device": device} for i, device in enumerate(devices)]
+    shares = worker_shares(args, len(workers))
+    recorded = preflight_workers(args, len(workers))
+    if recorded is not None and recorded != workers:
+        sys.exit(f"{args.run_dir}/launch.yaml records workers {recorded}, but this launch gives "
+                 f"{workers}; a resume needs the same ordered physical devices.")
 
     plan = []
-    for k, ((g, j), share) in enumerate(zip(workers, shares)):
-        name = worker_name(g, j)
+    for i, (worker, share) in enumerate(zip(workers, shares)):
+        name, device = worker["name"], worker["device"]
         wdir = os.path.join(args.run_dir, name)
         ckpt = result_file(wdir) if os.path.isdir(wdir) else None
-        seed = None if args.seed is None else args.seed + k
+        seed = None if args.seed is None else args.seed + i
         before = None
         if ckpt is not None:
             with open(ckpt) as f:
                 ckpt_res = yaml.safe_load(f)
-            ckpt_full = ckpt_res["decoder_full"]
-            if ckpt_full.get(target_key) != share:
-                sys.exit(
-                    f"{ckpt} was run with {target_key} {ckpt_full.get(target_key)}, but this "
-                    f"launch gives {name} {flag}={share}; a resume needs the same "
-                    f"-te/-tb and worker layout."
-                )
             before = summary(ckpt_res)
             if seed is None:
-                seed = ckpt_full.get("seed")  # the worker reuses the checkpoint's seed
+                seed = ckpt_res["decoder_full"].get("seed")
         cmd = [sys.executable, "-m", "syndrilla.main", f"-r={wdir}", f"{flag}={share}"]
         if args.save_interval is not None:
             cmd.append(f"--save-interval={args.save_interval}")
@@ -542,31 +565,20 @@ def plan_workers(args, passthrough):
         if ckpt is not None:
             cmd.append(f"-ckpt={ckpt}")
         env = {"PYTHONUNBUFFERED": "1"}
-        if g is not None:
-            env["CUDA_VISIBLE_DEVICES"] = devices[g]
-        plan.append(
-            {
-                "name": name,
-                "gpu": g,
-                "device": devices[g],
-                "worker": j,
-                "target": share,
-                "dir": wdir,
-                "log": os.path.join(wdir, "syndrilla.log"),
-                "seed": seed,
-                "resumed": ckpt is not None,
-                "before": before,
-                "last": before,
-                "cmd": cmd + passthrough,
-                "env": env,
-                "wall": None,
-            }
-        )
+        if device != "cpu":
+            env["CUDA_VISIBLE_DEVICES"] = device
+        plan.append({
+            **worker, "target": share, "dir": wdir,
+            "log": os.path.join(wdir, "syndrilla.log"), "seed": seed,
+            "resumed": ckpt is not None, "before": before, "last": before,
+            "cmd": cmd + passthrough, "env": env, "wall": None,
+        })
     return plan
 
 
-def worker_name(g, j):
-    return "cpu_w0" if g is None else f"gpu{g}_w{j}"
+def launch_record(args, plan):
+    return {**launch_targets(args),
+            "workers": [{"name": w["name"], "device": w["device"]} for w in plan]}
 
 
 def launch_targets(args):
@@ -649,7 +661,7 @@ def spawn_workers(plan, label=""):
         )
         print(
             f"{label}worker {w['name']}: "
-            + ("cpu " if w["gpu"] is None else f"CUDA_VISIBLE_DEVICES={w['device']} ")
+            + ("cpu " if w["device"] == "cpu" else f"CUDA_VISIBLE_DEVICES={w['device']} ")
             + f"{w['cmd'][4]} seed={w['seed']} resumed={w['resumed']}",
             flush=True,
         )
@@ -683,7 +695,7 @@ def start_launch(args, plan, label=""):
     """
     os.makedirs(args.run_dir, exist_ok=True)
     with open(os.path.join(args.run_dir, "launch.yaml"), "w") as f:
-        yaml.safe_dump(launch_targets(args), f)
+        yaml.safe_dump(launch_record(args, plan), f, sort_keys=False)
     # removed, so a failed launch leaves no merged or pooled yaml behind
     for old in [os.path.join(args.run_dir, "merged_result.yaml")] + glob.glob(
         os.path.join(args.run_dir, "result_phy_err_*.yaml")
@@ -787,7 +799,7 @@ def finish(state):
 def merge(args, plan, stopped, launch_wall):
     """Write merged_result.yaml and the pooled result yaml from the worker yamls; return the merged dict."""
     target_key = args.worker_target[1]
-    results, rows, missing = [], [], []
+    results, rows, missing, names = [], [], [], []
     for w in plan:
         path = result_file(w["dir"])
         if path is None:  # stopped by the pooled target before its first save
@@ -798,11 +810,10 @@ def merge(args, plan, stopped, launch_wall):
         results.append(res)
         r = summary(res)
         new_shots = r["shots"] - (w["before"] or {"shots": 0})["shots"]
+        names.append(w["name"])
         rows.append(
             {
-                "gpu": w["gpu"],
                 "device": w["device"],
-                "worker": w["worker"],
                 target_key: w["target"],
                 "seed": w["seed"],
                 "resumed": w["resumed"],
@@ -859,7 +870,7 @@ def merge(args, plan, stopped, launch_wall):
         ),
         "shots per wall second (this launch)": new_shots / launch_wall,
         "launch wall (s)": round(launch_wall, 3),
-        "per worker": rows,
+        "per worker": dict(zip(names, rows)),
     }
     out = os.path.join(args.run_dir, "merged_result.yaml")
     with open(out, "w") as f:
