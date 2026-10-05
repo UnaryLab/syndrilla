@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from argparse import Namespace
+from collections import Counter
 
 from syndrilla import parallel as par
 from syndrilla.utils import read_yaml, write_yaml
@@ -152,84 +153,117 @@ def csv_row(folder, merged=None, wall=None, status="not run"):
     return row
 
 
-def run_sweep(args, passthrough):
-    """Run every point folder under args.run_dir as a syndrilla-parallel launch.
+def free_slots(used, capacity):
+    """GPU indices for all free slots, least loaded first with GPU-index ties."""
+    slots = [(g, rank) for g in used for rank in range(capacity - used[g])]
+    return [g for g, rank in sorted(slots, key=lambda slot: (used[slot[0]] + slot[1], slot[0]))]
 
-    Points are a queue in sorted folder order; point i starts when k GPUs each
-    have a free worker slot (--workers-per-gpu slots per GPU) and runs one
-    worker on each, in worker dirs gpu0_w0 .. gpu<k-1>_w0 (the point's k GPU
-    slots, not GPU indices). Point i, worker j gets seed base + i*k + j.
-    A point folder that holds merged_result.yaml is done: its CSV row is built
-    from that yaml and it is not launched again.
+
+def run_sweep(args, passthrough):
+    """Run sorted points using flat workers and actual physical device assignments.
+
+    Point i gets seed base + i*w. A resumed point retains its recorded devices
+    and waits for their slots; completed points are skipped before validation.
     """
-    k = args.gpus_per_point
-    gpus = par.gpu_list(args)
-    devices = dict(
-        zip(gpus, par.physical_ids(gpus, os.environ.get("CUDA_VISIBLE_DEVICES")))
-    )
-    if not 1 <= k <= len(gpus):
-        sys.exit(f"--gpus-per-point {k} must be between 1 and the {len(gpus)} GPUs")
+    width, capacity = args.workers_per_point, args.workers_per_gpu
+    if width < 1 or capacity < 1:
+        sys.exit("--workers-per-point and --workers-per-gpu must be positive")
     folders = sorted(
-        d
-        for d in glob.glob(os.path.join(args.run_dir, "*"))
-        if os.path.isdir(d) and glob.glob(os.path.join(d, "*.decoding.yaml"))
+        d for d in glob.glob(os.path.join(args.run_dir, "*"))
+        if os.path.isdir(d) and (glob.glob(os.path.join(d, "*.decoding.yaml"))
+                                 or os.path.isfile(os.path.join(d, "merged_result.yaml")))
     )
     if not folders:
-        sys.exit(
-            f"{args.run_dir} holds no point folder (a folder with a *.decoding.yaml)"
-        )
+        sys.exit(f"{args.run_dir} holds no point folder (a folder with a *.decoding.yaml)")
 
-    # plan every point first, so a refusal stops the sweep before any point starts
+    # Check every saved layout and checkpoint before selecting any new devices.
     points = []
     for i, folder in enumerate(folders):
         pargs = Namespace(**vars(args))
-        pargs.run_dir, pargs.gpus, pargs.workers_per_gpu = folder, list(range(k)), 1
+        pargs.run_dir = folder
         if args.seed is not None:
-            pargs.seed = args.seed + i * k
-        flags = point_flags(folder) + passthrough
-        pt = {
-            "args": pargs,
-            "flags": flags,
-            "plan": par.plan_workers(pargs, flags),
-            "label": f"[{os.path.basename(folder)}] ",
-            "row": csv_row(folder),
-        }
+            pargs.seed = args.seed + i * width
+        pt = {"args": pargs, "plan": [], "label": f"[{os.path.basename(folder)}] ",
+              "row": csv_row(folder)}
         merged = os.path.join(folder, "merged_result.yaml")
         if os.path.isfile(merged):
             m = read_yaml(merged)
             pt["row"] = csv_row(folder, m, m["launch wall (s)"], "done")
             pt["done"] = True
+            points.append(pt)
+            continue
+        flags = point_flags(folder) + passthrough
+        cpu = par.decoding_device(flags) == "cpu"
+        recorded = par.preflight_workers(pargs, 1 if cpu else width)
+        if recorded is not None and any((w["device"] == "cpu") != cpu for w in recorded):
+            sys.exit(f"{folder}/launch.yaml records devices incompatible with its decoding device type.")
+        pt.update(flags=flags, cpu=cpu, recorded=recorded)
         points.append(pt)
+
+    queue = [pt for pt in points if not pt.get("done")]
+    gpus = par.gpu_list(args) if any(not pt["cpu"] for pt in queue) else []
+    devices = dict(zip(gpus, par.physical_ids(gpus, os.environ.get("CUDA_VISIBLE_DEVICES"))))
+    gpu_for_device = {device: g for g, device in devices.items()}
+    if any(not pt["cpu"] for pt in queue) and width > len(devices) * capacity:
+        sys.exit(f"--workers-per-point {width} exceeds total GPU worker capacity {len(devices) * capacity}")
+    for pt in queue:
+        pt["pinned"] = None
+        if pt["cpu"]:
+            pt["pinned"] = []
+        elif pt["recorded"] is not None:
+            required = [w["device"] for w in pt["recorded"]]
+            if any(device not in gpu_for_device for device in required):
+                sys.exit(f"{pt['args'].run_dir}/launch.yaml requires unavailable physical devices {required}; "
+                         "provide the recorded devices to resume this point.")
+            if any(count > capacity for count in Counter(required).values()):
+                sys.exit(f"{pt['args'].run_dir}/launch.yaml requires more worker slots on a device "
+                         "than --workers-per-gpu allows.")
+            pt["pinned"] = [gpu_for_device[device] for device in required]
 
     for pt in points:
         if pt.get("done"):
             print(f"{pt['label']}done, merged_result.yaml kept, not launched")
-    queue = [pt for pt in points if not pt.get("done")]
     if args.dry_run:
         for pt in queue:
+            slots = pt["pinned"]
+            if slots is None:
+                slots = free_slots({g: 0 for g in devices}, capacity)[:width]
+            assigned = ["cpu"] if pt["cpu"] else [devices[g] for g in slots]
+            plan = par.plan_workers(pt["args"], pt["flags"], devices=assigned)
             print(pt["label"])
-            for w in pt["plan"]:
-                print(f"  {w['name']} on GPU slot {w['gpu']}: {' '.join(w['cmd'])}")
+            for worker in plan:
+                print(f"  {worker['name']} on device {worker['device']}: {' '.join(worker['cmd'])}")
         return
 
-    used = {g: 0 for g in gpus}
+    used = {g: 0 for g in devices}
+    cpu_busy = False
     running, failed = [], []
     try:
         while queue or running:
-            free = sorted(
-                (g for g in gpus if used[g] < args.workers_per_gpu),
-                key=lambda g: used[g],
-            )
-            if queue and len(free) >= k and not (failed and args.fail_fast):
+            chosen = None
+            if queue and not (failed and args.fail_fast):
+                pinned = queue[0]["pinned"]
+                if queue[0]["cpu"]:
+                    if not cpu_busy:
+                        chosen = []
+                elif pinned is not None:
+                    if all(used[g] + count <= capacity for g, count in Counter(pinned).items()):
+                        chosen = pinned
+                else:
+                    free = free_slots(used, capacity)
+                    if len(free) >= width:
+                        chosen = free[:width]
+            if chosen is not None:
                 pt = queue.pop(0)
-                pt["gpus"] = free[:k]
-                for g in pt["gpus"]:
+                pt["slots"] = chosen
+                if pt["cpu"]:
+                    cpu_busy = True
+                for g in chosen:
                     used[g] += 1
-                for w, g in zip(pt["plan"], pt["gpus"]):
-                    if w["gpu"] is not None:
-                        w["device"] = w["env"]["CUDA_VISIBLE_DEVICES"] = devices[g]
-                print(f"{pt['label']}starting on GPUs {pt['gpus']}", flush=True)
+                assigned = ["cpu"] if pt["cpu"] else [devices[g] for g in chosen]
+                print(f"{pt['label']}starting on devices {assigned}", flush=True)
                 try:
+                    pt["plan"] = par.plan_workers(pt["args"], pt["flags"], devices=assigned)
                     if not args.no_probe:
                         # ponytail: the probe blocks the poll loop of running points for its seconds
                         par.probe(pt["args"], pt["flags"], pt["plan"][0]["env"])
@@ -239,20 +273,22 @@ def run_sweep(args, passthrough):
                     print(f"{pt['label']}failed: {e}", file=sys.stderr, flush=True)
                     pt["row"]["status"] = "failed"
                     failed.append(pt)
-                    for g in pt["gpus"]:
+                    if pt["cpu"]:
+                        cpu_busy = False
+                    for g in chosen:
                         used[g] -= 1
                 continue
             for pt in list(running):
                 if not par.step(pt["state"]):
                     continue
                 running.remove(pt)
-                for g in pt["gpus"]:
+                if pt["cpu"]:
+                    cpu_busy = False
+                for g in pt["slots"]:
                     used[g] -= 1
                 bad, stopped, wall = par.finish(pt["state"])
                 if bad:
-                    pt["row"].update(
-                        csv_row(pt["args"].run_dir, wall=wall, status="failed")
-                    )
+                    pt["row"].update(csv_row(pt["args"].run_dir, wall=wall, status="failed"))
                     failed.append(pt)
                     continue
                 try:
@@ -263,11 +299,7 @@ def run_sweep(args, passthrough):
                     pt["row"]["status"] = "failed"
                     failed.append(pt)
             if failed and args.fail_fast and running:
-                print(
-                    "--fail-fast: stopping the running points",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                print("--fail-fast: stopping the running points", file=sys.stderr, flush=True)
                 for pt in running:
                     par.stop(pt["plan"])
                     pt["row"]["status"] = "stopped"
@@ -279,20 +311,16 @@ def run_sweep(args, passthrough):
         print("interrupted; stopping all started points", file=sys.stderr)
         failed.append(None)
     finally:
-        # on any exit, every started worker of an unfinished point gets SIGTERM and
-        # saves; the row takes the counts of the worker yamls it saved
         for pt in points:
             started = [w for w in pt["plan"] if "proc" in w]
             if started and pt["row"]["status"] in ("not run", "stopped"):
                 par.stop(started)
-                t = par.pooled_now(pt["plan"])[0]
-                m = None
-                if t["shots"]:
-                    m = dict(t, **{"logical error rate": t["fails"] / t["shots"]})
-                    m["logical error rate 95% Wilson interval"] = par.wilson(
-                        t["fails"], t["shots"]
-                    )
-                pt["row"] = csv_row(pt["args"].run_dir, m, status="stopped")
+                totals = par.pooled_now(pt["plan"])[0]
+                merged = None
+                if totals["shots"]:
+                    merged = dict(totals, **{"logical error rate": totals["fails"] / totals["shots"]})
+                    merged["logical error rate 95% Wilson interval"] = par.wilson(totals["fails"], totals["shots"])
+                pt["row"] = csv_row(pt["args"].run_dir, merged, status="stopped")
         out = os.path.join(args.run_dir, "sweep_results.csv")
         with open(out, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
