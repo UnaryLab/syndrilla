@@ -17,12 +17,81 @@ def _binary_csr(rows, cols, shape):
     return m
 
 
-def _build_dem_matrices(circuit):
+def _build_decomposed_dem(circuit):
+    """Graphlike component columns and their correlated original DEM mechanisms."""
+    key = (str(circuit), True)
+    if key in STIM_CIRCUIT_CACHE:
+        return STIM_CIRCUIT_CACHE[key]
+    try:
+        dem = circuit.detector_error_model(decompose_errors=True)
+    except ValueError as exc:
+        raise ValueError(f"decompose=True requires a graphlike Stim DEM: {exc}") from exc
+
+    component_ids, priors, mechanism_priors, mechanism_components = {}, [], [], []
+    for inst in dem.flattened():
+        if inst.type != "error":
+            continue
+        probability = inst.args_copy()[0]
+        mechanism_priors.append(probability)
+        # Repeated components in one mechanism cancel; only distinct mechanisms
+        # contribute independent Bernoulli variables to a component's prior.
+        parity = {}
+        dets, obs = set(), set()
+        for target in [*inst.targets_copy(), None]:
+            if target is None or target.is_separator():
+                if len(dets) > 2:
+                    raise ValueError("decompose=True requires each DEM component to have at most two detectors.")
+                if dets or obs:
+                    support = (tuple(sorted(dets)), tuple(sorted(obs)))
+                    parity[support] = not parity.get(support, False)
+                dets, obs = set(), set()
+            elif target.is_relative_detector_id():
+                dets.symmetric_difference_update((target.val,))
+            elif target.is_logical_observable_id():
+                obs.symmetric_difference_update((target.val,))
+        indices = []
+        for support, present in parity.items():
+            if not present:
+                continue
+            if support not in component_ids:
+                component_ids[support] = len(priors)
+                priors.append(0.0)
+            index = component_ids[support]
+            indices.append(index)
+            prior = priors[index]
+            priors[index] = prior * (1 - probability) + (1 - prior) * probability
+        mechanism_components.append(tuple(indices))
+
+    h_rows, h_cols, o_rows, o_cols = [], [], [], []
+    for (dets, obs), index in component_ids.items():
+        h_rows.extend(dets)
+        h_cols.extend([index] * len(dets))
+        o_rows.extend(obs)
+        o_cols.extend([index] * len(obs))
+    result = dict(
+        dem=dem,
+        H=_binary_csr(h_rows, h_cols, (dem.num_detectors, len(priors))),
+        obs_mat=_binary_csr(o_rows, o_cols, (dem.num_observables, len(priors))),
+        priors=np.asarray(priors, dtype=np.float64),
+        mechanism_priors=np.asarray(mechanism_priors, dtype=np.float64),
+        components=tuple(component_ids),
+        mechanism_components=tuple(mechanism_components),
+    )
+    STIM_CIRCUIT_CACHE[key] = result
+    return result
+
+
+def _build_dem_matrices(circuit, decompose=False):
     """Extract (H, obs_mat, priors) from a stim circuit, H and obs_mat as scipy CSR.
-    Cached by circuit content (string form), since id() can be recycled by CPython when a Circuit is freed,
+    Cached by circuit content (string form) and decomposition flag, since id() can be recycled by CPython when a Circuit is freed,
     causing a fresh Circuit to alias an unrelated cached entry.
     """
-    key = str(circuit)
+    if not isinstance(decompose, bool):
+        raise ValueError("decompose must be a bool.")
+    if decompose:
+        data = _build_decomposed_dem(circuit)
+        return data["H"], data["obs_mat"], data["priors"]
+    key = (str(circuit), False)
     if key in STIM_CIRCUIT_CACHE:
         return STIM_CIRCUIT_CACHE[key]
 
@@ -67,7 +136,7 @@ class create:
     """
 
     # Read by decoders that mean something different on a circuit-level DEM than on a
-    # code's parity-check matrix: here a column is a circuit fault mechanism, not a
+    # code's parity-check matrix: here a column is a circuit fault mechanism or decomposed component, not a
     # qubit, so a code family and a distance cannot be measured off the shape.
     is_circuit_dem = True
 
@@ -84,7 +153,7 @@ class create:
                 f"stim matrix loader 'target' must be 'check' or 'observable', got <{self.target}>."
             )
 
-        H, obs_mat, priors = _build_dem_matrices(circuit)
+        H, obs_mat, priors = _build_dem_matrices(circuit, matrix_cfg.get("decompose", False))
         self._matrix = H if self.target == "check" else obs_mat
         self.priors = priors
 

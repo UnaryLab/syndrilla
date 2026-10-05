@@ -30,7 +30,7 @@ class create:
         self.circuit = get_stim_circuit(circuit_str=circuit_str)
         self.path = "<inline>"
 
-        H, obs_mat, _ = _build_dem_matrices(self.circuit)
+        H, obs_mat, _ = _build_dem_matrices(self.circuit, syndrome_cfg.get("decompose", False))
         self.sparse_h = knob(syndrome_cfg, "sparse_h", True)
         if self.sparse_h:
             H = H.tocoo()
@@ -60,7 +60,7 @@ class create:
 
     def measure_syndrome(self, error, decoder):
         """
-        Detectors and observable flips of `error`, a DEM mechanism vector.
+        Detectors and observable flips of `error`, a DEM column vector.
 
         The stim detector vector already encodes every QEC round of the
         circuit, so the output is always 2-D:
@@ -73,12 +73,12 @@ class create:
 
         if error.ndim != 2:
             raise ValueError(
-                f"Stim syndromes are measured on a [batch, mechanisms] error, got shape "
+                f"Stim syndromes are measured on a [batch, columns] error, got shape "
                 f"<{tuple(error.shape)}>; a circuit's detectors already cover every round."
             )
         if error.shape[1] != self._H.shape[1]:
             raise ValueError(
-                f"This circuit has <{self._H.shape[1]}> error mechanisms, got an error of "
+                f"This circuit has <{self._H.shape[1]}> error columns, got an error of "
                 f"width <{error.shape[1]}>; both must come from the same circuit."
             )
 

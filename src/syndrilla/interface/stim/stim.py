@@ -77,6 +77,9 @@ class create:
             "number_channel", interface_cfg.get("number_channel", 1)
         )
 
+        decompose = interface_cfg.get("decompose", False)
+        if not isinstance(decompose, bool):
+            raise ValueError("decompose must be a bool.")
         circuit_inline = interface_cfg.get("circuit", None)
 
         circuit_gen_cfg = None
@@ -125,7 +128,7 @@ class create:
             f"Stim interface: channels={number_channel}, device={device}, dtype={dtype}"
         )
 
-        circuit_ref = {"circuit": str(self.circuit)}
+        circuit_ref = {"circuit": str(self.circuit), "decompose": decompose}
 
         em_cfg = {
             "model": "stim_circuit",

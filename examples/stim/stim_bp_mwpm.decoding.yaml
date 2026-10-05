@@ -1,0 +1,11 @@
+decoding:
+  algorithm: [bp_norm_min_sum, mwpm]
+  check_type: hx
+  dtype: float32
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    - max_iter: 50
+    - weights: posterior
+      num_workers: 32

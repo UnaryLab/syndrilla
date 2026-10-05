@@ -1,0 +1,5 @@
+interface:
+  backend: stim
+  code: surface_code:rotated_memory_x
+  distance: 5
+  decompose: true

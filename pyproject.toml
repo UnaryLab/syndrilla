@@ -27,6 +27,7 @@ dependencies = [
     "loguru",
     "numpy",
     "scipy",
+    "pymatching>=2,<3",
     "pyfiglet",
     "torch>=2.0"
 ]

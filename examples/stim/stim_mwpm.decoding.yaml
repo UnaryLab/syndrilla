@@ -1,9 +1,10 @@
 decoding:
   algorithm: [mwpm]
   check_type: hx
-  dtype: float64
+  dtype: float32
   device:
     device_type: cpu
+    device_idx: 0
   config:
     # every column weighs 1: PyMatching Matching.from_check_matrix(H) with no weights
-    - weights: uniform
+    weights: uniform
