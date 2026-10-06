@@ -26,7 +26,8 @@ def _step(
       vn_adj     [VD * (N+1)] slot-major edge ids per variable (see create.__init__)
       synd_bits  [B, 2, M]    syndrome as bool
 
-    Returns (next message, normalized posterior, converged [B] bool).
+    Returns (next message, normalized posterior, converged [B] bool,
+    joint-Pauli hard decisions [B, 2, N+1] in Hx/Hz sector order).
     """
     B, C, M, D = message.shape
 
@@ -73,7 +74,7 @@ def _step(
     num1 = gathered[:, 0, 1] + gathered[:, 3, 1] + eps
     den1 = gathered[:, 1, 1] + gathered[:, 2, 1] + eps
     message = torch.stack([torch.log(num0 / den0), torch.log(num1 / den1)], 1)
-    return message, normalized, converged
+    return message, normalized, converged, torch.stack((z_bits, x_bits), 1)
 
 
 class create(torch.nn.Module):
@@ -84,8 +85,10 @@ class create(torch.nn.Module):
     per-variable product of the check factors is a gather through a fixed
     variable-to-edge table, multiplied in (channel, check, slot) order, so the
     result does not depend on the device's scatter order. Rows are compacted to the
-    unconverged samples as in bp_norm_min_sum. The returned e_v and llr are zeros of
-    shape [B, 2, N]; iter and converge come from the syndrome check.
+    unconverged samples as in bp_norm_min_sum. The returned e_v [B, 2, N] is the
+    joint-Pauli hard decision projected onto Hx/Hz sectors; llr holds the sector
+    marginal log odds from the same stop iteration. Their signs need not agree
+    with e_v because marginal MAP and projected joint MAP can differ.
     """
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
@@ -227,7 +230,8 @@ class create(torch.nn.Module):
             llr0: [B, 4, N] channel probabilities of I, X, Y, Z
 
         Output:
-            e_v, llr: [B, 2, N] zeros
+            e_v: [B, 2, N] joint-Pauli decisions (Z|Y for Hx, X|Y for Hz)
+            llr: [B, 2, N] sector marginal log odds; llr <= 0 can differ from e_v
             iter: iteration at which the sample converged (the stop iteration if not)
             converge: 1 where the hard decision matches both syndromes
         """
@@ -247,6 +251,8 @@ class create(torch.nn.Module):
         oldbitnode = chan
         num_iters = torch.full([B], -1, device=dev)
         converges = torch.full([B], 0, device=dev)
+        e_out = torch.zeros([B, 2, self.H_shape[1]], dtype=self.dtype, device=dev)
+        posterior_out = torch.zeros([B, 4, self.H_shape[1]], dtype=self.dtype, device=dev)
 
         col = self.V_c_col.detach().to(dev)
         vn_adj = self.vn_adj.to(dev)
@@ -293,7 +299,7 @@ class create(torch.nn.Module):
         while self.i < self.max_iter:
             self.i += 1
 
-            message, oldbitnode, conv = step(
+            message, oldbitnode, conv, hard = step(
                 message,
                 oldbitnode,
                 chan,
@@ -304,6 +310,12 @@ class create(torch.nn.Module):
                 vn_adj,
                 mask_dummy,
                 synd_bits,
+            )
+
+            active = (it_rows == -1)[:, None, None]
+            e_out[rows] = torch.where(active, hard[:, :, :-1], e_out[rows])
+            posterior_out[rows] = torch.where(
+                active, oldbitnode[:, :, :-1], posterior_out[rows]
             )
 
             # record the rows that converge in this iteration, without a host sync
@@ -337,9 +349,10 @@ class create(torch.nn.Module):
         # actual stop iter (== max_iter unless the cap broke early)
         num_iters[num_iters == -1] = self.i
         self.batch_size = B
-        out = torch.zeros(
-            [B, self.number_channel, self.H_shape[1]], dtype=self.dtype, device=dev
-        )
+        pI, pX, pY, pZ = posterior_out.unbind(1)
+        eps = max(self.eps, torch.finfo(self.dtype).tiny)
+        llr = torch.stack((pI + pX, pI + pZ), 1).clamp_min(eps).log()
+        llr -= torch.stack((pZ + pY, pX + pY), 1).clamp_min(eps).log()
 
         # warm-up: observe this batch's iteration distribution (decides k + the cap).
         if self.cap is not None and not self.cap.done and not self.cap_bypass:
@@ -348,6 +361,6 @@ class create(torch.nn.Module):
         logger.info("Complete.")
         logger.info(f"Decoding iterations: <{(self.i)}>.")
         io_dict.update(
-            {"e_v": out, "iter": num_iters, "llr": out.clone(), "converge": converges}
+            {"e_v": e_out, "iter": num_iters, "llr": llr, "converge": converges}
         )
         return io_dict

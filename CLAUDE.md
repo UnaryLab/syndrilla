@@ -49,7 +49,7 @@ syndrilla -r=tests/test_outputs -d=examples/alist/bposd_hx.decoding.yaml -e=exam
 ## Git and releases
 
 - Features go on topic branches merged to `main` by PR.
-- The version lives only in `pyproject.toml`; bump it in its own "Bump to vX.Y.Z" commit. The default bump is the patch number (+0.0.1); a larger bump only when asked.
+- The version lives only in `pyproject.toml`. Every PR to `main` ends with a version bump in its own "Bump to vX.Y.Z" commit, added without being asked. The default bump is the patch number (+0.0.1); a larger bump only when asked.
 
 ## Docs rules (docs/*.md, README.md)
 

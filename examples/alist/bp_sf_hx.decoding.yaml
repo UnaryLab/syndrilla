@@ -10,6 +10,6 @@ decoding:
     # syndrome-flipping (SF) post-processing on samples BP leaves unconverged
     sf:
       topk: 20      # number of most-oscillating bits used as flip candidates
-      w_min: 0      # minimum flip weight
-      w_max: 2      # maximum flip weight
-      n_sample: 200 # max combinations sampled per weight
+      w_min: 1      # minimum flip weight
+      w_max: 4      # maximum flip weight
+      n_sample: 5   # max combinations sampled per weight

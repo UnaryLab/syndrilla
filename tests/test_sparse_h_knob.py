@@ -155,7 +155,8 @@ def test_stim(dev):
 # (algorithm, decoding yaml, devices): decoders that read H's COO indices at init
 H_INDEX_DECODERS = [
     ("union_find", "examples/alist/union_find_hx.decoding.yaml", DEVICES),
-    ("mwpm", "examples/alist/mwpm_hx.decoding.yaml", ["cpu"]),
+    ("mwpm", "examples/alist/mwpm_hx.decoding.yaml", DEVICES),
+    ("mwpm_gpu", "examples/alist/mwpm_gpu_hx.decoding.yaml", ["cpu"]),
     ("saq", "examples/alist/saq_hx.decoding.yaml", ["cpu"]),
 ]
 
@@ -165,10 +166,12 @@ H_INDEX_DECODERS = [
     [(a, y, d) for a, y, devs in H_INDEX_DECODERS for d in devs],
 )
 def test_h_index_decoders(algo, yaml_path, dev):
-    """union_find (union_find_cuda on CUDA), mwpm and saq give identical outputs
+    """union_find (union_find_cuda on CUDA), mwpm, mwpm_gpu and saq give identical outputs
     for both sparse_h values on the surface_5 alist code."""
     cfg = read_yaml(os.path.join(ROOT, yaml_path))["decoding"]
     cfg["device"] = {"device_type": dev}
+    if algo == "mwpm_gpu":
+        cfg["config"]["weights"] = "uniform"
     if "checkpoint" in cfg.get("config", {}):
         cfg["config"]["checkpoint"] = os.path.join(ROOT, cfg["config"]["checkpoint"])
     mcfg = _alist_cfg()
