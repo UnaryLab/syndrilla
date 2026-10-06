@@ -44,7 +44,7 @@ def main():
             with open(file, 'w') as f:
                 yaml.safe_dump(data, f, sort_keys=False)
 
-    sweeping_file = Path('zoo/script/sweeping_configs.yaml')
+    sweeping_file = Path('zoo/speedup/script/sweeping_configs.yaml')
     with open(sweeping_file, 'r') as f:
         data = yaml.safe_load(f)
 

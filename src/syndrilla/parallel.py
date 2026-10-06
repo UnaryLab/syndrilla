@@ -368,7 +368,7 @@ def parse_args():
         "-c",
         "--config",
         required=True,
-        help="Sweeping configs yaml, e.g. zoo/script/sweeping_configs.yaml.",
+        help="Sweeping configs yaml, e.g. zoo/speedup/script/sweeping_configs.yaml.",
     )
     gen.add_argument("-r", "--run_dir", required=True, help="Sweep directory.")
     gen.add_argument(

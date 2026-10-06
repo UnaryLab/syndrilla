@@ -18,6 +18,6 @@ def passed(flag):
 if not passed("--configs"):
     sys.argv += ["--configs", *ablation.ENDS]
 if not passed("--out"):
-    sys.argv += ["--out", f"zoo/ablation/{datetime.date.today():%Y-%m-%d}-ablation-memory-results.md"]
+    sys.argv += ["--out", f"zoo/ablation_bposd/{datetime.date.today():%Y-%m-%d}-ablation-memory-results.md"]
 
 ablation.main()
