@@ -51,6 +51,9 @@ def _error_supports(dem):
 
 class create:
     def __init__(self, error_model_cfg, **kwargs) -> None:
+        self.decompose = error_model_cfg.get("decompose_errors", False)
+        if not isinstance(self.decompose, bool):
+            raise ValueError("decompose_errors must be a bool.")
         circuit_str = error_model_cfg.get("circuit", None)
         circuit = get_stim_circuit(circuit_str=circuit_str)
 
@@ -60,8 +63,23 @@ class create:
         self.number_channel = error_model_cfg.get("number_channel", 1)
 
         # extract DEM priors
-        self.dem = _dem_of(circuit)
-        priors = _error_priors(self.dem)
+        if self.decompose:
+            from syndrilla.matrix.stim.stim import _build_decomposed_dem
+
+            data = _build_decomposed_dem(circuit)
+            self.dem, priors = data["dem"], data["priors"]
+            self._components = data["components"]
+            self._mechanism_components = data["mechanism_components"]
+            self._mechanism_priors = torch.tensor(data["mechanism_priors"], dtype=torch.float64)
+            self._mechanism_index = torch.tensor([
+                i for i, indices in enumerate(self._mechanism_components) for _ in indices
+            ], dtype=torch.long)
+            self._component_index = torch.tensor([
+                j for indices in self._mechanism_components for j in indices
+            ], dtype=torch.long)
+        else:
+            self.dem = _dem_of(circuit)
+            priors = _error_priors(self.dem)
         self.num_errors = len(priors)
         self.priors = torch.tensor(priors, dtype=torch.float64)
         self._supports = _error_supports(self.dem)
@@ -84,14 +102,14 @@ class create:
             self._prior_table = None
 
         logger.info(
-            f"Stim error model ready: <{self.num_errors}> DEM mechanisms, "
+            f"Stim error model ready: <{self.num_errors}> DEM columns, "
             f"rate <{self.rate}>."
         )
 
     # rates
     @property
     def _prior_llr(self):
-        """This circuit's per-mechanism prior LLR, at its own noise level.
+        """This circuit's per-column prior LLR, at its own noise level.
 
         `get_llr` reports the rate each *shot* drew, which a sweep varies; this is the
         base circuit's, which is what a caller comparing against the DEM wants.
@@ -100,7 +118,7 @@ class create:
         return torch.log((1 - prior) / prior)
 
     def _avg_rate(self) -> float:
-        """Mean mechanism probability, the scalar a result file records."""
+        """Mean column probability, the scalar a result file records."""
         return float(self.priors.mean()) if self.num_errors else 0.0
 
     def _build_rate_sweep(self, error_model_cfg, training):
@@ -142,20 +160,33 @@ class create:
         # all equal, which is the usual case, a rate point simply sets every one to it
         reference = sum(configured.values()) / len(configured)
 
-        table = []
+        table, mechanism_table = [], []
         for rate in self.rates.tolist():
             point_cfg = dict(gen_cfg)
             scale = rate / reference
             for key, value in configured.items():
                 point_cfg[key] = min(max(value * scale, _MIN_RATE), _MAX_RATE)
-            dem = _dem_of(get_stim_circuit(circuit_cfg=point_cfg))
-            if _error_supports(dem) != self._supports:
+            circuit = get_stim_circuit(circuit_cfg=point_cfg)
+            if self.decompose:
+                from syndrilla.matrix.stim.stim import _build_decomposed_dem
+
+                data = _build_decomposed_dem(circuit)
+                same_supports = (data["components"] == self._components
+                                 and data["mechanism_components"] == self._mechanism_components)
+                table.append(data["priors"].tolist())
+                mechanism_table.append(data["mechanism_priors"].tolist())
+            else:
+                dem = _dem_of(circuit)
+                same_supports = _error_supports(dem) == self._supports
+                table.append(_error_priors(dem))
+            if not same_supports:
                 raise ValueError(
                     f"Rate point <{rate}> gives a detector error model with a different "
                     f"error-mechanism set than the base circuit; narrow the <rate> range."
                 )
-            table.append(_error_priors(dem))
         self._prior_table = torch.tensor(table, dtype=torch.float64)
+        if self.decompose:
+            self._mechanism_prior_table = torch.tensor(mechanism_table, dtype=torch.float64)
         logger.info(
             f"Stim rate sweep ready: <{rate_points}> points over <{self.rate[:2]}>, "
             f"sharing one H of <{self.num_errors}> columns."
@@ -163,7 +194,10 @@ class create:
 
     # error model interface
     def inject_error(self, codeword, batch_size: int = 0):
-        """Sample a DEM mechanism vector per shot, as `codeword` XOR the drawn faults.
+        """Sample DEM faults and return their column vector XOR `codeword`.
+
+        With decomposition enabled, each original mechanism flips all its components
+        together; the returned component columns can therefore be correlated.
 
         The result is the ground-truth error over the columns of `H`, so training reads
         its target from here and `syndrome/stim` derives the detectors from the same
@@ -184,7 +218,7 @@ class create:
 
         if codeword.size(-1) != self.num_errors:
             raise ValueError(
-                f"Error model <stim_circuit> samples <{self.num_errors}> DEM mechanisms, "
+                f"Error model <stim_circuit> samples <{self.num_errors}> DEM columns, "
                 f"got a codeword of width <{codeword.size(-1)}>."
             )
 
@@ -200,8 +234,25 @@ class create:
             prior = prior.unsqueeze(0).expand(shots, -1)
         self._shot_prior = prior
 
-        random_values = torch.rand_like(codeword)
-        error = torch.where(random_values < prior, 1 - codeword, codeword)
+        if self.decompose:
+            if self.rate_is_range:
+                mechanism_prior = self._mechanism_prior_table.to(
+                    device=codeword.device, dtype=codeword.dtype
+                )[idx]
+            else:
+                mechanism_prior = self._mechanism_priors.to(
+                    device=codeword.device, dtype=codeword.dtype
+                ).unsqueeze(0).expand(shots, -1)
+            mechanisms = torch.rand_like(mechanism_prior) < mechanism_prior
+            # Sparse mechanism-to-component indices keep all pieces of a sampled
+            # fault correlated, without allocating a dense mechanisms x columns map.
+            counts = torch.zeros_like(codeword, dtype=torch.int64)
+            counts.index_add_(1, self._component_index.to(codeword.device),
+                              mechanisms[:, self._mechanism_index.to(codeword.device)].long())
+            error = torch.where(counts.remainder(2).bool(), 1 - codeword, codeword)
+        else:
+            random_values = torch.rand_like(codeword)
+            error = torch.where(random_values < prior, 1 - codeword, codeword)
 
         dataloader = torch.utils.data.DataLoader(
             dataset(error, self.get_llr(error), torch.arange(0, shots)),
@@ -212,7 +263,7 @@ class create:
         return error, dataloader
 
     def get_llr(self, error):
-        """Per-mechanism prior LLR, `log((1 - p) / p)`, at the rate each shot drew."""
+        """Per-column prior LLR, `log((1 - p) / p)`, at the rate each shot drew."""
         prior = self._shot_prior
         if prior is None:
             prior = self.priors.to(device=error.device, dtype=error.dtype)

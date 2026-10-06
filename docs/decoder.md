@@ -36,17 +36,17 @@ decoding:
     max_iter: 181
 ```
 
-The one key almost every algorithm reads is `decoding.config.max_iter`, the per-sample iteration budget; it defaults to `50`, and the non-iterative decoders (`osd_0`, `mwpm`, `union_find`, `saq`) ignore it.
+The one key almost every algorithm reads is `decoding.config.max_iter`, the per-sample iteration budget; it defaults to `50`, and the non-iterative decoders (`osd_0`, `mwpm`, `mwpm_gpu`, `union_find`, `saq`) ignore it.
 
 A `config` written as a plain mapping, as above, is the settings of the block's first (or only) algorithm. Written as a list it is **positional**: entry *i* belongs to `algorithm[i]`, which is what lets one chain give each stage its own settings (Section 2), including the same algorithm twice with different ones. Omitting `config` leaves every decoder on its defaults.
 
 A key written in the wrong half is **rejected, not ignored**: `max_iter` left at the top level fails with a message naming `decoding.config`, and a framework-wide key such as `dtype` written inside `config` fails the same way in reverse. A decoder that quietly fell back to `max_iter: 50` instead of the configured `181` would still produce numbers, and they would look like results.
 
-**CUDA acceleration.** Every registered decoder **except `saq`** ships a CUDA-kernel implementation alongside its PyTorch/NumPy module (`saq` is a plain PyTorch model and runs on whatever device the config selects): the belief-propagation family (`bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp4`, `bp_sf`, `relay_bp`) plus `osd_0`, `mwpm`, and `union_find`. There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically when a CUDA-capable GPU is present and the kernel builds.
+**CUDA acceleration.** Every registered decoder **except `saq` and `mwpm`** ships a CUDA-kernel implementation alongside its PyTorch/NumPy module (`saq` is a plain PyTorch model and runs on whatever device the config selects): the belief-propagation family (`bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp4`, `bp_sf`, `relay_bp`) plus `osd_0`, `mwpm_gpu`, and `union_find`. `mwpm` has no CUDA kernel: on any device other than `cpu` it logs an info line, decodes on the host CPU with PyMatching and returns its tensors on the configured device (Section 3.9). There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically.
 
-The kernels come in two flavors. The BP decoders use **fused per-iteration kernels** that vectorize the message-passing across the batch. The graph decoders `mwpm` and `union_find` are inherently sequential per shot, so their kernels parallelize over the **batch axis** (one CUDA thread decodes one shot), while `osd_0` runs one thread block per sample. For `osd_0`, `mwpm`, and `union_find` the CUDA output is **bit-for-bit identical** to the corresponding CPU implementation.
+The kernels come in two flavors. The BP decoders use **fused per-iteration kernels** that vectorize the message-passing across the batch. The graph decoders `mwpm_gpu` and `union_find` are inherently sequential per shot, so their kernels parallelize over the **batch axis** (one CUDA thread decodes one shot), while `osd_0` runs one thread block per sample. For `osd_0`, `mwpm_gpu`, and `union_find` the CUDA output is **bit-for-bit identical** to the corresponding CPU implementation.
 
-The selection **falls back to PyTorch automatically**. If no CUDA GPU is available, or the `.cu` kernel fails to build or instantiate (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM, where the CUDA kernels do not compile), the plain `<algo>/<algo>.py` PyTorch module runs instead, on whatever device the config resolves to (the CUDA device under ROCm, otherwise CPU). The same fallback applies when an algorithm has no CUDA port. Set `force_pytorch: true` to force the PyTorch module even on an NVIDIA CUDA device. The PyTorch `bp_norm_min_sum` and the PyTorch decoders built on it (`bp_sf`, `bp_lottery`, `bp_lottery_policy`, `bp_norm_min_sum_quant`, `bp_lottery_quant`, `bp_sum_prod`), plus `relay_bp`, `bp_branch_assisted` and `bp4`, compile their iteration body with `torch.compile` on CUDA by default (decoder config key `compile`, default `true`); set `compile: false` to run them eager. Each decoder instance keeps its own compile cache. On CPU, or without torch.compile and Triton, the key is ignored and the eager path runs.
+The selection **does not fall back to PyTorch on failure**. On a `cuda` device a decoder with a CUDA module loads it, and that module raises `RuntimeError` when no CUDA GPU is present and fails when its kernel does not build (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM). The plain `<algo>/<algo>.py` PyTorch module runs only for a decoder without a CUDA module or with `force_pytorch: true`, on whatever device the config resolves to. Set `force_pytorch: true` on ROCm, or to force the PyTorch module even on an NVIDIA CUDA device. The PyTorch `bp_norm_min_sum` and the PyTorch decoders built on it (`bp_sf`, `bp_lottery`, `bp_lottery_policy`, `bp_norm_min_sum_quant`, `bp_lottery_quant`, `bp_sum_prod`), plus `relay_bp`, `bp_branch_assisted` and `bp4`, compile their iteration body with `torch.compile` on CUDA by default (decoder config key `compile`, default `true`); set `compile: false` to run them eager. Each decoder instance keeps its own compile cache. On CPU, or without torch.compile and Triton, the key is ignored and the eager path runs.
 
 ## 2. Chained decoders
 A list of algorithms runs each decoder in order; later decoders are only invoked on samples that the earlier ones did not converge on.
@@ -81,7 +81,8 @@ The following table lists every algorithm registered under `src/syndrilla/decode
 | `bp4`                       | 2        | Quaternary BP (BP4) operating on the 2-channel Pauli prior                               | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices                               |
 | `relay_bp`                  | 1        | Relay BP — normalized min-sum run over multiple "legs" with disordered per-variable memory, keeping the best converged solution | relay-bp crate (crates.io, `trmue/relay`)                                                  |
 | `osd_0`                     | 1        | Order-0 Ordered Statistics Decoding               | Soft-Decision Decoding of Linear Block Codes Based on Ordered Statistics                                                            |
-| `mwpm`                      | 1        | Minimum-Weight Perfect Matching (sparse-blossom). Graphlike codes only (every qubit column touches ≤2 checks) | PyMatching v2 sparse-blossom (Higgott & Gidney); clean-room PyTorch/NumPy transformation                     |
+| `mwpm`                      | 1        | Minimum-Weight Perfect Matching with PyMatching v2 (dependency `pymatching`). Graphlike codes only (every qubit column touches ≤2 checks) | PyMatching v2 sparse-blossom (Higgott & Gidney); CPU decode on every device                            |
+| `mwpm_gpu`                  | 1        | Minimum-Weight Perfect Matching, native sparse-blossom port with a CUDA kernel. Graphlike codes only. Up to 2 orders of magnitude slower than `mwpm` in every measured case; not recommended (Section 3.10) | PyMatching v2 sparse-blossom (Higgott & Gidney); clean-room PyTorch/NumPy transformation, bit-exact to PyMatching in all three `weights` modes |
 | `union_find`                | 1        | Union-Find (Delfosse-Nickerson) cluster-growth + peeling decoder. Graphlike codes only (every qubit column touches at most 2 checks; weight-1 = open boundary, e.g. surface codes; weight-2 = toric) | Almost-linear-time decoding for topological codes (arXiv:1709.06218); port of chaeyeunpark/UnionFind         |
 | `saq`                       | 1        | Learned dual-stream transformer decoder plus CPND constraint projection. Single feed-forward pass; toric and rotated surface codes only; needs trained weights | SAQ: Stabilizer-Aware Quantum Error Correction Decoder (arXiv:2512.08914); port of DavidZenati/SAQ-Decoder |
 
@@ -296,7 +297,7 @@ decoding:
 `relay_bp` uses `iteration_initial`/`iteration_count`/`legs` to bound its work, so it **ignores** the common `max_iter` field. The `center`/`width` defaults match the crate's `gamma_dist_interval = (−0.24, 0.66)`.
 
 ### 3.9. mwpm
-Minimum-Weight Perfect Matching via the sparse-blossom algorithm, a self-contained clean-room transformation of PyMatching v2 (it does not import `pymatching` or `networkx`). It is **graphlike-only**: every qubit column of `H` must touch at most two checks (a weight-1 column becomes a boundary edge, weight-2 a detector-detector edge; weight>2 raises an error). The matcher runs per shot and is non-iterative, so it ignores `max_iter`. The correction is **bit-for-bit identical** to PyMatching v2 (not merely equal-weight): the radix-heap LIFO tie-break and canonical neighbor order reproduce PyMatching's exact choice on degenerate syndromes. On a `cuda` device the CUDA port (`mwpm/mwpm_cuda.py`) decodes one shot per thread and matches the CPU output bit-for-bit, falling back to the CPU blossom for any shot the kernel cannot handle. Standalone example (`mwpm_hx.decoding.yaml`):
+Minimum-Weight Perfect Matching with PyMatching v2 (`mwpm/mwpm.py`; dependency `pymatching>=2,<3`, `pyproject.toml:30`). It is **graphlike-only**: every qubit column of `H` must touch at most two checks (a weight-1 column is a boundary edge, weight-2 a detector-detector edge); a heavier column raises `ValueError` at create, "Column {c} has weight {d} > 2; H is not graphlike, so the MWPM decoder does not apply." (`mwpm.py:59-66`). The matcher is `pymatching.Matching.from_check_matrix` on the sparse `H` as a scipy CSC matrix (`mwpm.py:55-58`, `:82`), so the fault ids are the columns of `H` and the correction `e_v` is a column vector like every other decoder's. It is non-iterative and ignores `max_iter`. The default configuration, `weights: prior` with no quantization, is the weighting of `pymatching.Matching.from_detector_error_model`: on the decomposed stim DEM of `stim_mwpm.interface.yaml` the default decoder and PyMatching built from the DEM predict the same observables on every shot, 10000 shots at distance 5 and p 0.001 and 20000 shots at distance 9 and p 0.01 (`tests/test_mwpm.py:287-312`). There is no CUDA kernel: on a `cuda` device, or any device other than `cpu`, the decoder logs one info line at create, "mwpm decodes on the host CPU with PyMatching and returns tensors on the configured device." (`mwpm.py:31-33`), moves the syndrome and the LLRs to the host, decodes in NumPy and returns `e_v`, `llr`, `converge` and `iter` on the configured device (`mwpm.py:126`, `:134`, `:160-166`). Standalone example (`mwpm_hx.decoding.yaml`):
 
 ```
 decoding:
@@ -305,18 +306,86 @@ decoding:
   dtype: float64
   device:
     device_type: cpu
+  config:
+    - weights: uniform
 ```
 
-`mwpm` adds two optional settings, both written under `decoding.config` like any other algorithm-specific key.
+Edge weights are floats passed to PyMatching as they are: with `weights: prior` the edge of qubit `v` gets weight `|llr0_v|`, and PyMatching maps the float weights to its internal integer grid itself (the limit `2^24 - 1` at `mwpm.py:11` is PyMatching's weight limit; the mapping is PyMatching's, not this repo's); with `weights: posterior` the same formula reads the previous stage's `llr` (belief-matching, Higgott et al. 2023, arXiv:2203.04948), so the stage must follow a BP stage in `algorithm`. In both modes a qubit with `llr_v <= 0` is preflipped: its `H` column is added to the syndrome before matching, it is matched with weight `|llr_v|` (0 for `llr_v = 0`), and it is flipped back into `e_v` after matching (`mwpm.py:137-141`, `:158-159`). A missing input, a wrong shape, a complex tensor or a non-finite value raises `ValueError` (`mwpm.py:131-136`); a weight above PyMatching's limit of `2^24 - 1` raises "Edge weights exceed the PyMatching backend limit of 16777215." (`mwpm.py:78-81`). In `uniform` mode one `Matching` is built at create with PyMatching's default weights and decodes every batch with `decode_batch` (`mwpm.py:67`, `:144`); in `prior` mode the batch is grouped by unique weight row and one `Matching` is built per group per forward (`mwpm.py:147-153`); in `posterior` mode one `Matching` is built per shot per forward (`mwpm.py:154-157`). In `prior` and `uniform` mode the matcher runs on every shot, BP-converged ones too, and reports `converge = 1`; in `posterior` mode `skip_converged` defaults to `true` (`mwpm.py:24`; the default per mode holds on `mwpm_gpu` too, `mwpm_gpu.py:1710`), so the converged shots pass through as the previous stage returned them, and `skip_converged: false` matches them too. `mwpm_gpu` (Section 3.10) solves the same problem without the `pymatching` dependency and normalizes the float weights the way PyMatching does; its corrections match `mwpm` bit for bit in all three modes (`tests/test_mwpm.py:89-108`). Chain example (`bp_mwpm_hx.decoding.yaml`):
+
+```
+decoding:
+  algorithm: [bp_norm_min_sum, mwpm]
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+  config:
+    - max_iter: 50
+    - weights: posterior
+```
+
+The optional settings, all written under `decoding.config` like any other algorithm-specific key (`mwpm.py:21-28`):
 
 | Key                              | Description                                                              | Default   |
 |----------------------------------|--------------------------------------------------------------------------|-----------|
-| `decoding.config.num_workers`     | Worker processes used to decode a batch; `<= 1` keeps the sequential path | CPU count |
+| `decoding.config.weights`         | `prior` (float edge weights `\|llr0\|` from the input `llr0`, the log-prior of each column, so no BP stage is needed; the PyMatching `from_detector_error_model` weighting), `posterior` (the same formula on the previous stage's `llr`, see above) or `uniform` (PyMatching's default weights, no `llr` input needed); any other value raises `ValueError` | `prior`   |
+| `decoding.config.skip_converged`  | `true`: in `posterior` mode, only the shots the previous stage left unconverged are matched; a converged shot keeps the previous stage's `e_v`, `llr`, `converge` and `iter` (its BP values), while a matched shot gets the matcher's `e_v`, its sign-encoded `llr` and `converge = 1` (`mwpm.py:87-119`). `true` with `weights: uniform` or `prior` raises `ValueError`, as does a value other than `true` or `false` (`mwpm.py:24-28`, `mwpm_gpu.py:1707-1714`). Separate from the BP CUDA pruning knob of the same name (Section 5) | `true` with `posterior`, `false` otherwise |
+
+
+The three `weights` modes, as PyMatching conditions:
+
+| Mode      | Weight per column                                                                 | PyMatching equivalent                                                                                   | When to use |
+|-----------|-----------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|-------------|
+| `prior`   | `\|llr0\|`, the log-prior `log((1-p)/p)` of each column from the error model, as a float | `Matching.from_detector_error_model(dem)`, and `Matching.from_check_matrix(H, weights=log((1-p)/p))` | The default: circuit-level or code-capacity decoding with the error model's priors, the PyMatching baseline |
+| `uniform` | every column 1                                                                    | `Matching.from_check_matrix(H)` with no weights                                                         | The plain MWPM baseline with no prior information |
+| `posterior` | `\|llr\|` of the previous BP stage as a float (read from the io_dict key `llr`), with the preflip on `llr <= 0` | none                                                                                                    | Belief matching after a BP stage; the only mode that allows `skip_converged`, and converged shots pass through untouched unless `skip_converged: false` |
+
+The default is `weights: prior`; with no `config` block the decoder matches on the error model's priors like `Matching.from_detector_error_model`.
+
+It carries no real per-bit LLR, so for every shot it matches it emits a sign-encoded soft output (`llr = 1 − 2·e_v`) and reports `converge = 1`; `iter` is the defect count of the matched (preflip-adjusted) syndrome, at least 1; the shots `skip_converged` keeps carry the previous stage's values.
+
+### 3.10. mwpm_gpu
+**Not recommended: use `mwpm` instead.** `mwpm_gpu` is up to 2 orders of magnitude slower than `mwpm` (PyMatching) in every measured case, so do not use it.
+
+The native sparse-blossom port: a self-contained clean-room transformation of PyMatching v2 (it imports neither `pymatching` nor `networkx`) with a CUDA kernel (`mwpm_gpu/mwpm_gpu.py`, `mwpm_gpu/mwpm_gpu_cuda.py`, `cuda/mwpm_gpu_kernel.cu`). It solves the same problem as `mwpm` (Section 3.9) with the same `weights` modes, the same graphlike-only rule (a column of weight above 2 raises `ValueError`, `mwpm_gpu.py:68-72`), the same preflip on `llr <= 0`, and the same `llr`, `converge` and `iter` outputs, and its corrections match `mwpm` bit for bit in `uniform`, `posterior` and `prior` mode on the CPU path and on the CUDA path (`tests/test_mwpm.py:89-108`, `test_200_shot_native_matches_pymatching`: a random graphlike `H` with parallel columns, 200 shots, normal LLRs). The radix-heap LIFO tie-break and the canonical neighbour order (boundary edges first, then the other edges sorted by column in `uniform` mode and in insertion order in the float modes, `mwpm_gpu.py:1448-1458`, `:1514-1516`) reproduce PyMatching's choice on degenerate syndromes (`RadixHeapQueue`, `mwpm_gpu.py:116`, LIFO pop at `:157`). The matcher runs per shot and is non-iterative, so it ignores `max_iter`. Standalone example (`mwpm_gpu_hx.decoding.yaml`, the `mwpm_hx` example with `algorithm: [mwpm_gpu]` and `config` written as a mapping):
+
+```
+decoding:
+  algorithm: [mwpm_gpu]
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+  config:
+    weights: uniform
+```
+
+Weights are normalized the way PyMatching normalizes them: with `weights: posterior` or `prior` the float weight of qubit `v` is `|llr_v|` (`mwpm_gpu.py:1870`); after the parallel columns of each node pair, and the repeated boundary columns of each node, collapse to the lowest-weight column (ties to the lowest column index, `mwpm_gpu.py:1427-1445`, `:1493`), the retained weights of a shot are left as they are when they are all integers, and are otherwise scaled so that the largest one maps to `2^24 - 1`; each scaled weight is rounded half away from zero and doubled, so the matcher works on even integers, a zero weight stays zero, and the reported matching weight is scaled back (`mwpm_gpu.py:1494-1505`; the kernel path does the same per shot in `mwpm_gpu_cuda.py:163-170`). A shot whose weights are all zero keeps them at zero. In `uniform` mode every edge weighs 2 with the reported weight scaled back to unit edges (`mwpm_gpu.py:386`, `:1479-1481`). `posterior` mode reads the key `llr` of its input, so it must follow a BP stage in `algorithm`; `prior` mode reads `llr0`; a missing input, a wrong shape, a complex tensor or a non-finite value raises `ValueError` (`mwpm_gpu.py:1864-1869`), and a weight above `2^24 - 1` raises "Edge weights exceed the PyMatching backend limit of 16777215." (`mwpm_gpu.py:1484-1489`, `mwpm_gpu_cuda.py:199-200`). On a `cpu` device the matcher runs per shot, or over the `num_workers` process pool when `num_workers > 1` and the batch is at least `mp_min_batch` (`mwpm_gpu.py:1766`); in `prior` mode the shots are grouped by unique weight row and one matcher per row is built in each worker and rebuilt per batch (`mwpm_gpu.py:1673-1681`, `:1831-1849`). On a `cuda` device `mwpm_gpu_cuda.py` decides the path once at create from `N`, the number of `H` columns (`mwpm_gpu_cuda.py:105`): for `N <= 64` the kernel decodes one shot per thread and returns the correction as a bit mask; for `64 < N <= 256` the kernel returns the match edges and the host rebuilds each shot's shortest paths on the CPU, over the `num_workers` pool or serially by the same rule as the `cpu` device (`mwpm_gpu_cuda.py:230-259`); a shot the kernel cannot handle (arena cap, iteration cap, or a correction that fails the syndrome check) is redone on the CPU blossom with a warning (`mwpm_gpu_cuda.py:260-272`). For `N > 256` the decoder logs a warning at create and the whole batch runs the serial CPU matcher in the main process, so `num_workers` is unused on that path (`mwpm_gpu_cuda.py:107-117`, `:273-278`); the "decoder ready (CUDA blossom kernel, ...)" line is logged on that path too (`mwpm_gpu_cuda.py:133`). The kernel output matches the CPU port bit-for-bit in `uniform` and `posterior` mode (`tests/test_mwpm_gpu.py`, `test_cuda_matches_cpu_surface10`). The kernel is compiled by nvcc on first use in each Python environment and cached afterwards: at create in `uniform` mode, on the first forward in `posterior` and `prior` mode (`mwpm_gpu_cuda.py:101`, `:212-213`). Chain example (`bp_mwpm_hx.decoding.yaml` with `mwpm_gpu` in place of `mwpm`):
+
+```
+decoding:
+  algorithm: [bp_norm_min_sum, mwpm_gpu]
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+  config:
+    - max_iter: 50
+    - weights: posterior
+```
+
+The optional settings, all written under `decoding.config` like any other algorithm-specific key (`mwpm_gpu.py:1707-1714`, `:1746-1747`):
+
+| Key                              | Description                                                              | Default   |
+|----------------------------------|--------------------------------------------------------------------------|-----------|
+| `decoding.config.num_workers`     | Worker processes used to decode a batch; `<= 1` keeps the sequential path. The pool is created on the first forward and kept for the decoder's lifetime; it starts with `fork` when the parent has not initialised CUDA and with `forkserver` after CUDA init; in the `forkserver` case a user script must guard its entry with `if __name__ == "__main__":`, or the pooled decode fails with `BrokenProcessPool` (one retry with a fresh pool, then the error is raised) | CPU count |
 | `decoding.config.mp_min_batch`    | Smallest batch that is worth spreading across those workers               | `64`      |
+| `decoding.config.weights`         | `prior` (per-shot float weights `\|llr0\|` from the input `llr0`, the log-prior of each column, so no BP stage is needed, normalized as above; the PyMatching `from_detector_error_model` weighting, the same default as `mwpm`), `posterior` (the same on the previous stage's `llr`) or `uniform` (every edge weight 1); any other value raises `ValueError` | `prior`   |
+| `decoding.config.skip_converged`  | `true`: in `posterior` mode, only the shots the previous stage left unconverged are matched; a converged shot keeps the previous stage's `e_v`, `llr`, `converge` and `iter` (its BP values), while a matched shot gets the matcher's `e_v`, its sign-encoded `llr` and `converge = 1`. `true` with `weights: uniform` or `prior` raises `ValueError`, as does a value other than `true` or `false` (`mwpm.py:24-28`, `mwpm_gpu.py:1707-1714`). Separate from the BP CUDA pruning knob of the same name (Section 5) | `true` with `posterior`, `false` otherwise |
 
-It carries no real per-bit LLR, so it emits a sign-encoded soft output (`llr = 1 − 2·e_v`) and always reports `converge = 1`.
+It carries no real per-bit LLR, so for every shot it matches it emits a sign-encoded soft output (`llr = 1 − 2·e_v`) and reports `converge = 1`; `iter` is the defect count of the matched (preflip-adjusted) syndrome, at least 1; the shots `skip_converged` keeps carry the previous stage's values.
 
-### 3.10. union_find
+### 3.11. union_find
 The Delfosse-Nickerson Union-Find decoder (arXiv:1709.06218): grow clusters around the syndrome defects, fuse them into a spanning forest, then peel to a correction. It is a PyTorch/NumPy port of `chaeyeunpark/UnionFind` and is **bit-for-bit identical** to that reference; matching its output on degenerate syndromes requires reproducing the C++ `tsl::robin_set` iteration order (a `_RobinTable` replica does this). It is **graphlike-only**: every qubit column of `H` must touch at most two checks. A weight-1 column becomes an open-boundary edge (planar/surface codes), a weight-2 column a detector-detector edge (toric codes), and weight>2 is rejected; a boundary vertex is added so open-boundary clusters absorb their unpaired defect. The decoder is non-iterative (ignores `max_iter`). On a `cuda` device the CUDA port (`union_find/union_find_cuda.py`) runs the **entire** decode, both the detector-graph build and the serial grow/fuse/peel, inside the extension (`cuda/union_find_kernel.cu` via `cuda/union_find_serial.cuh`, a line-for-line transliteration of `union_find.py`'s `decode_shot`). It decodes one shot per CUDA thread with its own scratch (the robin-hood iteration order is load-bearing, so each shot's decode is sequential; parallelism is across shots). It covers the **full graphlike domain**, both toric (weight-2 columns) and surface/open-boundary codes (weight-1 columns), and its output is **bit-for-bit identical** to the CPU `decode_shot` for every shot; on toric codes it additionally matches the C++ chaeyeunpark reference bit-for-bit. There is **no per-shot PyTorch fallback**: nothing in the CUDA module imports `union_find.py`. Large batches are split into fixed-memory-budget chunks (not fallbacks) so the per-launch scratch tensor stays bounded. Standalone example (`union_find_hx.decoding.yaml`):
 
 ```
@@ -328,9 +397,9 @@ decoding:
     device_type: cpu
 ```
 
-`union_find` introduces no algorithm-specific fields beyond Section 1. Like `mwpm` it carries no real per-bit LLR, so it emits `llr = 1 − 2·e_v` and always reports `converge = 1`.
+`union_find` introduces no algorithm-specific fields beyond Section 1. Like `mwpm` and `mwpm_gpu` it carries no real per-bit LLR, so it emits `llr = 1 − 2·e_v` and always reports `converge = 1`.
 
-### 3.11. saq
+### 3.12. saq
 SAQ (arXiv:2512.08914), a **learned** decoder: one feed-forward pass from syndrome to error estimate, so `max_iter` is ignored and `iter` is always 1. The heads emit a per-qubit posterior `llr` and logical class logits; a final CPND stage projects the hard decision onto a syndrome-consistent operator and lightens it within the stabilizer coset, inference-only and skipped during training.
 
 It takes toric and surface codes, rotated or unrotated, and circuit-level detector error models from the stim interface ([interface.md](interface.md)); which one is measured from the matrix, never configured. No code distance is reported, so run files are stemmed `<algorithm>_<check_type>_n<qubits>`, or `dem<detectors>x<mechanisms>` for a DEM. Example (`saq_hx.decoding.yaml`):
@@ -373,7 +442,7 @@ Each block has one reader, the decoder itself; a key written at the top of `deco
 
 The weights this architecture needs are produced by a training run, which the trainer module owns end to end: the objective, the optimizer, the epoch schedule, the run's outputs, and how an interrupted run is resumed. See [trainer.md](trainer.md).
 
-### 3.12. bp_sf
+### 3.13. bp_sf
 Normalized min-sum BP followed by syndrome-flipping post-processing on the samples BP leaves unconverged: the most-oscillating bits become flip candidates, and combinations of them are sampled to look for one that satisfies the syndrome. Example configuration (`bp_sf_hx.decoding.yaml`):
 
 ```
@@ -414,7 +483,7 @@ The group key `rebatch_opt` (boolean, default `true`, Section 5.1) turns the cap
 
 `rebatch_opt` goes in a stage's `decoding.config` entry or at the top level of the `decoding` block, like the other group keys (Section 5.3). The key `rebatch_speedup` is not accepted: a config that has it raises a `ValueError` that names `rebatch_opt` and `rebatch_opt_params`.
 
-**Decoders.** The cap is read by `bp_norm_min_sum` (both paths) and the decoders built on its loop: `bp_norm_min_sum_quant`, `bp_sum_prod`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`; by `bp4` and `relay_bp` (both paths); and by `bp_branch_assisted` on its CUDA path only. `bp_sf`, `osd_0`, `mwpm`, `union_find` and `saq` have no cap. `main.py` keeps the cap only on the first decoder of a chain; BP stages after the first never cap.
+**Decoders.** The cap is read by `bp_norm_min_sum` (both paths) and the decoders built on its loop: `bp_norm_min_sum_quant`, `bp_sum_prod`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`; by `bp4` and `relay_bp` (both paths); and by `bp_branch_assisted` on its CUDA path only. `bp_sf`, `osd_0`, `mwpm`, `mwpm_gpu`, `union_find` and `saq` have no cap. `main.py` keeps the cap only on the first decoder of a chain; BP stages after the first never cap.
 
 **Single round only.** The cap applies when the syndrome has no rounds dimension. With a syndrome generator whose `rounds` is above 1 (the phenomenological measurer), `main.py` logs a warning that the cap supports one round only, and the run never caps. A stim circuit counts as one round, since its detectors already cover every QEC round.
 
@@ -520,7 +589,7 @@ Paths: "BP CUDA" is `bp_norm_min_sum/bp_norm_min_sum_cuda.py`, "BP PyTorch" is `
 | `osd_column_scan`      | OSD         | `true`  | `false`: CUDA eliminates over all `N` columns of the order without the column-local scan; PyTorch runs a dense Gauss-Jordan on `H` augmented with `s` over the whole order. |
 | `osd_packed_transform` | OSD PyTorch | `true`  | `false`: keep the row transform as a dense bool matrix instead of bit-packed and transposed. |
 | `workspace_bytes`      | OSD         | `4 << 30` (4 GiB) | Byte budget per chunk of samples (see Section 3.1). The group off value `1 << 60` puts the whole batch in one chunk. |
-| `sparse_h`             | H           | `true`  | Set outside the `decoding` block (see Section 5.3), read by the matrix bundle and the stim syndrome measurer. `true` keeps H as a coalesced bool sparse COO tensor and computes the syndrome with a sparse matmul; `false`: `MatrixBundle.select()` returns a dense int64 H and the syndrome uses a dense matmul. The bundle builds each check type's H once and `select()` returns that same tensor on every call. The outputs are bit-identical. `union_find`, `mwpm` and `saq` read the sparse H from the matrix loader. |
+| `sparse_h`             | H           | `true`  | Set outside the `decoding` block (see Section 5.3), read by the matrix bundle and the stim syndrome measurer. `true` keeps H as a coalesced bool sparse COO tensor and computes the syndrome with a sparse matmul; `false`: `MatrixBundle.select()` returns a dense int64 H and the syndrome uses a dense matmul. The bundle builds each check type's H once and `select()` returns that same tensor on every call. The outputs are bit-identical. `union_find`, `mwpm`, `mwpm_gpu` and `saq` read the sparse H from the matrix loader. |
 
 ### 5.3. Coupling rules
 - `osd_early_stop: false` forces `osd_prefix_scan` off.

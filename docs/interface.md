@@ -74,6 +74,7 @@ The following table details the configuration parameters used in the interface m
 | `interface.distance`  | Code distance of the generated stim circuit                          | `3`                              |
 | `interface.circuit`   | (optional) Inline stim circuit string, or a mapping of generation parameters, used instead of `code`/`distance` | `<stim circuit string>` |
 | `interface.number_channel` | (optional) Fallback channel count when `error.number_channel` is absent | `1`                       |
+| `interface.decompose_errors` | (optional, default `false`) `true` builds `H` from the stim DEM with `decompose_errors=True`: each graphlike piece (at most 2 detectors plus its observables, or observables alone) of a mechanism is one column, a mechanism's repeated pieces cancel, and a column's prior is the XOR merge `p (1 - q) + (1 - p) q` of the mechanisms that contain it, so `mwpm` and `mwpm_gpu` can run on a circuit-level DEM. The error model samples the mechanisms and flips a column when an odd number of its mechanisms fired, so correlated pieces flip together; the syndrome generator and the observable matrix use the same component `H`. A piece with more than 2 detectors, or a non-bool value, raises `ValueError` | `true` |
 
 The device and dtype of the run come from the **decoder** YAML, not from this file.
 

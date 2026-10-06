@@ -1,0 +1,8 @@
+decoding:
+  algorithm: [mwpm_gpu]
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+  config:
+    weights: uniform

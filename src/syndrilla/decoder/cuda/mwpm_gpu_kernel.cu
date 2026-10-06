@@ -27,6 +27,7 @@ static inline int grid1d(int64_t n) { return (int)((n + THREADS - 1) / THREADS);
 #define ERR_OK        0
 #define ERR_OVERFLOW  1   // an arena capacity was exceeded
 #define ERR_UNSUPPORTED 2 // N > 64*OBSW (obs_mask too narrow; host uses the CPU fallback)
+#define ERR_WEIGHT    4   // invalid weight or weighted graph exceeds the event-time range
 #define ERR_ITER_CAP  3   // flood loop exceeded a safety bound -- guards against a per-shot
                           // hang from a latent structural bug; the host redoes the shot on
                           // the exact CPU blossom (bit-exact), so results stay correct.
@@ -56,10 +57,11 @@ __device__ __forceinline__ Obs& operator^=(Obs& a, const Obs& b) {
 }
 
 struct St {
-    // --- static graph (shared, NOT per-thread) ---
+    // --- graph (shared for uniform weights, per-shot otherwise) ---
     const int* g_off;     // [M+1] CSR offsets into g_nbr/g_obs
     const int* g_nbr;     // [E] neighbor node id, or -1 for the boundary
     const Obs* g_obs;     // [E] observable mask of the edge (bit=qubit, OBSW words)
+    const int64_t* g_weight; // [E] nonnegative even weights, or nullptr for WEIGHT
     int M, N;
 
     int REGCAP, ALTCAP, BCCAP, QCAP, CHILDCAP, STKCAP, MECAP;
@@ -382,7 +384,7 @@ __device__ void find_next_growing(St& S, int node, int64_t rad1_yint,
     int s = S.g_off[node], e = S.g_off[node + 1];
     int start = 0;
     if (e > s && S.g_nbr[s] < 0) {   // boundary neighbor at index 0
-        int64_t w = WEIGHT;
+        int64_t w = S.g_weight ? S.g_weight[s] : WEIGHT;
         int64_t ct = w - rad1_yint;
         if (ct < *best_time) { *best_time = ct; *best_nb = 0; }
         start = 1;
@@ -393,7 +395,7 @@ __device__ void find_next_growing(St& S, int node, int64_t rad1_yint,
         if (S.nd_region_top[node] == S.nd_region_top[nb]) continue;
         int slope2; int64_t yint2; node_local_radius(S, nb, &slope2, &yint2);
         if (slope2 == -1) continue;                 // rad2 shrinking
-        int64_t ct = (int64_t)WEIGHT - rad1_yint - yint2;
+        int64_t ct = (S.g_weight ? S.g_weight[k] : WEIGHT) - rad1_yint - yint2;
         if (slope2 == 1) ct = ct >> 1;              // both growing -> halve (arith shift)
         if (ct < *best_time) { *best_time = ct; *best_nb = k - s; }
     }
@@ -413,7 +415,7 @@ __device__ void find_next_not_growing(St& S, int node, int64_t rad1_yint,
         int nb = S.g_nbr[k];
         int slope2; int64_t yint2; node_local_radius(S, nb, &slope2, &yint2);
         if (slope2 == 1) {
-            int64_t ct = (int64_t)WEIGHT - yint1 - yint2;
+            int64_t ct = (S.g_weight ? S.g_weight[k] : WEIGHT) - yint1 - yint2;
             if (ct < *best_time) { *best_time = ct; *best_nb = k - s; }
         }
     }
@@ -1187,8 +1189,9 @@ __device__ void shatter_extract(St& S, int start_region, Obs* mask, int64_t* wei
 }
 
 __global__ void k_mwpm_decode(
-        // static graph
-        const int* g_off, const int* g_nbr, const Obs* g_obs, int M, int N,
+        // graph: shared offsets; neighbor/observable rows are per-shot with weights
+        const int* g_off, const int* g_nbr, const Obs* g_obs,
+        const int64_t* g_weight, int64_t E, int M, int N,
         // capacities
         int REGCAP, int ALTCAP, int BCCAP, int QCAP, int CHILDCAP, int STKCAP,
         // syndrome + outputs
@@ -1216,7 +1219,10 @@ __global__ void k_mwpm_decode(
     if (b >= B) return;
 
     St S;
-    S.g_off = g_off; S.g_nbr = g_nbr; S.g_obs = g_obs; S.M = M; S.N = N;
+    int64_t graph_start = g_weight ? (int64_t)b * E : 0;
+    S.g_off = g_off; S.g_nbr = g_nbr + graph_start; S.g_obs = g_obs + graph_start;
+    S.g_weight = g_weight ? g_weight + graph_start : nullptr;
+    S.M = M; S.N = N;
     S.REGCAP = REGCAP; S.ALTCAP = ALTCAP; S.BCCAP = BCCAP; S.QCAP = QCAP;
     S.CHILDCAP = CHILDCAP; S.STKCAP = STKCAP; S.MECAP = MECAP;
     // offset every pointer to thread b's slice
@@ -1269,6 +1275,16 @@ __global__ void k_mwpm_decode(
     out_menum[b] = 0;
 
     if (N > 64 * OBSW) { out_mask[b] = 0; out_err[b] = ERR_UNSUPPORTED; return; }
+    if (S.g_weight) {
+        int64_t total = 0;
+        for (int64_t k = 0; k < E; k++) {
+            int64_t w = S.g_weight[k];
+            if (w < 0 || (w & 1) || w >= INF64 - total) {
+                out_mask[b] = 0; out_err[b] = ERR_WEIGHT; return;
+            }
+            total += w;
+        }
+    }
 
     // ---- detection events (nonzero syndrome bits) ----
     const uint8_t* srow = synd + (int64_t)b*M;
@@ -1304,9 +1320,36 @@ __global__ void k_mwpm_decode(
 
 std::vector<torch::Tensor> mwpm_decode_cuda(
         torch::Tensor g_off, torch::Tensor g_nbr, torch::Tensor g_obs,
-        int64_t M, int64_t N, torch::Tensor synd) {
+        int64_t M, int64_t N, torch::Tensor synd,
+        c10::optional<torch::Tensor> weights = c10::nullopt) {
     TORCH_CHECK(synd.is_cuda(), "synd must be CUDA");
+    TORCH_CHECK(synd.dim() == 2 && synd.size(1) == M, "synd must have shape [B, M]");
+    TORCH_CHECK(g_off.device() == synd.device() && g_nbr.device() == synd.device()
+                && g_obs.device() == synd.device(), "graph and synd must share a CUDA device");
+    TORCH_CHECK(g_off.dim() == 1 && g_off.numel() == M + 1, "g_off must have shape [M+1]");
     int64_t B = synd.size(0);
+    bool weighted = weights.has_value();
+    torch::Tensor edge_weights;
+    int64_t E;
+    if (weighted) {
+        edge_weights = weights.value();
+        TORCH_CHECK(edge_weights.device() == synd.device()
+                    && edge_weights.scalar_type() == torch::kInt64,
+                    "weights must be int64 on the syndrome CUDA device");
+        TORCH_CHECK(edge_weights.dim() == 2 && edge_weights.size(0) == B,
+                    "weights must have shape [B, E]");
+        E = edge_weights.size(1);
+        TORCH_CHECK(g_nbr.dim() == 2 && g_nbr.size(0) == B && g_nbr.size(1) == E,
+                    "weighted g_nbr must have shape [B, E]");
+        TORCH_CHECK(g_obs.dim() == 3 && g_obs.size(0) == B && g_obs.size(1) == E
+                    && g_obs.size(2) == OBSW, "weighted g_obs must have shape [B, E, OBSW]");
+        edge_weights = edge_weights.contiguous();
+    } else {
+        TORCH_CHECK(g_nbr.dim() == 1, "uniform g_nbr must have shape [E]");
+        E = g_nbr.numel();
+        TORCH_CHECK(g_obs.dim() == 2 && g_obs.size(0) == E && g_obs.size(1) == OBSW,
+                    "uniform g_obs must have shape [E, OBSW]");
+    }
     auto dev = synd.device();
     auto opt_i32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
     auto opt_i64 = torch::TensorOptions().dtype(torch::kInt64).device(dev);
@@ -1340,6 +1383,7 @@ std::vector<torch::Tensor> mwpm_decode_cuda(
     auto out_mef   = torch::zeros({B, MECAP}, opt_i32);
     auto out_met   = torch::zeros({B, MECAP}, opt_i32);
     auto out_menum = torch::zeros({B}, opt_i32);
+    if (B == 0) return {out_mask, out_err, out_mef, out_met, out_menum};
 
     auto NI32 = [&](int64_t n){ return torch::empty({B, n}, opt_i32); };
     auto NI64 = [&](int64_t n){ return torch::empty({B, n}, opt_i64); };
@@ -1380,7 +1424,8 @@ std::vector<torch::Tensor> mwpm_decode_cuda(
     auto stream = at::cuda::getCurrentCUDAStream();
     k_mwpm_decode<<<grid1d(B), THREADS, 0, stream>>>(
         g_off.data_ptr<int>(), g_nbr.data_ptr<int>(),
-        reinterpret_cast<const Obs*>(g_obs.data_ptr<int64_t>()), (int)M, (int)N,
+        reinterpret_cast<const Obs*>(g_obs.data_ptr<int64_t>()),
+        weighted ? edge_weights.data_ptr<int64_t>() : nullptr, E, (int)M, (int)N,
         REGCAP, ALTCAP, BCCAP, QCAP, CHILDCAP, STKCAP,
         synd_u8.data_ptr<uint8_t>(),
         reinterpret_cast<Obs*>(out_mask.data_ptr<int64_t>()), out_err.data_ptr<int>(), (int)B,
@@ -1413,5 +1458,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Bit-exact batched MWPM decode (one CUDA thread per shot; obs_mask for N<=64, "
           "match-edges for N>64; N<=64*OBSW)",
           py::arg("g_off"), py::arg("g_nbr"), py::arg("g_obs"),
-          py::arg("M"), py::arg("N"), py::arg("synd"));
+          py::arg("M"), py::arg("N"), py::arg("synd"), py::arg("weights") = py::none());
 }

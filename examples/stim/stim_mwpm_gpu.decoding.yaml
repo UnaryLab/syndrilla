@@ -1,0 +1,10 @@
+decoding:
+  algorithm: [mwpm_gpu]
+  check_type: hx
+  dtype: float32
+  device:
+    device_type: cpu
+    device_idx: 0
+  config:
+    weights: uniform
+    num_workers: 32

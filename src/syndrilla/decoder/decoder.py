@@ -277,6 +277,8 @@ MOVED_TO_CONFIG = (
     "sf",
     "mp_min_batch",
     "num_workers",
+    "weights",
+    "skip_converged",
     # saq's blocks, and the weights only a learned decoder loads
     "model",
     "cpnd",
