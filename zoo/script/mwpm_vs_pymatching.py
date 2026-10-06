@@ -1,5 +1,5 @@
 """Speed benchmark: syndrilla mwpm_gpu (the native sparse-blossom port) vs PyMatching v2 on the stim
-surface_code:rotated_memory_x decomposed DEM (interface key decompose true),
+surface_code:rotated_memory_x decomposed DEM (interface key decompose_errors true),
 all four stim noise knobs at p, rounds = distance.
 
 One fixed shot set (torch seed --seed, chunks of --chunk, syndrilla's own
@@ -439,7 +439,7 @@ def write_md(out, results, env, commit, args, shape, dem, keys, agree):
     lines = [
         f"# syndrilla mwpm_gpu vs PyMatching v2, stim surface code d{args.distance} ({date.today()})",
         "",
-        f"- Code: stim surface_code:rotated_memory_x, distance {args.distance}, rounds {args.distance}, the DEM decomposed into graphlike components as H (interface decompose true, the keys of examples/stim/stim_mwpm.interface.yaml at distance {args.distance}); H is {shape[0]} detectors by {shape[1]} component columns; the stim DEM has {dem.num_detectors} detectors and {dem.num_errors} error instructions",
+        f"- Code: stim surface_code:rotated_memory_x, distance {args.distance}, rounds {args.distance}, the DEM decomposed into graphlike components as H (interface decompose_errors true, the keys of examples/stim/stim_mwpm.interface.yaml at distance {args.distance}); H is {shape[0]} detectors by {shape[1]} component columns; the stim DEM has {dem.num_detectors} detectors and {dem.num_errors} error instructions",
         f"- Error model: stim_circuit with {', '.join(NOISE)} and measurement_error_rate all {args.p:g}",
         f"- Shots: {args.shots} drawn once by syndrilla's mechanism sampler (torch seed {args.seed}, chunks of {args.chunk}) and fed to every row; syndromes and observable truth from syndrilla (H times the drawn error, and the observable matrix times it)",
         f"- Timing: one warm-up pass, then {args.repeats} timed passes over all chunks; wall = median of the timed passes, sampling and host-side scoring excluded, CUDA synced before and after each chunk; shots/s = shots over the median wall; row b's timed region rebuilds a NativeMatcher per worker per chunk (the per-batch cache is cleared on each forward, mwpm_gpu.py:1673-1681, :1836) and pickles the {shape[1]}-weight tuple with every shot (mwpm_gpu.py:1837-1839), while rows d and e build their matcher once, outside the timed region",

@@ -291,7 +291,7 @@ def test_stim_example_matches_direct_dem_observable_predictions(distance, rate, 
     from syndrilla.utils import read_yaml
 
     cfg = read_yaml("examples/stim/stim_mwpm.interface.yaml")["interface"]
-    assert cfg["distance"] == 5 and cfg["decompose"] is True
+    assert cfg["distance"] == 5 and cfg["decompose_errors"] is True
     cfg["distance"] = distance
     interface = create_interface(cfg=cfg, error_cfg={key: rate for key in NOISE_KEYS},
                                  syndrome_cfg={"rounds": distance})

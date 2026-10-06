@@ -25,7 +25,7 @@ def _build_decomposed_dem(circuit):
     try:
         dem = circuit.detector_error_model(decompose_errors=True)
     except ValueError as exc:
-        raise ValueError(f"decompose=True requires a graphlike Stim DEM: {exc}") from exc
+        raise ValueError(f"decompose_errors=True requires a graphlike Stim DEM: {exc}") from exc
 
     component_ids, priors, mechanism_priors, mechanism_components = {}, [], [], []
     for inst in dem.flattened():
@@ -40,7 +40,7 @@ def _build_decomposed_dem(circuit):
         for target in [*inst.targets_copy(), None]:
             if target is None or target.is_separator():
                 if len(dets) > 2:
-                    raise ValueError("decompose=True requires each DEM component to have at most two detectors.")
+                    raise ValueError("decompose_errors=True requires each DEM component to have at most two detectors.")
                 if dets or obs:
                     support = (tuple(sorted(dets)), tuple(sorted(obs)))
                     parity[support] = not parity.get(support, False)
@@ -87,7 +87,7 @@ def _build_dem_matrices(circuit, decompose=False):
     causing a fresh Circuit to alias an unrelated cached entry.
     """
     if not isinstance(decompose, bool):
-        raise ValueError("decompose must be a bool.")
+        raise ValueError("decompose_errors must be a bool.")
     if decompose:
         data = _build_decomposed_dem(circuit)
         return data["H"], data["obs_mat"], data["priors"]
@@ -153,7 +153,7 @@ class create:
                 f"stim matrix loader 'target' must be 'check' or 'observable', got <{self.target}>."
             )
 
-        H, obs_mat, priors = _build_dem_matrices(circuit, matrix_cfg.get("decompose", False))
+        H, obs_mat, priors = _build_dem_matrices(circuit, matrix_cfg.get("decompose_errors", False))
         self._matrix = H if self.target == "check" else obs_mat
         self.priors = priors
 

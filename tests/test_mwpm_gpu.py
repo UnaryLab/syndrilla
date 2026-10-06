@@ -537,7 +537,7 @@ def _stim_surface5():
     from syndrilla.interface import create_interface
 
     return create_interface(cfg={
-        "backend": "stim", "decompose": True,
+        "backend": "stim", "decompose_errors": True,
         "circuit": {"code": "surface_code:rotated_memory_x", "distance": 5, "rounds": 5,
                     "after_clifford_depolarization": 0.001,
                     "after_reset_flip_probability": 0.001,

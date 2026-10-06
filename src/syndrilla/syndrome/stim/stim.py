@@ -30,7 +30,7 @@ class create:
         self.circuit = get_stim_circuit(circuit_str=circuit_str)
         self.path = "<inline>"
 
-        H, obs_mat, _ = _build_dem_matrices(self.circuit, syndrome_cfg.get("decompose", False))
+        H, obs_mat, _ = _build_dem_matrices(self.circuit, syndrome_cfg.get("decompose_errors", False))
         self.sparse_h = knob(syndrome_cfg, "sparse_h", True)
         if self.sparse_h:
             H = H.tocoo()

@@ -51,9 +51,9 @@ def _error_supports(dem):
 
 class create:
     def __init__(self, error_model_cfg, **kwargs) -> None:
-        self.decompose = error_model_cfg.get("decompose", False)
+        self.decompose = error_model_cfg.get("decompose_errors", False)
         if not isinstance(self.decompose, bool):
-            raise ValueError("decompose must be a bool.")
+            raise ValueError("decompose_errors must be a bool.")
         circuit_str = error_model_cfg.get("circuit", None)
         circuit = get_stim_circuit(circuit_str=circuit_str)
 
