@@ -172,7 +172,7 @@ decoding:
 | `decoding.config.flip_start_iter` | Sign-flips start after this iteration (first flip at iteration `flip_start_iter + 1`) | `4`       |
 | `decoding.config.flip_interval`   | Iterations between sign-flips; a value that is not an int `>= 1` (a float, a bool or a string too) raises `ValueError` | `1`       |
 
-A sign-flip happens at the end of iteration `i` only when `i > flip_start_iter` and `(i - flip_start_iter - 1) % flip_interval == 0`, so the first flip is at iteration `flip_start_iter + 1` and the next ones every `flip_interval` iterations; on the other iterations no random value is drawn.
+A sign-flip happens at the end of iteration `i` only when `i > flip_start_iter` and `(i - flip_start_iter - 1) % flip_interval == 0` and `i < max_iter`, so the first flip is at iteration `flip_start_iter + 1` and the next ones every `flip_interval` iterations; on the other iterations no random value is drawn. No flip happens at iteration `max_iter`, which comes after the last convergence check, so the returned `llr` of a non-converged shot is the BP posterior `u_init + sum(c2v)` with no negated entry, and `llr <= 0` equals `e_v` on every row.
 
 ### 3.5. bp_lottery_quant
 Lottery BP with fixed-point quantized messages. Example configuration (`lottery_bp_quant_hx.decoding.yaml`):
@@ -224,7 +224,7 @@ decoding:
 | `decoding.config.random_machine`  | Random sampler used to drive sign-flips: `sobol` or `system`             | `sobol`     |
 | `decoding.config.sign_flip_policy`| Sign-flip policy (see table below)                                        | `Proposed`  |
 
-`bp_lottery_policy` does not read `flip_interval`: it makes a sign-flip at the end of every iteration.
+`bp_lottery_policy` does not read `flip_interval`: it makes a sign-flip at the end of every iteration except the last (`i == max_iter`), so the returned `llr` of a non-converged shot has no negated entry.
 
 The accepted values for `sign_flip_policy`:
 

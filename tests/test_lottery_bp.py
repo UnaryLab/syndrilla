@@ -2,12 +2,14 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 
 sys.path.append(os.getcwd())
 
 
 def _surface10_system_outputs(mod, extra=None, batches=((0, 16, 0.03), (1, 16, 0.03))):
-    """Per batch: e_v, iter, converge, the CPU and CUDA global RNG states after
+    """Per batch: e_v, llr, iter, converge, the CPU and CUDA global RNG states after
     decoding, and cap.frac. Each (seed, B, p) in batches is a BSC batch on
     surface_10 hx, decoded in turn by one decoder with random_machine system
     after torch.manual_seed(7); extra updates the decoder config."""
@@ -39,9 +41,12 @@ def _surface10_system_outputs(mod, extra=None, batches=((0, 16, 0.03), (1, 16, 0
         llr0 = torch.full((B, N), math.log((1 - p) / p), dtype=torch.float64)
         with torch.no_grad():
             out = dec({"synd": synd, "llr0": llr0})
-        o = {k: out[k].cpu() for k in ("e_v", "iter", "converge")}
+        o = {k: out[k].cpu() for k in ("e_v", "llr", "iter", "converge")}
         o["cpu_rng"] = torch.get_rng_state()
-        o["cuda_rng"] = torch.cuda.get_rng_state()
+        o["cuda_rng"] = (
+            torch.cuda.get_rng_state()
+            if torch.cuda.is_available() else torch.empty(0, dtype=torch.uint8)
+        )
         o["cap_frac"] = None if dec.cap is None else dec.cap.frac
         outs.append(o)
     return outs
@@ -54,6 +59,38 @@ def _assert_same(ref, got):
         for k in r:
             same = r[k] == o[k] if k == "cap_frac" else torch.equal(r[k], o[k])
             assert same, (b, k)
+
+
+@pytest.mark.parametrize("backend", ["cpu", "pytorch", "cuda"])
+@pytest.mark.parametrize(
+    "variant", ["", "_quant", "_policy"], ids=["lottery", "quant", "policy"]
+)
+@pytest.mark.parametrize("rm", ["sobol", "system"])
+def test_final_iteration_matches_plain_bp(backend, variant, rm):
+    from importlib import import_module
+    import torch
+
+    if backend != "cpu":
+        _cuda_or_skip()
+    suffix = "_cuda" if backend == "cuda" else ""
+    name = "bp_lottery" + variant
+    lottery = import_module(f"syndrilla.decoder.{name}.{name}{suffix}")
+    name = "bp_norm_min_sum" + ("_quant" if variant == "_quant" else "")
+    plain = import_module(f"syndrilla.decoder.{name}.{name}{suffix}")
+    cfg = dict(
+        device={"device_type": "cpu" if backend == "cpu" else "cuda"},
+        max_iter=1 if variant == "_policy" else 3,
+        flip_start_iter=2,
+        random_machine=rm,
+    )
+    if variant == "_quant":
+        cfg.update(int_width=3, frac_width=4)
+    batches = ((0, 16, 0.1),)
+    out = _surface10_system_outputs(lottery, cfg, batches)[0]
+    ref = _surface10_system_outputs(plain, cfg, batches)[0]
+    assert not bool(out["converge"].all())
+    assert torch.equal(out["llr"] <= 0, out["e_v"])
+    _assert_same([ref], [out])
 
 
 def test_system_pytorch_matches_cuda():
@@ -147,7 +184,7 @@ def _assert_interval_cases(out, k):
     import types
     from syndrilla.decoder.bp_lottery.bp_lottery import is_flip_iter
 
-    d = types.SimpleNamespace(flip_start_iter=4, flip_interval=k)
+    d = types.SimpleNamespace(flip_start_iter=4, flip_interval=k, max_iter=60)
     ends = [int(o["iter"].max()) for o in out if bool(o["converge"].all())]
     assert any(t > 4 and is_flip_iter(d, t) for t in ends), ends
     assert any(t > 4 and not is_flip_iter(d, t) for t in ends), ends
@@ -180,7 +217,7 @@ def test_flip_interval_1_matches_default():
 
 def test_flip_interval_2_flip_iterations():
     """With flip_start_iter 4 and flip_interval 2, each path flips at
-    iterations 5, 7, ..., 19 of max_iter 20 on a batch that does not fully
+    iterations 5, 7, ..., 17 of max_iter 19 on a batch that does not fully
     converge, and on no other iteration."""
     import types
 
@@ -197,11 +234,11 @@ def test_flip_interval_2_flip_iterations():
 
         out = _surface10_system_outputs(
             types.SimpleNamespace(create=Rec),
-            dict(max_iter=20, flip_start_iter=4, flip_interval=2),
+            dict(max_iter=19, flip_start_iter=4, flip_interval=2),
             ((0, 16, 0.1),),
         )
         assert not bool(out[0]["converge"].all())
-        assert seen == list(range(5, 20, 2)), (mod.__name__, seen)
+        assert seen == list(range(5, 19, 2)), (mod.__name__, seen)
 
 
 def test_flip_interval_pytorch_matches_cuda():
@@ -224,7 +261,7 @@ def test_flip_interval_pytorch_matches_cuda():
 
 def test_quant_flip_interval_2_flip_iterations():
     """bp_lottery_quant with flip_start_iter 4 and flip_interval 2: each path
-    flips at iterations 5, 7, ..., 19 of max_iter 20 on a batch that does not
+    flips at iterations 5, 7, ..., 17 of max_iter 19 on a batch that does not
     fully converge, and on no other iteration."""
     import types
 
@@ -245,7 +282,7 @@ def test_quant_flip_interval_2_flip_iterations():
         out = _surface10_system_outputs(
             types.SimpleNamespace(create=Rec),
             dict(
-                max_iter=20,
+                max_iter=19,
                 flip_start_iter=4,
                 flip_interval=2,
                 int_width=3,
@@ -254,7 +291,7 @@ def test_quant_flip_interval_2_flip_iterations():
             ((0, 16, 0.1),),
         )
         assert not bool(out[0]["converge"].all())
-        assert seen == list(range(5, 20, 2)), (mod.__name__, seen)
+        assert seen == list(range(5, 19, 2)), (mod.__name__, seen)
 
 
 def test_quant_flip_interval_pytorch_matches_cuda():

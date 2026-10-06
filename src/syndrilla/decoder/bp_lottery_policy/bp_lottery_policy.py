@@ -14,7 +14,7 @@ class create(_NmsPy):
     """
     Lottery BP decoder with a selectable sign-flip policy: bp_norm_min_sum (eager
     or compiled step, row compaction) with the policy's sign-flip in _iter_hook
-    every iteration.
+    every iteration before max_iter.
 
     Accepts every bp_norm_min_sum key plus
         random_machine  : 'sobol' (default) | 'system'
@@ -67,6 +67,8 @@ class create(_NmsPy):
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Policy sign-flip at the end of iteration i on the unconverged rows; the
         next iteration reads the flipped l_v."""
+        if i >= self.max_iter:
+            return
         self.i = i
         self._active = active
         self._apply_policy(syndrome, self.syndrome_estimation(e_v), l_v)
