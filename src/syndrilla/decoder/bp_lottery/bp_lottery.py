@@ -48,10 +48,10 @@ def read_flip_interval(decoding_cfg):
 
 
 def is_flip_iter(dec, i):
-    """True when iteration i flips: i > flip_start_iter, and every
-    flip_interval iterations from flip_start_iter + 1 on."""
+    """True when flip_start_iter < i < max_iter and every flip_interval
+    iterations from flip_start_iter + 1 on."""
     s = dec.flip_start_iter
-    return i > s and (i - s - 1) % dec.flip_interval == 0
+    return s < i < dec.max_iter and (i - s - 1) % dec.flip_interval == 0
 
 
 class create(_NmsPy):
