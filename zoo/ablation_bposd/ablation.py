@@ -37,7 +37,7 @@ every pass has at least 16 batches and the BP cap can warm up) whose one-batch
 decode with that row's config fits in GPU memory and in the row timeout.
 
 Usage:
-    conda run -n syndrilla python zoo/script/ablation.py [--distances 3 9 15 21 27] [--ps 1e-3 1e-2 1e-1] [--shots 4096] [--batch-size 64] [--row-timeout 1800] ...
+    conda run -n syndrilla python zoo/ablation_bposd/ablation.py [--distances 3 9 15 21 27] [--ps 1e-3 1e-2 1e-1] [--shots 4096] [--batch-size 64] [--row-timeout 1800] ...
 """
 import argparse
 import csv
@@ -478,7 +478,8 @@ def main():
     )
     ap.add_argument(
         "--out",
-        default=f"zoo/ablation/{datetime.date.today():%Y-%m-%d}-ablation-results.md",
+        default=f"zoo/ablation_bposd/{datetime.date.today():%Y-%m-%d}-ablation-results.md",
+        help="Markdown output path (default: %(default)s).",
     )
     args = ap.parse_args()
 

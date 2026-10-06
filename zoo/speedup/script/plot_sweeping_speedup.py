@@ -5,13 +5,13 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 # Get the directory containing the current Python file
-current_path = Path(__file__).resolve().parent.parent.parent
+current_path = Path(__file__).resolve().parents[3]
 
 # Add to sys.path (if not already there)
 if str(current_path) not in sys.path:
     sys.path.insert(0, str(current_path))
 
-from zoo.script.plot_utils import (
+from zoo.speedup.script.plot_utils import (
     load_results_dict,
     lookup_results_dict,
     tag_to_str,

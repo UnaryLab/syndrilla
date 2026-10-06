@@ -542,7 +542,7 @@ A training run resumes on the pair of checkpoints it wrote, ```-ckpt``` set to t
 Run both from the repository root: the templates and the matrix paths in the generated YAMLs are relative to it (```examples/alist/```).
 
 ```command
-syndrilla-parallel sweep-gen -c zoo/script/sweeping_configs.yaml -r zoo/bposd_quant_sweeping
+syndrilla-parallel sweep-gen -c zoo/speedup/script/sweeping_configs.yaml -r zoo/bposd_quant_sweeping
 syndrilla-parallel sweep -r zoo/bposd_quant_sweeping -te=1000 -bs=10000 -l=SUCCESS
 ```
 
@@ -559,12 +559,12 @@ distance: [3, 5, 7, 9, 11, 13]
 dtype: ['float32']
 ```
 
-This file lives at ```zoo/script/sweeping_configs.yaml```; it ships with the wider alternatives commented out above each line.
+This file lives at ```zoo/speedup/script/sweeping_configs.yaml```; it ships with the wider alternatives commented out above each line.
 
 *Note that currently supported data format includes ['bfloat16', 'float16', 'float32', 'float64'].*
 
 ```sweep-gen``` writes one folder per combination directly under ```-r```, named ```<code>_<check_type>_<probability>_<distance>_<dtype>```, holding ```<decoder>_<check_type>.decoding.yaml```, ```bsc.error.yaml```, ```lx.check.yaml``` (```hx```) or ```lz.check.yaml``` (```hz```), ```perfect.syndrome.yaml``` and ```matrix.yaml```. The ```max_iter``` of the decoding YAML is set from the distance. If a point folder already holds a result YAML, ```sweep-gen``` writes nothing and exits, unless ```--force``` is given, which rewrites the config YAMLs and keeps the results.
-```python zoo/script/generate_sweeping_configs.py``` does the same from ```zoo/script/sweeping_configs.yaml```, writing the points of each decoder to ```zoo/<decoder>_sweeping/```, or all points to ```zoo/<-r>/``` with ```-r```. A point folder holds one decoding YAML, so both refuse a sweep dir given more than one decoder.
+```python zoo/speedup/script/generate_sweeping_configs.py``` does the same from ```zoo/speedup/script/sweeping_configs.yaml```, writing the points of each decoder to ```zoo/<decoder>_sweeping/```, or all points to ```zoo/<-r>/``` with ```-r```. A point folder holds one decoding YAML, so both refuse a sweep dir given more than one decoder.
 
 ```sweep``` takes every folder under ```-r``` that holds a ```*.decoding.yaml``` as a point, in sorted name order, and takes ```-d```, ```-e```, ```-c```, ```-s``` and ```-m``` from the point folder's ```*.decoding.yaml```, ```*.error.yaml```, ```*.check.yaml```, ```*.syndrome.yaml``` and ```matrix.yaml```, each of which must match exactly one file; giving any of them, or ```-i```, on the command line is refused. Every other ```run``` flag applies to each point, and unknown flags are passed to every worker. Each point folder is launched exactly like ```run``` with ```-r``` set to that folder: probe, ```launch.yaml```, worker dirs, pooled stop, ```merged_result.yaml``` and the pooled ```result_phy_err_<rate>.yaml```, resume and refusals all work per folder. Every point is planned before the first one starts, so a refusal in any folder stops the sweep before it runs anything.
 

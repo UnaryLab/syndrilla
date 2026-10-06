@@ -1,4 +1,4 @@
-"""Write the point folders of zoo/script/sweeping_configs.yaml; run from the repo root.
+"""Write the point folders of zoo/speedup/script/sweeping_configs.yaml; run from the repo root.
 
 Calls syndrilla.sweep.generate. Without -r, the points of each decoder go to
 zoo/<decoder>_sweeping/; with -r, all points go to zoo/<run_dir>/.
@@ -27,7 +27,7 @@ def main():
     )
     args = parser.parse_args()
 
-    config = read_yaml("zoo/script/sweeping_configs.yaml")
+    config = read_yaml("zoo/speedup/script/sweeping_configs.yaml")
     if args.run_dir is not None:
         generate(config, os.path.join("zoo/", args.run_dir), args.force)
         return

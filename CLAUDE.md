@@ -40,7 +40,7 @@ syndrilla -r=tests/test_outputs -d=examples/alist/bposd_hx.decoding.yaml -e=exam
 - **H storage**: `sparse_h` (default true) keeps H as a coalesced bool sparse COO tensor; it is set in the `matrix`, stim `syndrome`, or `interface` block, never in `decoding`.
 - **Device** (`utils/utils.py: parse_device_dtype`): omitted device means cuda if available; bad dtype falls back to float64; mps with float64 falls back to cpu.
 - **Optimization groups** (`decoder/knobs.py`): six bool groups, all on by default: `pruning_opt`, `fusion_opt`, `mapping_opt`, `gather_opt`, `memory_opt`, `rebatch_opt`. An explicit knob wins over its group. `rebatch_opt` is the learned iteration cap; the old key `rebatch_speedup` raises.
-- **Docs**: `docs/` has one file per module (decoder, error, syndrome, matrix, interface, trainer) and design notes (optimizations, parallel, bp_interventions). `zoo/` holds tracked sweep/plot tooling; `zoo/study/` holds ignored local research scripts, notes and results. `reports/` holds dated tech reports.
+- **Docs**: `docs/` has one file per module (decoder, error, syndrome, matrix, interface, trainer) and design notes (optimizations, parallel, bp_interventions). `zoo/speedup/script/` holds tracked sweep/plot tooling, with published sweep results and figures in `zoo/speedup/`; `zoo/ablation_bposd/` holds the ablation driver, memory helper, plotting tools and their results; `zoo/study/` holds ignored local research scripts, notes and results. `reports/` holds dated tech reports.
 
 ## Config keys
 
