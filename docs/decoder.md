@@ -457,9 +457,9 @@ decoding:
     max_iter: 181
     sf:
       topk: 20
-      w_min: 0
-      w_max: 2
-      n_sample: 200
+      w_min: 1
+      w_max: 4
+      n_sample: 5
 ```
 
 The SF stage is configured by a nested `sf` block under `decoding.config`.

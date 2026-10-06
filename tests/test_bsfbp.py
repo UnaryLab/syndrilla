@@ -2,6 +2,7 @@ import os
 import sys
 import time
 
+import pytest
 import torch
 from loguru import logger
 
@@ -14,6 +15,38 @@ from syndrilla.matrix import load_matrices
 from syndrilla.metric import BatchTracker, MetricState
 from syndrilla.syndrome import create_syndrome
 from syndrilla.utils import get_path, parse_device_dtype, read_yaml
+
+
+@pytest.mark.parametrize("backend", ["cpu", "pytorch", "cuda"])
+def test_llr_matches_hard_decision(backend):
+    from syndrilla.decoder.bp_branch_assisted import (
+        bp_branch_assisted,
+        bp_branch_assisted_cuda,
+    )
+
+    if backend != "cpu" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    mod = bp_branch_assisted_cuda if backend == "cuda" else bp_branch_assisted
+    cfg = dict(
+        device={"device_type": "cpu" if backend == "cpu" else "cuda"},
+        dtype="float64",
+        check_type="hx",
+        max_iter=3,
+        max_b_iter=2,
+        compile=False,
+    )
+    matrix_cfg = read_yaml("examples/alist/surface_10.matrix.yaml")["matrix"]
+    bundle = load_matrices(matrix_cfg, *parse_device_dtype(cfg))
+    H = bundle.select("hx")[3].to_dense().cpu().double()
+    g = torch.Generator().manual_seed(0)
+    err = (torch.rand(16, H.shape[1], generator=g) < 0.1).double()
+    with torch.no_grad():
+        out = mod.create(cfg, bundle=bundle)(
+            {"synd": ((err @ H.T) % 2).to(torch.uint8),
+             "llr0": torch.full_like(err, 2.0)}
+        )
+    assert not bool(out["converge"].all())
+    assert torch.equal(out["llr"] <= 0, out["e_v"])
 
 
 def test_batch_alist_hx(batch_size=1000, target_error=1000,
@@ -101,6 +134,7 @@ def test_batch_alist_hx(batch_size=1000, target_error=1000,
             for decoder_idx in range(num_decoders):
                 start_time = time.time()
                 io_dict = decoders[decoder_idx](io_dict)
+                assert torch.equal(io_dict["llr"] <= 0, io_dict["e_v"])
                 elapsed = time.time() - start_time
 
                 bt.record_metric(decoder_idx, io_dict, elapsed)
