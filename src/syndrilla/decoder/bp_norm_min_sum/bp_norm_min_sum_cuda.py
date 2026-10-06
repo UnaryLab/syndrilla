@@ -385,15 +385,20 @@ class create(nn.Module):
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Per-step path hook, called at the end of iteration i (after the
-        convergence update and the early-exit checks, so not on the iteration
-        that breaks the loop). l_v [B, N_ext] is the posterior LLR (column N is
+        convergence update and the early-exit checks). With self._hook_before_stop
+        True, it runs before those checks, including on the iteration that breaks.
+        self._hook_final is True when those checks would end the loop.
+        l_v [B, N_ext] is the posterior LLR (column N is
         the +inf dummy), e_v [B, N_ext] uint8 the hard decision, active [B] bool
         the samples still unconverged, syndrome [B, M] the decoder-dtype
         syndrome. The hook may change l_v in place on active rows only; the next
         iteration reads it, and an active row's l_v at loop end is the returned
         llr. Converged rows, e_v and syndrome are read-only, and the hook cannot
-        mark rows converged. A subclass that overrides it always runs the
-        per-step path. The default does nothing."""
+        mark rows converged. It may set self._hook_stop to a [B] bool tensor:
+        True active rows stop with their current l_v/e_v and iteration i, keeping
+        converge == 0. The mask is reset to None before each call and forward.
+        A subclass that overrides it always runs the per-step path.
+        The default does nothing."""
 
     def _exit_hook(self, l_v, e_v, num_iters, converges) -> None:
         """Called once after the decode loop on both paths, with num_iters final
@@ -464,7 +469,7 @@ class create(nn.Module):
           host_check_every (default 8, 0 never) iterations when the rebatch cap
           is inactive, and every iteration when the cap is active. A
           subclass's _iter_hook runs at the end of each iteration that does not
-          break the loop.
+          break the loop, or before early-exit checks with _hook_before_stop.
 
         With edge_layout padded both paths run on col_pad and VN_eid_pad, and
         b_c2v is [B, M * D + 1]. On the per-step path, fuse_vn false fills an
@@ -497,6 +502,9 @@ class create(nn.Module):
         syndrome = io_dict["synd"].to(dtype=self.dtype, device=dev).contiguous()
         B, M = syndrome.shape
         self.batch_size = B
+        self._hook_stop = None
+        self._hook_rows = None
+        self._hook_final = False
 
         # Append dummy column (∞) so variable index N always gives ∞ LLR.
         llr0 = io_dict["llr0"].to(dtype=self.dtype, device=dev).contiguous()
@@ -568,6 +576,9 @@ class create(nn.Module):
             mismatch = torch.zeros(B, dtype=torch.int32, device=dev)
             num_iters.fill_(-1)
             hooked = type(self)._iter_hook is not create._iter_hook
+            hook_before_stop = hooked and getattr(self, "_hook_before_stop", False)
+            if hooked:
+                self._hook_rows = torch.arange(B, device=dev)
             # num_iters the three compute kernels skip on: all -1 runs every sample
             run = num_iters
             if not self._skip_converged:
@@ -616,21 +627,44 @@ class create(nn.Module):
                     new = (num_iters == i).unsqueeze(1)
                     torch.where(new, l_v, l_snap, out=l_snap)
                     torch.where(new, e_v, e_snap, out=e_snap)
+                should_break = False
                 if cap_frac is not None:
                     # cap active: count converged each iteration (host sync) and stop
                     # once the learned fraction is reached or every sample converges.
-                    n_conv = int((num_iters != -1).sum())
+                    n_conv = int(converges.sum())
                     if n_conv >= cap_frac * B or n_conv == B:
                         cap_stopped = n_conv < B and i < self.max_iter
-                        break
+                        should_break = True
                 elif (
                     every
                     and i % every == 0
                     and not (num_iters == -1).any().item()
                 ):
+                    should_break = True
+                if hooked and (hook_before_stop or not should_break):
+                    self._hook_stop = None
+                    self._hook_final = should_break
+                    active = num_iters == -1
+                    self._iter_hook(i, l_v, e_v, active, syndrome)
+                    if self._hook_stop is not None:
+                        stop = self._hook_stop & active
+                        num_iters.masked_fill_(stop, i)
+                        if not self._skip_converged:
+                            run.masked_fill_(stop, i)
+                            l_snap[stop] = l_v[stop]
+                            e_snap[stop] = e_v[stop]
+                        if not hook_before_stop:
+                            should_break |= not (num_iters == -1).any().item()
+                if hook_before_stop:
+                    should_break = not (num_iters == -1).any().item()
+                    if cap_frac is not None:
+                        n_conv = int(converges.sum())
+                        cap_stopped = (
+                            n_conv >= cap_frac * B and n_conv < B and i < self.max_iter
+                        )
+                        should_break |= n_conv >= cap_frac * B
+                if should_break:
                     break
-                if hooked:
-                    self._iter_hook(i, l_v, e_v, num_iters == -1, syndrome)
 
             if not self._skip_converged:
                 done = (num_iters != -1).unsqueeze(1)

@@ -50,8 +50,9 @@ class create(torch.nn.Module):
 
     A subclass can change the decoding through two hooks, with the names, argument
     order and contract of the hooks in bp_norm_min_sum_cuda: `_iter_hook` at the end
-    of each iteration that does not break the loop, and `_exit_hook` once after the
-    loop. The defaults do nothing; `_iter_hook` is called only when a subclass
+    of each iteration that does not break the loop (or before early-exit checks
+    with `_hook_before_stop`), and `_exit_hook` once after the loop.
+    The defaults do nothing; `_iter_hook` is called only when a subclass
     overrides it. Both run eagerly, on the eager and the compiled path alike.
     Both ports take the same arguments, so one override serves both. In a class
     that inherits from a CUDA decoder and a PyTorch decoder, the first base in the
@@ -60,8 +61,9 @@ class create(torch.nn.Module):
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Called at the end of iteration i, after the convergence update and the
-        early-exit checks (so not on the iteration that breaks the loop: all rows
-        converged, or the rebatch cap reached) and before compaction.
+        early-exit checks and before compaction. With self._hook_before_stop True,
+        it runs before those checks, including on the iteration that breaks.
+        self._hook_final is True when those checks would end the loop.
 
         The tensors hold the rows still decoded, which after a compaction are fewer
         than the batch: row r is sample self._hook_rows[r] ([R] long, set before
@@ -75,7 +77,10 @@ class create(torch.nn.Module):
         reads it, compaction keeps it, and an active row's l_v at loop end is the
         returned llr. Converged rows of l_v (already copied to the output), e_v,
         active, syndrome and self._hook_rows are read-only, and the hook cannot
-        mark rows converged. The default does nothing.
+        mark rows converged. It may set self._hook_stop to a [R] bool tensor:
+        True active rows stop with their current l_v/e_v and iteration i, keeping
+        converge == 0. The mask is reset to None before each call and forward.
+        The default does nothing.
         """
 
     def _exit_hook(self, l_v, e_v, num_iters, converges) -> None:
@@ -296,7 +301,8 @@ class create(torch.nn.Module):
             s_est:  estimated syndrome for c-th code node at i-th iteration
 
         Hooks: _iter_hook(i, l_v, e_v, active, syndrome) at the end of each
-        iteration that does not break the loop, and _exit_hook(l_v, e_v, num_iters,
+        iteration that does not break the loop (before early-exit checks with
+        _hook_before_stop), and _exit_hook(l_v, e_v, num_iters,
         converges) once after it; see their docstrings. They have the arguments of
         the bp_norm_min_sum_cuda hooks, and the sample index of each compacted row
         is self._hook_rows. A class with a CUDA and a PyTorch base takes the hooks
@@ -337,7 +343,7 @@ class create(torch.nn.Module):
         num_iters = torch.full([self.batch_size], -1, device=self.device)
         converges = torch.full([self.batch_size], 0, device=self.device)
         # the per-iteration state holds only the rows still decoded: row r is sample
-        # rows[r], and it_rows[r] is its convergence iteration (-1 while unconverged)
+        # rows[r], and it_rows[r] is its finish iteration (-1 while still running)
         rows = torch.arange(B, device=self.device)
         it_rows = num_iters.clone()
 
@@ -381,12 +387,17 @@ class create(torch.nn.Module):
         cap_frac = self.cap.frac if cap_applied else None
         cap_stopped = False
         hooked = type(self)._iter_hook is not create._iter_hook
+        hook_before_stop = hooked and getattr(self, "_hook_before_stop", False)
         self._hook_rows = None
+        self._hook_stop = None
+        self._hook_final = False
 
         self.i = 0
         while self.i < self.max_iter:
             # variable node update update v2c
             self.i += 1
+            if hook_before_stop:
+                self._hook_rows = rows
 
             if self.compile:
                 c2v_msg, l_v, e_v, s_est = self._step(
@@ -435,31 +446,56 @@ class create(torch.nn.Module):
                 l_out[dst] = l_v[indices]
                 converges[dst] = 1
 
-            # do the early termination if all batch satisfy the condition
-            if checker.size()[0] == 0:
-                break
-
-            # adaptive cap: stop once >= cap_frac of the batch has converged; the
-            # unconverged remainder (converge == 0) becomes main's deferred tail.
+            should_break = checker.size()[0] == 0
             if cap_frac is not None:
-                n_conv = int((num_iters != -1).sum())
+                n_conv = int(converges.sum())
                 if n_conv >= cap_frac * B:
                     cap_stopped = n_conv < B and self.i < self.max_iter
-                    break
+                    should_break = True
 
-            if hooked:
+            n_stopped = 0
+            if hooked and (hook_before_stop or not should_break):
                 self._hook_rows = rows
-                self._iter_hook(self.i, l_v, e_v, it_rows == -1, syndrome)
+                self._hook_stop = None
+                self._hook_final = should_break
+                active = it_rows == -1
+                self._iter_hook(self.i, l_v, e_v, active, syndrome)
+                if self._hook_stop is not None:
+                    stop = (self._hook_stop & active).nonzero().squeeze(1)
+                    n_stopped = stop.numel()
+                    it_rows[stop] = self.i
+                    dst = rows[stop]
+                    num_iters[dst] = self.i
+                    e_out[dst] = e_v[stop]
+                    l_out[dst] = l_v[stop]
+
+            if hook_before_stop:
+                should_break = not (it_rows == -1).any().item()
+                if cap_frac is not None:
+                    n_conv = int(converges.sum())
+                    cap_stopped = (
+                        n_conv >= cap_frac * B and n_conv < B and self.i < self.max_iter
+                    )
+                    should_break |= n_conv >= cap_frac * B
+            if should_break or (
+                n_stopped > 0 and n_stopped == checker.numel() - indices.numel()
+            ):
+                break
 
             # compaction: keep only the unconverged rows once they drop below
             # compact_frac of the current rows (never to zero rows, never after the
-            # last iteration; compiled, never to one row, which would recompile).
+            # last iteration; normal compiled compaction avoids a singleton).
+            # Hook-stopped rows force compaction even with compact_frac == 0 and
+            # may leave a singleton that recompiles the compiled step.
             # Eager with reuse_buffers: kept rows move to the front of each buffer
             # through the work buffer, which is free here, and the buffers become
             # prefix views.
-            n_left = checker.size()[0] - indices.size()[0]
+            n_left = checker.size()[0] - indices.size()[0] - n_stopped
             if (
-                int(self.compile) < n_left < self.compact_frac * self.batch_size
+                (
+                    int(self.compile) < n_left < self.compact_frac * self.batch_size
+                    or n_stopped and n_left > 0
+                )
                 and self.i < self.max_iter
             ):
                 keep = (it_rows == -1).nonzero().squeeze(1)
