@@ -183,3 +183,8 @@ CODE_MAP.md
 
 # local benchmark reports
 reports/
+tests/test_outputs/
+zoo/**/cli_check/
+*.aborted*
+innovation_summary/
+zoo/study/
