@@ -30,13 +30,14 @@ class create(_LotteryCuda, _QuantCuda):
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """The bp_lottery_quant flip on the unconverged rows at each flip
-        iteration (is_flip_iter). With random_machine system, a call with no
+        iteration (is_flip_iter). With early termination and random_machine
+        system, a call with no
         unconverged row returns before drawing (one host sync per call);
         forward() makes the one draw the PyTorch path makes when the last rows
         converge at a flip iteration."""
         if not is_flip_iter(self, i):
             return
-        if self.random_machine == "system" and not active.any():
+        if self.early_termination and self.random_machine == "system" and not active.any():
             return
         _LotteryQuantPy._iter_hook(self, i, l_v, e_v, active, syndrome)
 

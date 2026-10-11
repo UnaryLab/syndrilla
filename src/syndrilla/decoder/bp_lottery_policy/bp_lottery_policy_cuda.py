@@ -40,14 +40,15 @@ class create(_NmsCuda, _PolicyPy):
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """The bp_lottery_policy flip on the unconverged rows. When the policy
-        draws from the global RNG (random_machine system, or local_random), a
+        draws from the global RNG (random_machine system, or local_random) and
+        early termination is enabled, a
         call with no unconverged row returns before drawing (one host sync per
         call), so the RNG advances as if the loop had stopped when the last row
         converged."""
         draws = (
             self.random_machine == "system" or self.sign_flip_policy == "local_random"
         )
-        if draws and not active.any():
+        if self.early_termination and draws and not active.any():
             return
         _PolicyPy._iter_hook(self, i, l_v, e_v, active, syndrome)
 

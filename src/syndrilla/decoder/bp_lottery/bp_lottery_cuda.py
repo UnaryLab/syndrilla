@@ -43,13 +43,14 @@ class create(_BaseCuda):
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Lottery sign-flip at the end of each flip iteration i (is_flip_iter),
         on the rows still unconverged; the next iteration's check update reads
-        the flipped l_v. With random_machine system, a call with no unconverged
+        the flipped l_v. With early termination and random_machine system,
+        a call with no unconverged
         row returns before drawing (one host sync per call); forward() makes the
         one draw the PyTorch path makes when the last rows converge at a flip
         iteration."""
         if not is_flip_iter(self, i):
             return
-        if self.random_machine == "system" and not active.any():
+        if self.early_termination and self.random_machine == "system" and not active.any():
             return
         self.i = i
         s_est = (e_v[:, self.V_c_col].sum(dim=2, dtype=torch.uint8) & 1).to(self.dtype)
@@ -83,6 +84,7 @@ class create(_BaseCuda):
         # paths leave the global RNG equal.
         if (
             self.random_machine == "system"
+            and self.early_termination
             and self._global_last_draw
             and not capped
             and out["converge"].numel() > 0

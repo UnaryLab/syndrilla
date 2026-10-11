@@ -10,6 +10,11 @@ from syndrilla.decoder.knobs import knob
 from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, read_yaml
 
 DEFAULT_CANDIDATES = tuple(range(100))
+EARLY_TERMINATION_ALGOS = frozenset({
+    "bp_norm_min_sum", "bp_norm_min_sum_quant", "bp_sum_prod",
+    "bp_lottery", "bp_lottery_quant", "bp_lottery_policy",
+    "bp_norm_min_sum_layered", "bp_lottery_layered", "bp_sf", "bp_sf_lottery",
+})
 
 
 def _projected_speedup(hists, pct, batch_size):
@@ -268,6 +273,7 @@ class RoundFlattenWrapper(torch.nn.Module):
 # than ignored: a silent fallback to a default still produces numbers.
 MOVED_TO_CONFIG = (
     "max_iter",
+    "early_termination",
     "damping_factor",
     "max_b_iter",
     "random_machine",
@@ -482,6 +488,8 @@ def _create_one_decoder(dec_cfg: dict, header: str, func_name: str, **kwargs):
     asks for a CUDA device.
     """
     algo = dec_cfg[func_name].lower()
+    if dec_cfg.get("early_termination") is False and algo not in EARLY_TERMINATION_ALGOS:
+        raise ValueError(f"{algo} does not support early_termination=false")
     device_type = (dec_cfg.get("device") or {}).get("device_type", "cpu")
     force_pytorch = dec_cfg.get("force_pytorch", False)
 

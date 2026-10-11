@@ -190,6 +190,8 @@ class create(nn.Module):
         algorithm   : bp_norm_min_sum_cuda
         check_type  : hx | hz          (default: hx)
         max_iter    : int               (default: 50)
+        early_termination : bool       (default: true; false runs every sample
+                      for max_iter iterations and returns the final iterate)
         dtype       : float32 | float64 | float16 | bfloat16  (default: float64)
         force_per_step : bool           (default: false; alias of persistent_kernel:
                       false, used when persistent_kernel is absent)
@@ -226,6 +228,10 @@ class create(nn.Module):
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         nn.Module.__init__(self)
         logger.info("Creating bp_norm_min_sum_cuda decoder.")
+
+        self.early_termination = decoding_cfg.get("early_termination", True)
+        if not isinstance(self.early_termination, bool):
+            raise ValueError("early_termination must be a bool")
 
         if not torch.cuda.is_available():
             raise RuntimeError(
@@ -334,7 +340,9 @@ class create(nn.Module):
         self.algo = "bp_norm_min_sum"
         self.batch_size = 1  # updated in forward()
 
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
+        self.cap = (
+            RebatchSpeedup.from_cfg(decoding_cfg) if self.early_termination else None
+        )
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap stopped early
 
@@ -364,7 +372,8 @@ class create(nn.Module):
         self._f64_int = bool(knob(decoding_cfg, "f64_int_compare", True))
         self._vn_gather = bool(knob(decoding_cfg, "vn_gather", True))
         self._force_per_step = (
-            self._persistent is False
+            not self.early_termination
+            or self._persistent is False
             or not self._skip_converged
             or not self._warp_per_check
             or not self._fuse_vn
@@ -422,7 +431,7 @@ class create(nn.Module):
         """True if a batch of B samples runs on the persistent kernel: small codes
         (M <= 120) or batches of at least 4 samples per SM on codes with
         M <= PERSISTENT_MAX_M, or any B with persistent_kernel true; never with
-        persistent_kernel false (or force_per_step), skip_converged false,
+        early_termination false, persistent_kernel false (or force_per_step), skip_converged false,
         warp_per_check false, fuse_vn false, vn_gather false or an overridden
         _iter_hook, never when no persistent block fits on an SM, and with the cap on only when all B
         blocks are co-resident."""
@@ -442,8 +451,8 @@ class create(nn.Module):
         Run BP Normalized Min-Sum decoding on the CSR edge layout (row_ptr, col,
         VN_eid; b_c2v is [B, nnz + 1] with the last slot always zero).
 
-        Two paths give the same outputs bit for bit; _use_persistent picks one
-        per call from the batch size B:
+        With early_termination true, two paths give the same outputs bit for
+        bit; _use_persistent picks one per call from the batch size B:
 
         - persistent: one launch of bp_nms_persistent runs the whole loop with
           one block of PERSISTENT_THREADS threads per sample, each block stopping
@@ -466,6 +475,13 @@ class create(nn.Module):
           subclass's _iter_hook runs at the end of each iteration that does not
           break the loop.
 
+        With early_termination false, the per-step path runs every sample for
+        all max_iter iterations, without convergence snapshots, the rebatch
+        cap, or host early-exit checks. Each hook gets the current syndrome
+        mismatch mask, including at the last iteration. The returned estimate
+        is the final iterate, converge checks its syndrome, iter is max_iter
+        for every sample, and defer is false.
+
         With edge_layout padded both paths run on col_pad and VN_eid_pad, and
         b_c2v is [B, M * D + 1]. On the per-step path, fuse_vn false fills an
         a_v2c buffer shaped like b_c2v with vn_update_csr before each check
@@ -485,7 +501,8 @@ class create(nn.Module):
         e_v      : [B, N]   hard-decision error estimate
         llr      : [B, N]   final per-variable LLR
         iter     : [B]      iteration at which each sample converged (max_iter,
-                            or the cap's stop iteration, if not)
+                            or the cap's stop iteration, if not); max_iter on
+                            every row with early_termination false
         converge : [B]      1 if converged, 0 otherwise
         defer    : [B]      bool, True on unconverged samples when the cap
                             stopped the batch before max_iter
@@ -570,7 +587,7 @@ class create(nn.Module):
             hooked = type(self)._iter_hook is not create._iter_hook
             # num_iters the three compute kernels skip on: all -1 runs every sample
             run = num_iters
-            if not self._skip_converged:
+            if self.early_termination and not self._skip_converged:
                 run = torch.full_like(num_iters, -1)
                 l_snap = torch.empty_like(l_v)
                 e_snap = torch.empty_like(e_v)
@@ -608,9 +625,15 @@ class create(nn.Module):
                     )
                 else:
                     self._ext.llr_hard_update_csr(u_init, b_c2v, vn_eid, l_v, e_v, run)
+                if not self.early_termination:
+                    mismatch.zero_()
                 self._ext.syndrome_check_csr(
                     e_v, self.row_ptr, col, syndrome, run, mismatch, self.N
                 )
+                if not self.early_termination:
+                    if hooked:
+                        self._iter_hook(i, l_v, e_v, mismatch != 0, syndrome)
+                    continue
                 self._ext.convergence_flag_update(mismatch, num_iters, converges, i)
                 if not self._skip_converged:
                     new = (num_iters == i).unsqueeze(1)
@@ -632,11 +655,13 @@ class create(nn.Module):
                 if hooked:
                     self._iter_hook(i, l_v, e_v, num_iters == -1, syndrome)
 
-            if not self._skip_converged:
+            if self.early_termination and not self._skip_converged:
                 done = (num_iters != -1).unsqueeze(1)
                 l_v = torch.where(done, l_snap, l_v)
                 e_v = torch.where(done, e_snap, e_v)
             num_iters.masked_fill_(num_iters == -1, i)
+            if not self.early_termination:
+                converges = (mismatch == 0).to(torch.int64)
 
         self._exit_hook(l_v, e_v, num_iters, converges)
         self.cap_active_last = cap_stopped
