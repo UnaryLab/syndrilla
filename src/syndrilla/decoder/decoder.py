@@ -12,7 +12,7 @@ from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, rea
 DEFAULT_CANDIDATES = tuple(range(100))
 EARLY_TERMINATION_ALGOS = frozenset({
     "bp_symbreak",
-    "bp_norm_min_sum", "bp_norm_min_sum_quant", "bp_sum_prod", "bp_ots",
+    "bp_norm_min_sum", "bp_norm_min_sum_quant", "bp_sum_prod", "bp_ots", "bp_gd",
     "bp_lottery", "bp_lottery_quant", "bp_lottery_policy",
     "bp_norm_min_sum_layered", "bp_lottery_layered", "bp_sf", "bp_sf_lottery", "bp_lottery_pre",
 })
@@ -262,7 +262,7 @@ class RoundFlattenWrapper(torch.nn.Module):
             if key in io_dict and io_dict[key].shape[0] == Bd:
                 v = io_dict[key]
                 io_dict[key] = v.reshape(B, d, *v.shape[1:])
-        for key in ("converge", "iter", "splits"):
+        for key in ("converge", "iter", "splits", "rounds"):
             if key in io_dict and io_dict[key].shape[0] == Bd:
                 io_dict[key] = io_dict[key].reshape(B, d)
         io_dict["llr0"] = llr0

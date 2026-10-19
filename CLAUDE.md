@@ -50,6 +50,7 @@ syndrilla -r=tests/test_outputs -d=examples/alist/bposd_hx.decoding.yaml -e=exam
 ## Experiment conventions
 
 - Study and sweep runs on the BP family (`bp_norm_min_sum` and every decoder built on it, including `bp_lottery` variants) set `max_iter` to the code's data qubit count: `d * d` for the rotated surface code at distance `d`, `n` for an `[[n, k, d]]` code such as BB `[[144, 12, 12]]`. Unit tests under `tests/` keep their own small `max_iter`.
+- `bp_gd` spends `round_iters` iterations per decimation round, so its study budget is `max_iter = n * round_iters`, or `round_iters: 1` with `max_iter = n`; the plain `max_iter = n` with the default `round_iters` gives only `n / round_iters` rounds.
 
 ## Git and releases
 

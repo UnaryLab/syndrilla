@@ -108,15 +108,19 @@ template <typename T>
 __global__ void spa_factors(const T* values, const T* incoming, const int32_t* col,
                             const int64_t* active, T* factors, int64_t total,
                             int64_t edges, int64_t input_width, int64_t n,
-                            bool from_lv, T epsilon) {
+                            bool from_lv, T epsilon, T saturation) {
     for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
             index < total; index += int64_t(blockDim.x) * gridDim.x) {
         const int64_t row = index / edges, edge = index % edges;
         if (active[row] != -1) continue;
         const int32_t variable = col[edge];
-        const T value = variable == n ? T(INFINITY) : (from_lv
+        T value = variable == n ? T(INFINITY) : (from_lv
             ? values[row * input_width + variable] - incoming[row * (edges + 1) + edge]
             : values[row * input_width + edge]);
+        if (variable != n) {
+            value = value > saturation ? saturation : value;
+            value = value < -saturation ? -saturation : value;
+        }
         T probability = T(1) / (T(1) + exp(value));
         probability = probability < epsilon ? epsilon : probability;
         probability = probability > T(1) - epsilon ? T(1) - epsilon : probability;
@@ -157,7 +161,7 @@ __global__ void spa_checks(const T* factors, const T* signs, const int32_t* ptr,
 
 void spa_cn(torch::Tensor values, torch::Tensor signs, torch::Tensor ptr,
             torch::Tensor col, torch::Tensor incoming, torch::Tensor active,
-            int64_t n, int64_t padded_degree, bool warp, bool from_lv) {
+            int64_t n, int64_t padded_degree, bool warp, bool from_lv, double saturation) {
     TORCH_CHECK(values.is_cuda() && incoming.is_cuda() && signs.is_cuda(), "SPA tensors must be CUDA tensors");
     TORCH_CHECK(values.is_contiguous() && incoming.is_contiguous() && signs.is_contiguous(),
                 "SPA tensors must be contiguous");
@@ -177,7 +181,7 @@ void spa_cn(torch::Tensor values, torch::Tensor signs, torch::Tensor ptr,
         spa_factors<scalar_t><<<blocks, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
             values.data_ptr<scalar_t>(), incoming.data_ptr<scalar_t>(), col.data_ptr<int32_t>(),
             active.data_ptr<int64_t>(), factors.data_ptr<scalar_t>(), b * edges,
-            edges, values.size(1), n, from_lv, epsilon);
+            edges, values.size(1), n, from_lv, epsilon, scalar_t(saturation));
         spa_checks<scalar_t><<<check_blocks, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
             factors.data_ptr<scalar_t>(), signs.data_ptr<scalar_t>(), ptr.data_ptr<int32_t>(),
             col.data_ptr<int32_t>(), active.data_ptr<int64_t>(), incoming.data_ptr<scalar_t>(),

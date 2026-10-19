@@ -43,11 +43,11 @@ A `config` written as a plain mapping, as above, is the settings of the block's 
 
 A key written in the wrong half is **rejected, not ignored**: `max_iter` left at the top level fails with a message naming `decoding.config`, and a framework-wide key such as `dtype` written inside `config` fails the same way in reverse. A decoder that quietly fell back to `max_iter: 50` instead of the configured `181` would still produce numbers, and they would look like results.
 
-**CUDA acceleration.** Every registered decoder **except `saq` and `mwpm`** ships a CUDA-kernel implementation alongside its PyTorch/NumPy module (`saq` is a plain PyTorch model and runs on whatever device the config selects): the belief-propagation family (`bp_symbreak`, `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp_ots`, `bp4`, `bp_sf`, `bp_sf_lottery`, `bp_lottery_pre`, `relay_bp`, `bp_norm_min_sum_layered`, `bp_lottery_layered`) plus `osd_0`, `mwpm_gpu`, and `union_find`. `mwpm` has no CUDA kernel: on any device other than `cpu` it logs an info line, decodes on the host CPU with PyMatching and returns its tensors on the configured device (Section 3.9). There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically.
+**CUDA acceleration.** Every registered decoder **except `saq` and `mwpm`** ships a CUDA-kernel implementation alongside its PyTorch/NumPy module (`saq` is a plain PyTorch model and runs on whatever device the config selects): the belief-propagation family (`bp_symbreak`, `bp_norm_min_sum`, `bp_norm_min_sum_quant`, `bp_branch_assisted`, `bp_lottery`, `bp_lottery_quant`, `bp_lottery_policy`, `bp_ots`, `bp_gd`, `bp4`, `bp_sf`, `bp_sf_lottery`, `bp_lottery_pre`, `relay_bp`, `bp_norm_min_sum_layered`, `bp_lottery_layered`) plus `osd_0`, `mwpm_gpu`, and `union_find`. `mwpm` has no CUDA kernel: on any device other than `cpu` it logs an info line, decodes on the host CPU with PyMatching and returns its tensors on the configured device (Section 3.9). There is **no** separate `*_cuda` algorithm name: set `device.device_type: cuda` and the kernel port (`<algo>/<algo>_cuda.py`) is selected automatically.
 
 The kernels come in two flavors. The BP decoders use **fused per-iteration kernels** that vectorize the message-passing across the batch. The graph decoders `mwpm_gpu` and `union_find` are inherently sequential per shot, so their kernels parallelize over the **batch axis** (one CUDA thread decodes one shot), while `osd_0` runs one thread block per sample. For `osd_0`, `mwpm_gpu`, and `union_find` the CUDA output is **bit-for-bit identical** to the corresponding CPU implementation.
 
-The selection **does not fall back to PyTorch on failure**. On a `cuda` device a decoder with a CUDA module loads it, and that module raises `RuntimeError` when no CUDA GPU is present and fails when its kernel does not build (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM). The plain `<algo>/<algo>.py` PyTorch module runs only for a decoder without a CUDA module or with `force_pytorch: true`, on whatever device the config resolves to. Set `force_pytorch: true` on ROCm, or to force the PyTorch module even on an NVIDIA CUDA device. The PyTorch `bp_norm_min_sum` and the PyTorch decoders built on it (`bp_sf`, `bp_sf_lottery`, `bp_lottery_pre`, `bp_lottery`, `bp_lottery_policy`, `bp_norm_min_sum_quant`, `bp_lottery_quant`, `bp_sum_prod`, `bp_ots`), plus `relay_bp`, `bp_branch_assisted` and `bp4`, compile their iteration body with `torch.compile` on CUDA by default (decoder config key `compile`, default `true`); set `compile: false` to run them eager. Each decoder instance keeps its own compile cache. On CPU, or without torch.compile and Triton, the key is ignored and the eager path runs.
+The selection **does not fall back to PyTorch on failure**. On a `cuda` device a decoder with a CUDA module loads it, and that module raises `RuntimeError` when no CUDA GPU is present and fails when its kernel does not build (nvcc missing, or a non-NVIDIA accelerator such as AMD ROCm or IBM). The plain `<algo>/<algo>.py` PyTorch module runs only for a decoder without a CUDA module or with `force_pytorch: true`, on whatever device the config resolves to. Set `force_pytorch: true` on ROCm, or to force the PyTorch module even on an NVIDIA CUDA device. The PyTorch `bp_norm_min_sum` and the PyTorch decoders built on it (`bp_sf`, `bp_sf_lottery`, `bp_lottery_pre`, `bp_lottery`, `bp_lottery_policy`, `bp_norm_min_sum_quant`, `bp_lottery_quant`, `bp_sum_prod`, `bp_ots`, `bp_gd`), plus `relay_bp`, `bp_branch_assisted` and `bp4`, compile their iteration body with `torch.compile` on CUDA by default (decoder config key `compile`, default `true`); set `compile: false` to run them eager. Each decoder instance keeps its own compile cache. On CPU, or without torch.compile and Triton, the key is ignored and the eager path runs.
 
 ## 2. Chained decoders
 A list of algorithms runs each decoder in order; later decoders are only invoked on samples that the earlier ones did not converge on.
@@ -85,6 +85,7 @@ The following table lists every algorithm registered under `src/syndrilla/decode
 | `bp_lottery_quant`          | 1        | Lottery BP with fixed-point quantization                                         | -                                                                                                                                  |
 | `bp_lottery_policy`         | 1        | Lottery BP with selectable sign-flip policy (paper's five-policy)               | -                                                                                                                                  |
 | `bp_ots`                    | 1        | Sum-product BP with oscillator and least-reliable prior switches; PyTorch and CUDA | Chytas et al., Algorithm 1 (DOI:10.1109/LCOMM.2024.3356312) |
+| `bp_gd`                     | 1        | Sum-product BP with guided decimation: one variable's prior fixed to a large magnitude at the end of each round | Belief Propagation Decoding of Quantum LDPC Codes with Guided Decimation (Yao et al., arXiv:2312.10950) |
 | `bp4`                       | 2        | Quaternary BP (BP4) operating on the 2-channel Pauli prior                               | Quaternary Neural Belief Propagation Decoding of Quantum LDPC Codes with Overcomplete Check Matrices                               |
 | `relay_bp`                  | 1        | Relay BP — normalized min-sum run over multiple "legs" with disordered per-variable memory, keeping the best converged solution | relay-bp crate (crates.io, `trmue/relay`)                                                  |
 | `osd_0`                     | 1        | Order-0 Ordered Statistics Decoding               | Soft-Decision Decoding of Linear Block Codes Based on Ordered Statistics                                                            |
@@ -765,6 +766,44 @@ use finite message bounds, sqrt(finfo.max) / (edge_slots + 1), to avoid inf - in
 Split exhaustion continues BP until a stop condition. These numerical and message
 choices are explicit in the module docstring.
 
+### 3.20. bp_gd
+Sum-product BP with guided decimation (GD), from Hanwen Yao, Waleed Abu Laban, Christian Haeger, Alexandre Graell i Amat and Henry D. Pfister, "Belief Propagation Decoding of Quantum LDPC Codes with Guided Decimation", arXiv:2312.10950, Algorithm 1. The decoder runs BP in rounds of `round_iters` iterations. The check-to-variable messages start once and persist across rounds. At the end of each round, on each unconverged sample, the decoder decimates one variable. It picks the undecimated variable with the largest absolute posterior, with ties to the lowest index. It sets the channel prior of that variable to `+llr_max` if the posterior is strictly positive, and to `-llr_max` if not. The next round starts from the kept messages and the changed priors. A decimated prior stays fixed in later rounds. It is a finite value, not a hard pin. Example configuration:
+
+```
+decoding:
+  algorithm: bp_gd
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+  config:
+    max_iter: 181
+    round_iters: 10
+    llr_max: 25
+```
+
+| Key | Meaning | Default |
+|-----|---------|---------|
+| `max_iter` | Total BP iteration budget; a positive int, at least `round_iters` | `50` |
+| `round_iters` | BP iterations per round; a positive int | `10` |
+| `llr_max` | Magnitude of a decimated prior; finite and positive | `25` |
+| `saturation` | Variable-to-check message magnitude limit from eq. 23; finite and positive | `25` |
+| `max_rounds` | Largest number of rounds; a positive int | number of variables |
+| `order` | Decimation order: `reliability` (largest absolute posterior) or `random` (a uniform pick among the undecimated variables) | `reliability` |
+| `random_machine` | Random source for `order: random`: `sobol` (unscrambled, one draw per round shared by all samples) or `system` (the device RNG) | `sobol` |
+
+A value of the wrong type, or outside these ranges, raises `ValueError`. `dtype` must be `float32` or `float64`.
+
+**Budget.** The number of rounds is `min(max_rounds, n, floor(max_iter / round_iters))`, where `n` is the number of variables. The default `max_iter` gives five rounds at the default `round_iters`. The decoder runs only complete rounds, so iterations of `max_iter` beyond the last complete round are not used. No decimation follows the last round. The paper's budget is `max_iter = n * round_iters`. With `max_iter = n`, use `round_iters: 1` to get the paper's number of rounds.
+
+**Early termination.** With `early_termination: true` the decoder checks the syndrome after every iteration, as BP in the paper does. With `early_termination: false` it checks only at the end of each round. A sample that matches the syndrome there stops, with no further rounds.
+
+**Outputs.** The decoder returns the standard outputs (Section 6) and one extra output, `rounds`: the number of decimations done on each sample. `iter` counts BP iterations.
+
+**Precision.** With the same random draws, float64 results are the same on the CPU and CUDA paths. With float32, results can differ between backends on unconverged samples: a small difference in the posterior can change the decimated variable or the sign of its prior.
+
+On a `cuda` device the CUDA module runs the sum-product check update with the `bp_ots` CUDA kernels, and the decimation runs as tensor operations between iterations. `force_pytorch: true` selects the PyTorch module. The CPU and CUDA `system` random streams are not the same.
+
 ## 4. Adaptive iteration speedup (`rebatch_opt`, `rebatch_opt_params`)
 The iteration cap stops a batch once a warm-up-learned fraction of its samples has converged and defers the unconverged rest to be decoded again uncapped. It reduces decoding **time**.
 
@@ -928,6 +967,7 @@ Every decoder consumes and returns an `io_dict` with the following entries.
 | `iter`             | out       | Number of iterations actually used per sample. For `bp_sf`, `bp_sf_lottery` and `bp_lottery_pre`, the main-pass count only |
 | `iter_serial`      | out, optional | `bp_sf`, `bp_sf_lottery` and `bp_lottery_pre` only. Shape `[B]`, cumulative iterations under a serial execution model (below) |
 | `iter_parallel`    | out, optional | `bp_sf`, `bp_sf_lottery` and `bp_lottery_pre` only. Shape `[B]`, two-stage iterations when all trials run at once (below) |
+| `rounds`           | out, optional | `bp_gd` only. Shape `[B]`, number of decimations done per sample |
 
 **SF iteration counts.** All SF trials decode at once, and the returned estimate is the trial that converges earliest (fewest iterations, ties to the lowest trial index). `iter_parallel` counts that two-stage run. `iter_serial` follows the serial model the BP-SF paper reports: trials are counted as if decoded one after another in trial order, up to the first that converges. That trial can differ from the returned one.
 - A sample that converges in the main pass keeps its `iter` in both outputs.

@@ -42,7 +42,7 @@ class _Kernels:
     def vn_cn_update_csr(self, values, sign, row_ptr, col, incoming, active,
                          beta, n, **kwargs):
         self.owner._ots_ext.spa_cn(values, sign, row_ptr, col, incoming, active, n,
-            self.owner.V_c_col.shape[1], kwargs.get('warp', True), kwargs.get('from_lv', True))
+            self.owner.V_c_col.shape[1], kwargs.get('warp', True), kwargs.get('from_lv', True), float('inf'))
 
     def llr_hard_update_csr(self, prior, incoming, adjacency, *args):
         self.owner._ots_prior, self.owner._ots_edges = prior, incoming
