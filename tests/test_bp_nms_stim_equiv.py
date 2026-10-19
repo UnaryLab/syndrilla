@@ -57,7 +57,7 @@ def case(request):
             dtype=dtype,
             check_type="hx",
             max_iter=MAX_ITER,
-            force_per_step=True,
+            persistent_kernel=False,
         ),
         bundle=it.matrix_bundle,
     )

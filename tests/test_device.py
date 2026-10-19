@@ -94,7 +94,8 @@ def test_unaccepted_dtype_on_mps_gives_cpu_float64(monkeypatch, name):
 def test_relay_bp_bad_device_falls_back(monkeypatch, device):
     _no_cuda(monkeypatch)
     cfg = read_yaml(get_path("examples/alist/relay_bp_hx.decoding.yaml"))["decoding"]
-    cfg = {**cfg, **cfg.pop("config"), "device": device}
+    settings = cfg.pop("config")
+    cfg = {**cfg, **settings, "device": device}
     matrix_cfg = read_yaml(get_path("examples/alist/surface_5.matrix.yaml"))["matrix"]
     bundle = load_matrices(matrix_cfg, torch.device("cpu"), torch.float64)
     decoder, msgs = _warnings(lambda: create_relay_bp(cfg, bundle=bundle))

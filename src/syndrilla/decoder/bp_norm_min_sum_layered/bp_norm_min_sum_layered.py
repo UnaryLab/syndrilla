@@ -35,6 +35,9 @@ def check_layers(cols, n):
 class create(_Nms):
     """Normalized min-sum with one ordered sweep of disjoint check layers."""
 
+    _config_keys = ()
+    _config_algorithm = "bp_norm_min_sum_layered"
+
     def __init__(self, decoding_cfg, **kwargs):
         # Layer updates need eager, in-place posterior writes between layers.
         super().__init__({**decoding_cfg, "compile": False}, **kwargs)

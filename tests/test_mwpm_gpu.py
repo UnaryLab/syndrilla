@@ -414,11 +414,15 @@ def test_invalid_posterior(llr, mode):
     ("weights", "posterior"),
     ("skip_converged", True),
 ])
-def test_weight_keys_belong_in_config(key, value):
+def test_weight_option_placement(key, value):
     from syndrilla.decoder.decoder import resolve_configs
 
-    with pytest.raises(ValueError, match="decoding.config"):
-        resolve_configs({"algorithm": "mwpm_gpu", key: value})
+    top_level = {"algorithm": "mwpm_gpu", key: value}
+    if key == "weights":
+        with pytest.raises(ValueError, match="decoding.config"):
+            resolve_configs(top_level)
+    else:
+        assert resolve_configs(top_level)[0][key] == value
     assert resolve_configs({"algorithm": "mwpm_gpu", "config": {key: value}})[0][key] == value
 
 
@@ -511,7 +515,8 @@ def test_cuda_matches_cpu_surface10(mode, workers, monkeypatch):
     h = bundle.select("hx")[3].to_dense().cpu().double()
     g = torch.Generator().manual_seed(20261005)
     errors = (torch.rand(32, h.shape[1], generator=g) < 0.1).double()
-    bp = BP({**cfg, "max_iter": 3, "compile": False}, bundle=bundle)
+    bp = BP({"device": cfg["device"], "dtype": cfg["dtype"], "max_iter": 3,
+             "compile": False}, bundle=bundle)
     posterior = bp({"synd": errors @ h.T % 2, "llr0": torch.full_like(errors, 2.0)})
     assert not bool(posterior["converge"].all())
     cpu = mwpm_gpu.create({**cfg, "device": {"device_type": "cpu"}}, bundle=bundle)
@@ -613,7 +618,9 @@ def test_cuda_parallel_winner_preserves_original_slots(monkeypatch):
     assert torch.equal(got["e_v"].cpu(), ref["e_v"])
     from syndrilla.decoder.mwpm import mwpm
 
-    expected = mwpm.create(_cfg(weights="posterior"), bundle=_bundle(h))(dict(io))
+    plain_cfg = _cfg(weights="posterior")
+    plain_cfg.pop("num_workers")
+    expected = mwpm.create(plain_cfg, bundle=_bundle(h))(dict(io))
     assert torch.equal(ref["e_v"], expected["e_v"])
 
 

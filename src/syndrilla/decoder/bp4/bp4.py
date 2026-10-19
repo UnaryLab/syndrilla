@@ -5,6 +5,7 @@ from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
+from syndrilla.decoder.knobs import BASE_CONFIG_KEYS, reject_unknown_keys
 
 # compact the per-iteration state to the unconverged samples once fewer than this
 # fraction of the rows decoded since the last compaction are still unconverged
@@ -91,6 +92,10 @@ class create(torch.nn.Module):
     with e_v because marginal MAP and projected joint MAP can differ.
     """
 
+    _config_algorithm = "bp4"
+    _base_config_keys = BASE_CONFIG_KEYS
+    _config_keys = frozenset({"damping_factor"})
+
     def __init__(self, decoding_cfg, **kwargs) -> None:
         """
         Initialization for bp decoder
@@ -114,6 +119,10 @@ class create(torch.nn.Module):
         """
 
         super(create, self).__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
 
         logger.info("Creating bp decoder.")
 

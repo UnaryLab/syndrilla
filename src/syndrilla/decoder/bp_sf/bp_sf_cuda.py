@@ -12,8 +12,11 @@ class create(_BaseCuda):
     """bp_sf on CUDA kernels. Accepts every bp_sf key (check_type, max_iter, dtype,
     the ``sf:`` block). The main pass runs the bp_norm_min_sum_cuda per-step loop
     and counts oscillations in _iter_hook; the SF retries run on bp_nms_persistent,
-    or on the per-step loop with force_per_step or when no persistent block fits.
+    or on the per-step loop with persistent_kernel false or when no persistent block fits.
     bp_sf never applies the rebatch cap."""
+
+    _config_keys = _BpSfPy._config_keys
+    _config_algorithm = "bp_sf"
 
     _init_sf = _BpSfPy._init_sf
     _sf_postprocess = _BpSfPy._sf_postprocess
@@ -48,21 +51,20 @@ class create(_BaseCuda):
         osc = self._osc[:, : self.N]
         del self._osc, self._prev_hard
 
-        if self.w_max > 0:
-            self._sf_postprocess(
-                syndrome,
-                llr0,
-                io_dict["e_v"],
-                io_dict["llr"],
-                io_dict["converge"],
-                io_dict["iter"],
-                osc,
-            )
+        io_dict["iter_serial"], io_dict["iter_parallel"] = self._sf_postprocess(
+            syndrome,
+            llr0,
+            io_dict["e_v"],
+            io_dict["llr"],
+            io_dict["converge"],
+            io_dict["iter"],
+            osc,
+        )
         return io_dict
 
     def _bp_core(self, syndrome, llr0, track_osc=False):
         """SF retry decode in one uncapped bp_nms_persistent launch, or on the
-        per-step loop with force_per_step or when no persistent block fits. Returns
+        per-step loop with persistent_kernel false or when no persistent block fits. Returns
         ``(e_out, l_out, converges, num_iters, None)`` over the real N bits."""
         if self._force_per_step or self._max_coresident == 0:
             out = _BaseCuda.forward(self, {"synd": syndrome, "llr0": llr0})

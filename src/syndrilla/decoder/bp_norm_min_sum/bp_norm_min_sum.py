@@ -5,7 +5,7 @@ from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
-from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.knobs import BASE_CONFIG_KEYS, knob, reject_unknown_keys
 
 # compact the per-iteration state to the unconverged samples once fewer than this
 # fraction of the rows decoded since the last compaction are still unconverged
@@ -57,6 +57,10 @@ class create(torch.nn.Module):
     that inherits from a CUDA decoder and a PyTorch decoder, the first base in the
     MRO supplies the hooks.
     """
+
+    _base_config_keys = BASE_CONFIG_KEYS
+    _config_keys = ()
+    _config_algorithm = "bp_norm_min_sum"
 
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Called at the end of iteration i, after the convergence update and the
@@ -129,6 +133,10 @@ class create(torch.nn.Module):
                 every iteration and compacts by plain indexing.
         """
 
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         super(create, self).__init__()
 
         logger.info("Creating bp decoder.")

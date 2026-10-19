@@ -1,9 +1,10 @@
 decoding:
-  algorithm: bp_self_corrected_min_sum
+  algorithm: bp_lottery_pre
   check_type: hx
   dtype: float64
   device:
     device_type: cuda
     device_idx: 0
   config:
-    max_iter: 181
+    max_iter: 121
+    pre_parallel_max_lambda: 32

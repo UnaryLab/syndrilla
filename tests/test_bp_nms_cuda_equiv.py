@@ -71,7 +71,7 @@ def _mixed(res):
 @pytest.mark.parametrize("per_step", [True, False], ids=["per_step", "persistent"])
 def test_float64_matches_reference(surface10, per_step):
     bundle, synd, llr0 = surface10
-    cfg = _cfg("float64", 50, force_per_step=per_step)
+    cfg = _cfg("float64", 50, persistent_kernel=not per_step)
     dec = bp_gpu.create(cfg, bundle=bundle)
     assert dec._use_persistent(len(synd), False) is (not per_step)
     ref = _run(bp_ref.create(cfg, bundle=bundle), synd, llr0)
@@ -89,7 +89,7 @@ def test_per_step_vs_persistent_mixed_convergence(surface10):
     assert pers_dec._use_persistent(len(synd), False)
     pers = _run(pers_dec, synd, llr0)
     step = _run(
-        bp_gpu.create(_cfg("float64", 10, force_per_step=True), bundle=bundle),
+        bp_gpu.create(_cfg("float64", 10, persistent_kernel=False), bundle=bundle),
         synd,
         llr0,
     )
@@ -102,7 +102,7 @@ def test_per_step_vs_persistent_mixed_convergence(surface10):
 
 def test_float32_per_step_matches_reference(surface10):
     bundle, synd, llr0 = surface10
-    cfg = _cfg("float32", 50, force_per_step=True)
+    cfg = _cfg("float32", 50, persistent_kernel=False)
     got = _run(bp_gpu.create(cfg, bundle=bundle), synd, llr0)
     assert got["llr"].dtype == torch.float32
     _assert_equal(got, _run(bp_ref.create(cfg, bundle=bundle), synd, llr0), "float32")
@@ -154,7 +154,7 @@ def test_capped_persistent_matches_per_step(dtype):
     outs = []
     for per_step in (False, True):
         dec = bp_gpu.create(
-            _cfg(dtype, max_iter, force_per_step=per_step), bundle=bundle
+            _cfg(dtype, max_iter, persistent_kernel=not per_step), bundle=bundle
         )
         dec.cap = RebatchSpeedup()
         dec.cap.frac = 0.5
@@ -170,11 +170,11 @@ def test_capped_persistent_matches_per_step(dtype):
 def test_no_coresident_block_falls_back_to_per_step(monkeypatch):
     """When persistent_max_blocks reports 0 (the persistent kernel does not fit a
     block of PERSISTENT_THREADS threads), the decoder takes the per-step path,
-    capped or not, and gives the same outputs as force_per_step."""
+    capped or not, and gives the same outputs as persistent_kernel false."""
     B, max_iter = 64, 50
     bundle, synd, llr0 = _stim("float64", B, max_iter)
     ref = _run(
-        bp_gpu.create(_cfg("float64", max_iter, force_per_step=True), bundle=bundle),
+        bp_gpu.create(_cfg("float64", max_iter, persistent_kernel=False), bundle=bundle),
         synd,
         llr0,
     )
@@ -188,7 +188,7 @@ def test_no_coresident_block_falls_back_to_per_step(monkeypatch):
 
 def test_bp_sf_retries_fall_back_to_per_step(monkeypatch):
     """bp_sf_cuda runs its SF retries on bp_nms_persistent, and on the per-step
-    loop when persistent_max_blocks reports 0 or with force_per_step. All three
+    loop when persistent_max_blocks reports 0 or with persistent_kernel false. All three
     give the same outputs on 64 stim rotated_memory_x d=5 shots at p=3e-3, where
     the retries run."""
     from syndrilla.decoder.bp_sf import bp_sf_cuda
@@ -214,14 +214,14 @@ def test_bp_sf_retries_fall_back_to_per_step(monkeypatch):
 
     ref, n_ref = run()
     assert n_ref > 0, "no SF retry ran"
-    step, n_step = run(force_per_step=True)
+    step, n_step = run(persistent_kernel=False)
     assert n_step == 0
-    _assert_equal(step, ref, "bp_sf force_per_step vs persistent retries")
+    _assert_equal(step, ref, "bp_sf per-step vs persistent retries")
     monkeypatch.setattr(ext, "persistent_max_blocks", lambda *a: 0)
     got, n_got = run()
     assert n_got == 0
     _assert_equal(got, ref, "bp_sf no co-resident block vs persistent retries")
-    _assert_equal(got, step, "bp_sf no co-resident block vs force_per_step")
+    _assert_equal(got, step, "bp_sf no co-resident block vs per-step")
 
 
 def _assert_close(got, ref, label):
@@ -320,18 +320,17 @@ def test_pruning_knobs_match_per_step(surface10, kw):
     outputs bit for bit, with part of the batch unconverged at max_iter 10."""
     bundle, synd, llr0 = surface10
     ref = _run(
-        bp_gpu.create(_cfg("float64", 10, force_per_step=True), bundle=bundle),
+        bp_gpu.create(_cfg("float64", 10, persistent_kernel=False), bundle=bundle),
         synd,
         llr0,
     )
-    dec = bp_gpu.create(_cfg("float64", 10, force_per_step=True, **kw), bundle=bundle)
+    dec = bp_gpu.create(_cfg("float64", 10, persistent_kernel=False, **kw), bundle=bundle)
     _assert_equal(_run(dec, synd, llr0), ref, str(kw))
 
 
 def test_persistent_kernel_knob_and_couplings(surface10):
     """persistent_kernel true takes the persistent kernel where auto would not,
-    false and its alias force_per_step never take it, an explicit
-    persistent_kernel key wins over force_per_step, skip_converged false,
+    false never takes it, and skip_converged false,
     warp_per_check false, fuse_vn false and vn_gather false force the per-step
     path, persistent_kernel accepts only true, false
     and auto (as bools or case-insensitive strings), and an explicit member key
@@ -345,11 +344,10 @@ def test_persistent_kernel_knob_and_couplings(surface10):
 
     assert dec()._use_persistent(1, False) is False
     assert dec(persistent_kernel=True)._use_persistent(1, False) is True
-    assert dec(persistent_kernel=True, force_per_step=True)._use_persistent(1, False)
+    assert dec(fusion_opt=False, persistent_kernel=True, fuse_vn=True)._use_persistent(1, False)
     big = 4 * torch.cuda.get_device_properties(0).multi_processor_count
     for kw in (
         {"persistent_kernel": False},
-        {"force_per_step": True},
         {"persistent_kernel": True, "skip_converged": False},
         {"persistent_kernel": True, "warp_per_check": False},
         {"persistent_kernel": True, "fuse_vn": False},

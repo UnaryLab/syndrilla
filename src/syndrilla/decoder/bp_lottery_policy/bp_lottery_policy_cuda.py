@@ -13,9 +13,14 @@ class create(_NmsCuda, _PolicyPy):
         sign_flip_policy: one of bp_lottery_policy's seven policies (default Proposed)
     """
 
+    _config_algorithm = _PolicyPy._config_algorithm
+    _config_keys = _PolicyPy._config_keys
+    _base_config_keys = _PolicyPy._base_config_keys
+
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         # Only the CUDA parent's __init__ runs (kernels, adjacency, V_c_col on
         # device, dtype, N_ext, …). The PyTorch parent contributes methods only.
+        self._validate_config(decoding_cfg)
         _NmsCuda.__init__(self, decoding_cfg, **kwargs)
 
         self.random_machine = str(decoding_cfg.get("random_machine", "sobol")).lower()

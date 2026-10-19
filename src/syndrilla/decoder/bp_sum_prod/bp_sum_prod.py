@@ -67,6 +67,9 @@ class create(_NmsPy):
     D. Poulin, Y. Chung, "On the iterative decoding of sparse quantum codes," Quantum Inf. Comput., vol. 8, no. 10, pp. 987-1000, 2008. arXiv:0801.1241
     """
 
+    _config_keys = ()
+    _config_algorithm = "bp_sum_prod"
+
     def __init__(self, decoder_cfg, **kwargs) -> None:
         """Takes every bp_norm_min_sum key (max_iter, dtype, check_type, compile,
         rebatch_opt, rebatch_opt_params)."""

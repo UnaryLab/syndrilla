@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, reject_unknown_keys
 
 
 def _clones(module, n):
@@ -150,6 +151,10 @@ class SLTDLayer(nn.Module):
 class create(nn.Module):
     """SAQ decoder exposed through the syndrilla decoder contract."""
 
+    _config_algorithm = "saq"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset({"cpnd", "model", "checkpoint", "max_iter"})
+
     # a learned decoder: `-t` fits these weights, and the run does the fitting. Declared
     # rather than detected, since a decoder holding `nn.Parameter` index tensors it never
     # learns -- the bp family does -- would pass any test based on having parameters
@@ -174,6 +179,44 @@ class create(nn.Module):
         """
         super(create, self).__init__()
 
+        legal = self._base_config_keys.union(self._config_keys)
+        first_unknown = next((key for key in decoding_cfg if key not in legal), None)
+        if first_unknown == "code_type":
+            raise ValueError(
+                "Decoder <saq>: <code_type> was removed. Nothing in the decoder branches "
+                "on the code family, so nothing has to declare it; delete the key."
+            )
+        for legacy, block in (
+            ("d_model", "model"),
+            ("N_dec", "model"),
+            ("h", "model"),
+            ("dropout", "model"),
+            ("no_mask", "model"),
+            ("cpnd_passes", "cpnd"),
+        ):
+            if first_unknown == legacy:
+                raise ValueError(
+                    f"Decoder <saq>: <{legacy}> moved under the decoding yaml's "
+                    f"<config.{block}> block. Nest it there rather than at the top level."
+                )
+        for legacy, moved in (
+            ("lr", "training.optimizer.lr"),
+            ("weight_decay", "training.optimizer.weight_decay"),
+            ("min_lr", "training.optimizer.min_lr"),
+            ("lambda_loss_lc", "training.loss.lambda_lc"),
+            ("lambda_loss_lp", "training.loss.lambda_lp"),
+            ("lambda_loss_ent", "training.loss.lambda_ent"),
+        ):
+            if first_unknown == legacy:
+                raise ValueError(
+                    f"Decoder <saq>: <{legacy}> moved to the training yaml as "
+                    f"<{moved}>; pass it with -tr."
+                )
+        reject_unknown_keys(
+            decoding_cfg, legal,
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
+
         logger.info("Creating saq decoder.")
 
         self.device, _ = parse_device_dtype(decoding_cfg, default_dtype="float32")
@@ -191,12 +234,6 @@ class create(nn.Module):
                 f"Invalid input check type <{self.check_type}>, default to <hx>."
             )
             self.check_type = "hx"
-
-        if "code_type" in decoding_cfg:
-            raise ValueError(
-                "Decoder <saq>: <code_type> was removed. Nothing in the decoder branches "
-                "on the code family, so nothing has to declare it; delete the key."
-            )
 
         bundle = kwargs.get("bundle")
         if bundle is None:
@@ -238,33 +275,6 @@ class create(nn.Module):
         self.register_buffer(
             "logic_matrix", l_matrix.t().to(self.device).to(self.dtype)
         )
-
-        for legacy, block in (
-            ("d_model", "model"),
-            ("N_dec", "model"),
-            ("h", "model"),
-            ("dropout", "model"),
-            ("no_mask", "model"),
-            ("cpnd_passes", "cpnd"),
-        ):
-            if legacy in decoding_cfg:
-                raise ValueError(
-                    f"Decoder <saq>: <{legacy}> moved under the decoding yaml's "
-                    f"<config.{block}> block. Nest it there rather than at the top level."
-                )
-        for legacy, moved in (
-            ("lr", "training.optimizer.lr"),
-            ("weight_decay", "training.optimizer.weight_decay"),
-            ("min_lr", "training.optimizer.min_lr"),
-            ("lambda_loss_lc", "training.loss.lambda_lc"),
-            ("lambda_loss_lp", "training.loss.lambda_lp"),
-            ("lambda_loss_ent", "training.loss.lambda_ent"),
-        ):
-            if legacy in decoding_cfg:
-                raise ValueError(
-                    f"Decoder <saq>: <{legacy}> moved to the training yaml as "
-                    f"<{moved}>; pass it with -tr."
-                )
 
         cpnd_cfg = decoding_cfg.get("cpnd", {})
         if not isinstance(cpnd_cfg, dict):

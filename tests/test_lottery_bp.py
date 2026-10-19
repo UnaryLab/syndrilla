@@ -25,8 +25,12 @@ def _surface10_system_outputs(mod, extra=None, batches=((0, 16, 0.03), (1, 16, 0
         max_iter=100,
         compile=False,
         random_machine="system",
+        flip_mode="lottery",
     )
     cfg.update(extra or {})
+    if not mod.create._config_algorithm.startswith("bp_lottery"):
+        for key in ("random_machine", "flip_phase_iters", "flip_mode"):
+            cfg.pop(key, None)
     mcfg = read_yaml("examples/alist/surface_10.matrix.yaml")["matrix"]
     bundle = load_matrices(mcfg, *parse_device_dtype(cfg))
     H = bundle.select("hx")[3].to_dense().cpu().double()
@@ -80,7 +84,7 @@ def test_final_iteration_matches_plain_bp(backend, variant, rm):
     cfg = dict(
         device={"device_type": "cpu" if backend == "cpu" else "cuda"},
         max_iter=1 if variant == "_policy" else 3,
-        flip_start_iter=2,
+        **({} if variant == "_policy" else dict(flip_phase_iters=[2], flip_mode=["off", "lottery"])),
         random_machine=rm,
     )
     if variant == "_quant":
@@ -167,28 +171,6 @@ def test_quant_system_pytorch_matches_cuda():
     _assert_same(ref, got)
 
 
-_INTERVAL_BATCHES = (
-    (11, 8, 0.002),
-    (0, 8, 0.01),
-    (34, 2, 0.03),
-    (3, 4, 0.02),
-    (25, 4, 0.02),
-    (0, 64, 0.03),
-)
-
-
-def _assert_interval_cases(out, k):
-    """out holds a batch fully converged at a flip iteration past 4 (where the
-    CUDA path makes the extra system draw), one fully converged at another
-    iteration past 4, and one not fully converged."""
-    import types
-    from syndrilla.decoder.bp_lottery.bp_lottery import is_flip_iter
-
-    d = types.SimpleNamespace(flip_start_iter=4, flip_interval=k, max_iter=60)
-    ends = [int(o["iter"].max()) for o in out if bool(o["converge"].all())]
-    assert any(t > 4 and is_flip_iter(d, t) for t in ends), ends
-    assert any(t > 4 and not is_flip_iter(d, t) for t in ends), ends
-    assert len(ends) < len(out)
 
 
 def _cuda_or_skip():
@@ -197,141 +179,6 @@ def _cuda_or_skip():
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-
-
-def test_flip_interval_1_matches_default():
-    """flip_interval 1 gives the outputs and RNG states of a config without the
-    key, on both paths."""
-    _cuda_or_skip()
-    from syndrilla.decoder.bp_lottery import bp_lottery, bp_lottery_cuda
-
-    for mod in (bp_lottery, bp_lottery_cuda):
-        for rm in ("sobol", "system"):
-            _assert_same(
-                _surface10_system_outputs(mod, dict(random_machine=rm)),
-                _surface10_system_outputs(
-                    mod, dict(random_machine=rm, flip_interval=1)
-                ),
-            )
-
-
-def test_flip_interval_2_flip_iterations():
-    """With flip_start_iter 4 and flip_interval 2, each path flips at
-    iterations 5, 7, ..., 17 of max_iter 19 on a batch that does not fully
-    converge, and on no other iteration."""
-    import types
-
-    _cuda_or_skip()
-    from syndrilla.decoder.bp_lottery import bp_lottery, bp_lottery_cuda
-
-    for mod in (bp_lottery, bp_lottery_cuda):
-        seen = []
-
-        class Rec(mod.create):
-            def sign_flip_cn_rand_new(self, syndrome, s_est, l_v):
-                seen.append(self.i)
-                return super().sign_flip_cn_rand_new(syndrome, s_est, l_v)
-
-        out = _surface10_system_outputs(
-            types.SimpleNamespace(create=Rec),
-            dict(max_iter=19, flip_start_iter=4, flip_interval=2),
-            ((0, 16, 0.1),),
-        )
-        assert not bool(out[0]["converge"].all())
-        assert seen == list(range(5, 19, 2)), (mod.__name__, seen)
-
-
-def test_flip_interval_pytorch_matches_cuda():
-    """flip_interval 2 and 3, sobol and system: equal outputs and global RNG
-    states on both paths, over batches that fully converge at a flip
-    iteration, at another iteration, and not at all."""
-    _cuda_or_skip()
-    from syndrilla.decoder.bp_lottery import bp_lottery, bp_lottery_cuda
-
-    for k in (2, 3):
-        for rm in ("sobol", "system"):
-            extra = dict(
-                max_iter=60, rebatch_opt=False, random_machine=rm, flip_interval=k
-            )
-            ref = _surface10_system_outputs(bp_lottery, extra, _INTERVAL_BATCHES)
-            got = _surface10_system_outputs(bp_lottery_cuda, extra, _INTERVAL_BATCHES)
-            _assert_interval_cases(ref, k)
-            _assert_same(ref, got)
-
-
-def test_quant_flip_interval_2_flip_iterations():
-    """bp_lottery_quant with flip_start_iter 4 and flip_interval 2: each path
-    flips at iterations 5, 7, ..., 17 of max_iter 19 on a batch that does not
-    fully converge, and on no other iteration."""
-    import types
-
-    _cuda_or_skip()
-    from syndrilla.decoder.bp_lottery_quant import (
-        bp_lottery_quant,
-        bp_lottery_quant_cuda,
-    )
-
-    for mod in (bp_lottery_quant, bp_lottery_quant_cuda):
-        seen = []
-
-        class Rec(mod.create):
-            def sign_flip(self, syndrome, s_est, l_v, active):
-                seen.append(self.i)
-                return super().sign_flip(syndrome, s_est, l_v, active)
-
-        out = _surface10_system_outputs(
-            types.SimpleNamespace(create=Rec),
-            dict(
-                max_iter=19,
-                flip_start_iter=4,
-                flip_interval=2,
-                int_width=3,
-                frac_width=4,
-            ),
-            ((0, 16, 0.1),),
-        )
-        assert not bool(out[0]["converge"].all())
-        assert seen == list(range(5, 19, 2)), (mod.__name__, seen)
-
-
-def test_quant_flip_interval_pytorch_matches_cuda():
-    """bp_lottery_quant with flip_interval 2, sobol and system: equal outputs
-    and global RNG states on both paths."""
-    _cuda_or_skip()
-    from syndrilla.decoder.bp_lottery_quant import (
-        bp_lottery_quant,
-        bp_lottery_quant_cuda,
-    )
-
-    for rm in ("sobol", "system"):
-        extra = dict(
-            max_iter=60,
-            rebatch_opt=False,
-            int_width=3,
-            frac_width=4,
-            random_machine=rm,
-            flip_interval=2,
-        )
-        ref = _surface10_system_outputs(bp_lottery_quant, extra, _INTERVAL_BATCHES)
-        got = _surface10_system_outputs(bp_lottery_quant_cuda, extra, _INTERVAL_BATCHES)
-        _assert_interval_cases(ref, 2)
-        _assert_same(ref, got)
-
-
-def test_flip_interval_bad_values_raise():
-    """A flip_interval that is not an int >= 1 raises ValueError on both
-    paths; the message shows a string value with its quotes."""
-    import pytest
-
-    _cuda_or_skip()
-    from syndrilla.decoder.bp_lottery import bp_lottery, bp_lottery_cuda
-
-    for mod in (bp_lottery, bp_lottery_cuda):
-        for v in (0, -1, 1.5, True, "2"):
-            with pytest.raises(ValueError, match="^flip_interval must"):
-                _surface10_system_outputs(mod, dict(flip_interval=v), ())
-        with pytest.raises(ValueError, match="got <'2'>"):
-            _surface10_system_outputs(mod, dict(flip_interval="2"), ())
 
 
 def test_batch_alist_hz(batch_size=1000, target_error=1000):

@@ -5,6 +5,7 @@ from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
+from syndrilla.decoder.knobs import BASE_CONFIG_KEYS, reject_unknown_keys
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _NmsPy
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import _build_vn_adj
 
@@ -44,6 +45,13 @@ class create(torch.nn.Module):
     """
     This class creates a bp decoder on a single GPU
     """
+    _config_algorithm = "relay_bp"
+    _base_config_keys = BASE_CONFIG_KEYS
+    _config_keys = frozenset({
+        "center", "width", "init_mem_strength", "alpha", "alpha_scaling",
+        "solution", "iteration_initial", "iteration_count", "legs", "type",
+    })
+
     def __init__(self,
                  decoding_cfg,
                  **kwargs) -> None:
@@ -75,6 +83,10 @@ class create(torch.nn.Module):
         """
 
         super(create, self).__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
 
         logger.info('Creating bp decoder.')
 

@@ -6,10 +6,10 @@ decoding:
     device_type: cpu
     device_idx: 0
   config:
-    max_iter: 181
+    max_iter: 100
     # syndrome-flipping (SF) post-processing on samples BP leaves unconverged
     sf:
-      topk: 20      # number of most-oscillating bits used as flip candidates
+      topk: 50      # number of most-oscillating bits used as flip candidates
       w_min: 1      # minimum flip weight
-      w_max: 4      # maximum flip weight
-      n_sample: 5   # max combinations sampled per weight
+      w_max: 10     # maximum flip weight
+      n_sample: 10  # max combinations sampled per weight

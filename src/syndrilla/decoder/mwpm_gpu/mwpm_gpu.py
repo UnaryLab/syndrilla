@@ -11,6 +11,7 @@ from loguru import logger
 # Keep worker pickles on syndrilla.decoder.mwpm_gpu.mwpm_gpu when the CPU factory loads a synthetic module.
 from syndrilla.decoder.mwpm_gpu import mwpm_gpu as _real_mod
 from syndrilla.utils import parse_device_dtype
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, reject_unknown_keys
 
 
 @dataclass
@@ -1696,8 +1697,16 @@ class create(torch.nn.Module):
     using that path need an ``if __name__ == '__main__':`` guard.
     """
 
+    _config_algorithm = "mwpm_gpu"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset({"weights", "skip_converged", "num_workers", "mp_min_batch"})
+
     def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         logger.info("Creating mwpm_gpu decoder.")
         logger.warning(
             "mwpm_gpu is up to 2 orders of magnitude slower than mwpm (PyMatching) in every "

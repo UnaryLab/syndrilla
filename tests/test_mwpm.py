@@ -61,7 +61,7 @@ def test_factory_random_graph_syndrome_and_output_device(mode, device):
     syndrome = torch.tensor(errors @ h.T % 2, device=device)
     prior = torch.tensor(rng.normal(size=errors.shape), dtype=torch.float64, device=device)
     cfg = _cfg(algorithm="mwpm", device={"device_type": device},
-               config=dict(weights=mode, num_workers=32))
+               config=dict(weights=mode))
     decoder = create_decoder(cfg=cfg, bundle=_bundle(h, device))[0]
     assert decoder.skip_converged is (mode == "posterior")
     out = decoder({"synd": syndrome, "llr": prior, "llr0": prior})
@@ -95,13 +95,13 @@ def test_200_shot_native_matches_pymatching(mode, device):
     syndrome = rng.integers(0, 2, (200, h.shape[0]), dtype=np.uint8)
     llr = rng.normal(0, 2, (200, h.shape[1]))
     llr[0, 0] = 0
-    cfg = _cfg(weights=mode, num_workers=1, device={"device_type": device})
+    cfg = _cfg(weights=mode, device={"device_type": device})
     bundle = _bundle(h, device)
     io = {"synd": torch.tensor(syndrome, device=device),
           "llr0": torch.tensor(llr, device=device), "llr": torch.tensor(llr, device=device)}
     got = mwpm.create(cfg, bundle=bundle)(dict(io))
     native = mwpm_gpu_cuda if device == "cuda" else mwpm_gpu
-    ref = native.create(cfg, bundle=bundle)(dict(io))
+    ref = native.create({**cfg, "num_workers": 1}, bundle=bundle)(dict(io))
     got_bits, ref_bits = (out["e_v"].cpu().numpy().astype(np.uint8) for out in (got, ref))
     assert np.array_equal(got_bits @ h.T % 2, syndrome)
     assert np.array_equal(ref_bits @ h.T % 2, syndrome)

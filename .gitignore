@@ -57,7 +57,7 @@ cover/
 
 # Django stuff:
 *.log
-!zoo/ablation_bposd/*.log
+!zoo/opt_ablation_bposd/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -190,3 +190,6 @@ zoo/*/outputs/
 *.aborted*
 innovation_summary/
 zoo/study/
+
+# local uploads (papers, notes)
+upload/

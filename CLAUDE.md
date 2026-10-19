@@ -40,11 +40,16 @@ syndrilla -r=tests/test_outputs -d=examples/alist/bposd_hx.decoding.yaml -e=exam
 - **H storage**: `sparse_h` (default true) keeps H as a coalesced bool sparse COO tensor; it is set in the `matrix`, stim `syndrome`, or `interface` block, never in `decoding`.
 - **Device** (`utils/utils.py: parse_device_dtype`): omitted device means cuda if available; bad dtype falls back to float64; mps with float64 falls back to cpu.
 - **Optimization groups** (`decoder/knobs.py`): six bool groups, all on by default: `pruning_opt`, `fusion_opt`, `mapping_opt`, `gather_opt`, `memory_opt`, `rebatch_opt`. An explicit knob wins over its group. `rebatch_opt` is the learned iteration cap; the old key `rebatch_speedup` raises.
-- **Docs**: `docs/` has one file per module (decoder, error, syndrome, matrix, interface, trainer) and design notes (optimizations, parallel, bp_interventions). `zoo/speedup/script/` holds tracked sweep/plot tooling, with published sweep results and figures in `zoo/speedup/`; `zoo/ablation_bposd/` holds the ablation driver, memory helper, plotting tools and their results; `zoo/study/` holds ignored local research scripts, notes and results. `reports/` holds dated tech reports.
+- **Docs**: `docs/` has one file per module (decoder, error, syndrome, matrix, interface, trainer) and one design note (parallel). `zoo/speedup/script/` holds tracked sweep/plot tooling, with published sweep results and figures in `zoo/speedup/`; `zoo/opt_ablation_bposd/` holds the ablation driver, memory helper, plotting tools and their results; `zoo/study/` holds ignored local research scripts, notes and results. `reports/` holds dated tech reports.
 
 ## Config keys
 
 - A config key that maps to an argument of an external tool (stim, PyMatching, ldpc, torch) keeps that tool's argument name verbatim, for example `decompose_errors`, not `decompose`.
+- Every decoder rejects unknown config keys with `ValueError` (shared check in `decoder/knobs.py`); each decoder module declares its own legal keys, torch and CUDA alike. A stage's own `config` entry is strict; top-level knobs and group keys are filtered to each chain stage, and raise only when no stage reads them. A new config key must be added to its decoder's legal set.
+
+## Experiment conventions
+
+- Study and sweep runs on the BP family (`bp_norm_min_sum` and every decoder built on it, including `bp_lottery` variants) set `max_iter` to the code's data qubit count: `d * d` for the rotated surface code at distance `d`, `n` for an `[[n, k, d]]` code such as BB `[[144, 12, 12]]`. Unit tests under `tests/` keep their own small `max_iter`.
 
 ## Git and releases
 

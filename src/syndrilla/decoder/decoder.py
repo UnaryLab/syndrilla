@@ -6,14 +6,15 @@ import numpy as np
 import torch
 from loguru import logger
 
-from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.knobs import knob, reject_unknown_keys
 from syndrilla.utils import call_func_from_cfg, check_yaml_header, get_path, read_yaml
 
 DEFAULT_CANDIDATES = tuple(range(100))
 EARLY_TERMINATION_ALGOS = frozenset({
-    "bp_norm_min_sum", "bp_norm_min_sum_quant", "bp_sum_prod",
+    "bp_symbreak",
+    "bp_norm_min_sum", "bp_norm_min_sum_quant", "bp_sum_prod", "bp_ots",
     "bp_lottery", "bp_lottery_quant", "bp_lottery_policy",
-    "bp_norm_min_sum_layered", "bp_lottery_layered", "bp_sf", "bp_sf_lottery",
+    "bp_norm_min_sum_layered", "bp_lottery_layered", "bp_sf", "bp_sf_lottery", "bp_lottery_pre",
 })
 
 
@@ -261,7 +262,7 @@ class RoundFlattenWrapper(torch.nn.Module):
             if key in io_dict and io_dict[key].shape[0] == Bd:
                 v = io_dict[key]
                 io_dict[key] = v.reshape(B, d, *v.shape[1:])
-        for key in ("converge", "iter"):
+        for key in ("converge", "iter", "splits"):
             if key in io_dict and io_dict[key].shape[0] == Bd:
                 io_dict[key] = io_dict[key].reshape(B, d)
         io_dict["llr0"] = llr0
@@ -277,6 +278,11 @@ MOVED_TO_CONFIG = (
     "damping_factor",
     "max_b_iter",
     "random_machine",
+    # bp_lottery's flip knobs
+    "cn_pick",
+    "cn_pick_tie_break",
+    "vn_pick",
+    "vn_pick_tie_break",
     "sign_flip_policy",
     "int_width",
     "frac_width",
@@ -284,7 +290,6 @@ MOVED_TO_CONFIG = (
     "mp_min_batch",
     "num_workers",
     "weights",
-    "skip_converged",
     # saq's blocks, and the weights only a learned decoder loads
     "model",
     "cpnd",
@@ -300,14 +305,14 @@ MOVED_TO_CONFIG = (
     "alpha",
     "alpha_scaling",
     "type",
-    # bp_lottery, bp_lottery_parallel, bp_ots
-    "flip_start_iter",
-    "flip_interval",
-    "num_parallel",
-    "seeds",
-    "select",
+    # bp_ots
     "interval",
     "strength",
+    # bp_symbreak graph split controls
+    "bp_iters",
+    "k_max",
+    "max_splits",
+    "assign",
 )
 
 # The other half of the same rule: these stay at the top of the block, so a `config`
@@ -435,13 +440,31 @@ def assert_trained(decoders):
     )
 
 
+def _decoder_config_keys(algorithm, cfg):
+    """Read the selected constructor's key set without setting up a device."""
+    algo = algorithm.lower()
+    module_name = algo
+    if (cfg.get("device") or {}).get("device_type") == "cuda" and not cfg.get("force_pytorch", False):
+        cuda_file = os.path.join(os.path.dirname(__file__), algo, f"{algo}_cuda.py")
+        if os.path.isfile(cuda_file):
+            module_name += "_cuda"
+    module = importlib.import_module(f"syndrilla.decoder.{algo}.{module_name}")
+    return module.create._base_config_keys.union(module.create._config_keys)
+
+
 def resolve_configs(dec_cfg: dict, source: str = "dict"):
     """Return one flat config per algorithm, in `decoding.algorithm` order."""
     algorithms = dec_cfg["algorithm"]
     if isinstance(algorithms, str):
         algorithms = [algorithms]
+    blocks = _split_config(dec_cfg, algorithms, source)
     shared = {k: v for k, v in dec_cfg.items() if k != "config"}
-    return [{**shared, **block} for block in _split_config(dec_cfg, algorithms, source)]
+    legal_sets = [_decoder_config_keys(algo, shared) for algo in algorithms]
+    reject_unknown_keys(shared, frozenset().union(*legal_sets), ", ".join(algorithms))
+    # Explicit stage entries stay intact for the constructor's strict validation.
+    # A top-level member knob reaches only the stages that accept it.
+    return [{**{key: value for key, value in shared.items() if key in legal}, **block}
+            for legal, block in zip(legal_sets, blocks)]
 
 
 def create_decoder(yaml_path: str = None, cfg: dict = None, **kwargs):

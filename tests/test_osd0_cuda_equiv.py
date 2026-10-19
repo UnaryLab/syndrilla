@@ -14,6 +14,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from syndrilla.decoder import create_decoder
+from syndrilla.decoder.decoder import resolve_configs
 from syndrilla.decoder.osd_0 import osd_0 as osd_cpu
 from syndrilla.decoder.osd_0 import osd_0_cuda as osd_gpu
 from syndrilla.error_model import create_error_model
@@ -84,7 +85,7 @@ def surface10():
     H = bundle.select("hx")[3]
     with torch.no_grad():
         io = bp({"synd": synd, "llr0": llr0, "H_matrix": H})
-    return cfg, bundle, io["synd"].cpu(), io["llr"].double().cpu()
+    return {**resolve_configs(cfg)[1], "algorithm": "osd_0"}, bundle, io["synd"].cpu(), io["llr"].double().cpu()
 
 
 def test_surface10_matches_cpu(surface10):
@@ -92,8 +93,8 @@ def test_surface10_matches_cpu(surface10):
     H = bundle.select("hx")[3]
     ref = _cpu_osd(bundle, synd, llr)
     for per_step in (False, True):
-        dec = osd_gpu.create(dict(cfg, force_per_step=per_step), bundle=bundle)
-        assert torch.equal(_run(dec, synd, llr, H), ref), f"force_per_step={per_step}"
+        dec = osd_gpu.create(dict(cfg, fused=not per_step), bundle=bundle)
+        assert torch.equal(_run(dec, synd, llr, H), ref), f"fused={not per_step}"
 
 
 def test_surface10_chunked(surface10):
@@ -109,12 +110,12 @@ def test_surface10_chunked(surface10):
     per_sample = whole._scan_bytes(whole.pool_rows, whole.pool_cols, whole.A_rank)
     for per_step in (False, True):
         dec = osd_gpu.create(
-            dict(cfg, force_per_step=per_step, workspace_bytes=5 * per_sample),
+            dict(cfg, fused=not per_step, workspace_bytes=5 * per_sample),
             bundle=bundle,
         )
         calls, scan = [], dec._scan
         dec._scan = lambda *a: calls.append(a[0].shape[0]) or scan(*a)
-        assert torch.equal(_run(dec, synd, llr, H), ref), f"force_per_step={per_step}"
+        assert torch.equal(_run(dec, synd, llr, H), ref), f"fused={not per_step}"
         assert calls == [5] * 12 + [4]
         assert dec.last_pivot_pos == whole.last_pivot_pos
 
@@ -140,11 +141,11 @@ def test_rank_deficient_late_pivots(M):
 
     ref = _cpu_osd(bundle, synd, llr)
     for per_step in (False, True):
-        dec = osd_gpu.create(dict(CUDA_CFG, force_per_step=per_step), bundle=bundle)
+        dec = osd_gpu.create(dict(CUDA_CFG, fused=not per_step), bundle=bundle)
         assert dec.A_rank < M
         out = _run(dec, synd, llr, Ht)
         assert dec.last_pivot_pos >= 2 * M  # a pivot beyond the first 2M columns
-        assert torch.equal(out, ref), f"force_per_step={per_step}"
+        assert torch.equal(out, ref), f"fused={not per_step}"
 
 
 def _gpu_variants(cfg, bundle, B):
@@ -155,7 +156,7 @@ def _gpu_variants(cfg, bundle, B):
     out = []
     for per_step in (False, True):
         for budget in (None, 3 * per_sample):
-            c = dict(cfg, force_per_step=per_step)
+            c = dict(cfg, fused=not per_step)
             if budget:
                 c["workspace_bytes"] = budget
                 assert B > 3
@@ -416,14 +417,14 @@ def test_group_off(surface10, case, group):
         llr = torch.from_numpy(rng.random((B, N)))
         cfg, k = CUDA_CFG, 15
     for per_step in (False, True):
-        on = osd_gpu.create(dict(cfg, force_per_step=per_step), bundle=bundle)
+        on = osd_gpu.create(dict(cfg, fused=not per_step), bundle=bundle)
         on.prefix = k
         widths, solve = [], on._solve
         on._solve = lambda s, o: widths.append(o.shape[1]) or solve(s, o)
         want = _run_partly_converged(on, synd, llr)
         assert len(widths) > 1  # the prefix retry ran
         off = osd_gpu.create(
-            dict(cfg, force_per_step=per_step, **{group: False}), bundle=bundle
+            dict(cfg, fused=not per_step, **{group: False}), bundle=bundle
         )
         assert off.prefix == off.N
         got = _run_partly_converged(off, synd, llr)
@@ -432,17 +433,42 @@ def test_group_off(surface10, case, group):
 
 
 def test_knob_resolution():
-    """osd_early_stop false turns osd_prefix_scan off; a key written explicitly
-    wins over its group key; groups without OSD members are ignored."""
+    """early_stop false turns prefix_scan off; a key written explicitly
+    wins over its group key; groups without OSD members have no effect."""
     H = (np.random.default_rng(2).random((30, 90)) < 0.1).astype(np.uint8)
     bundle = _Bundle(H)
-    dec = osd_gpu.create(dict(CUDA_CFG, osd_early_stop=False), bundle=bundle)
-    assert not dec.osd_prefix_scan and dec.osd_solve_by_pivots
+    dec = osd_gpu.create(dict(CUDA_CFG, early_stop=False), bundle=bundle)
+    assert not dec.prefix_scan and dec.solve_by_pivots
     dec = osd_gpu.create(
-        dict(CUDA_CFG, pruning_opt=False, osd_skip_converged=True, fusion_opt=False),
+        dict(CUDA_CFG, pruning_opt=False, skip_converged=True),
         bundle=bundle,
     )
-    assert not (dec.osd_early_stop or dec.osd_prefix_scan or dec.osd_solve_by_pivots)
-    assert dec.osd_skip_converged and dec.osd_column_scan
+    assert not (dec.early_stop or dec.prefix_scan or dec.solve_by_pivots)
+    assert dec.skip_converged and dec.column_scan
     dec = osd_gpu.create(dict(CUDA_CFG, memory_opt=False), bundle=bundle)
-    assert not dec.osd_column_scan and dec.workspace_bytes == 1 << 60
+    assert not dec.column_scan and dec.workspace_bytes == 1 << 60
+    dec = osd_gpu.create(dict(CUDA_CFG, fusion_opt=False), bundle=bundle)
+    assert dec.prefix_scan and dec.column_scan and not dec.fused
+
+
+@pytest.mark.parametrize("group,explicit,expected", [
+    (True, None, True), (False, None, False),
+    (False, True, True), (True, False, False),
+])
+def test_fused_group_and_member_resolution(surface10, monkeypatch, group, explicit, expected):
+    """The group selects fused elimination unless an explicit member overrides it."""
+    cfg, bundle, synd, llr = surface10
+    cfg = dict(cfg, fusion_opt=group)
+    if explicit is not None:
+        cfg["fused"] = explicit
+    dec = osd_gpu.create(cfg, bundle=bundle)
+    assert dec.fused is expected
+    calls, fused = [], dec._ext.osd0_fused
+
+    def counted(*args):
+        calls.append(1)
+        return fused(*args)
+
+    monkeypatch.setattr(dec._ext, "osd0_fused", counted)
+    assert torch.equal(_run(dec, synd, llr, bundle.select("hx")[3]), _cpu_osd(bundle, synd, llr))
+    assert bool(calls) is expected

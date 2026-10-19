@@ -1,6 +1,6 @@
-"""Plot ablation results written by zoo/ablation_bposd/ablation.py.
+"""Plot ablation results written by zoo/opt_ablation_bposd/ablation.py.
 
-Usage: python zoo/ablation_bposd/plot_ablation.py results.csv [--outdir DIR]
+Usage: python zoo/opt_ablation_bposd/plot_ablation.py results.csv [--outdir DIR]
 
 Writes, next to the CSV (or into --outdir), with the CSV stem as prefix:
   <stem>-total-vs-d-p<p>.pdf  speedup_total vs distance, one figure per p

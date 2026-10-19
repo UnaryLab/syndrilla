@@ -7,7 +7,7 @@ import torch.nn as nn
 from loguru import logger
 
 from syndrilla.decoder.decoder import RebatchSpeedup
-from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.knobs import BASE_CONFIG_KEYS, knob, reject_unknown_keys
 
 _EXT = None  # module-level cache; compiled once per Python process
 PERSISTENT_THREADS = (
@@ -193,8 +193,6 @@ class create(nn.Module):
         early_termination : bool       (default: true; false runs every sample
                       for max_iter iterations and returns the final iterate)
         dtype       : float32 | float64 | float16 | bfloat16  (default: float64)
-        force_per_step : bool           (default: false; alias of persistent_kernel:
-                      false, used when persistent_kernel is absent)
         persistent_kernel : auto | true | false  (default: auto; true takes the
                       persistent kernel whenever it can run, false never)
         host_check_every : int          (default: 8; per-step host early-exit
@@ -225,7 +223,15 @@ class create(nn.Module):
           device_idx  : int             (default: 0)
     """
 
+    _base_config_keys = BASE_CONFIG_KEYS
+    _config_keys = ()
+    _config_algorithm = "bp_norm_min_sum"
+
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         nn.Module.__init__(self)
         logger.info("Creating bp_norm_min_sum_cuda decoder.")
 
@@ -352,10 +358,6 @@ class create(nn.Module):
         # many persistent blocks the device holds at once (the capped launch needs
         # every sample's block co-resident).
         persistent = knob(decoding_cfg, "persistent_kernel", "auto")
-        if "persistent_kernel" not in decoding_cfg and decoding_cfg.get(
-            "force_per_step"
-        ):
-            persistent = False
         if isinstance(persistent, str):
             persistent = {"true": True, "false": False}.get(
                 persistent.lower(), persistent.lower()
@@ -431,7 +433,7 @@ class create(nn.Module):
         """True if a batch of B samples runs on the persistent kernel: small codes
         (M <= 120) or batches of at least 4 samples per SM on codes with
         M <= PERSISTENT_MAX_M, or any B with persistent_kernel true; never with
-        early_termination false, persistent_kernel false (or force_per_step), skip_converged false,
+        early_termination false, persistent_kernel false, skip_converged false,
         warp_per_check false, fuse_vn false, vn_gather false or an overridden
         _iter_hook, never when no persistent block fits on an SM, and with the cap on only when all B
         blocks are co-resident."""

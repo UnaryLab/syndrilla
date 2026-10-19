@@ -9,6 +9,9 @@ from loguru import logger
 from syndrilla.utils import get_path
 
 
+_OPTIONAL_ITERATIONS = (("iter_serial", "serial"), ("iter_parallel", "parallel"))
+
+
 class TrainResultDumper(yaml.SafeDumper):
     """`SafeDumper` with its representers frozen as they are at import."""
 
@@ -67,6 +70,8 @@ class BatchTracker:
         self.e_all = None
         self.converge_all = [None] * (nd + 1)
         self.iter_all = [None] * nd
+        for key, _ in _OPTIONAL_ITERATIONS:
+            setattr(self, f"{key}_all", [None] * nd)
         self.time_iter_all = [[] for _ in range(nd)]
 
     def ensure_buffer(self, sample, dtype=None):
@@ -115,6 +120,15 @@ class BatchTracker:
         e_v = self._flatten_rounds(e_v, e_v_base)
         iter_val = self._flatten_rounds(iter_val, 1)
         converge = self._flatten_rounds(converge, 1)
+        # Consume the per-stage keys: the decoder chain reuses this io_dict.
+        for key, _ in _OPTIONAL_ITERATIONS:
+            value = io_dict.pop(key, None)
+            if value is not None:
+                value = self._flatten_rounds(value.to(device=self.device, dtype=torch.long), 1)
+                buffers = getattr(self, f"{key}_all")
+                if buffers[i] is None:
+                    buffers[i] = self.ensure_buffer(value)
+                buffers[i] = torch.cat((buffers[i], value))
 
         if self.e_v_all[i] is None:
             self.e_v_all[i] = self.ensure_buffer(e_v, dtype=self.dtype)
@@ -147,6 +161,9 @@ class BatchTracker:
         for di in range(self.num_decoders):
             self.e_v_all[di] = _maybe_slice(self.e_v_all[di])
             self.iter_all[di] = _maybe_slice(self.iter_all[di])
+            for key, _ in _OPTIONAL_ITERATIONS:
+                buffers = getattr(self, f"{key}_all")
+                buffers[di] = _maybe_slice(buffers[di])
         for di in range(self.num_decoders + 1):
             self.converge_all[di] = _maybe_slice(self.converge_all[di])
 
@@ -161,6 +178,13 @@ def _add_histogram(total, batch):
     elif batch.numel() < total.numel():
         batch = torch.nn.functional.pad(batch, (0, total.numel() - batch.numel()))
     return total + batch
+
+
+def _iteration_percentiles(histogram):
+    """The p0..p100 iteration counts from a histogram whose slot k-1 counts k."""
+    cdf = torch.cumsum(histogram.to(torch.float64), dim=0) / histogram.sum()
+    qs = torch.linspace(0.0, 1.0, 101, dtype=torch.float64, device=histogram.device)
+    return (torch.searchsorted(cdf, qs, right=False) + 1).int().tolist()
 
 
 def _opt_int(value):
@@ -313,6 +337,9 @@ class MetricState:
 
         # distribution is special (tensor per decoder)
         self.distribution = [0.0] * num_decoders
+        for _, suffix in _OPTIONAL_ITERATIONS:
+            setattr(self, f"average_iter_{suffix}", [0.0] * num_decoders)
+            setattr(self, f"distribution_{suffix}", [None] * num_decoders)
 
         # per-channel accumulators: list[list[float]] indexed by [decoder][channel]
         for field in self._channel_fields:
@@ -329,6 +356,8 @@ class MetricState:
         converge,
         converge_next,
         decode_idx,
+        iteration_serial=None,
+        iteration_parallel=None,
     ):
         """
         This function reports the decoding iteration and accuracy.
@@ -359,7 +388,7 @@ class MetricState:
         logger.info(f"Average iterations per sample: {average_iter}")
         logger.info(f"Maximum iterations: {distribution}")
 
-        if total_time == 0:
+        if total_time == 0 or sample_size == 0:
             average_time_sample = 0
             logger.info(f"Average time per sample: {average_time_sample} seconds.")
 
@@ -393,7 +422,7 @@ class MetricState:
         logical_error_rate = torch.zeros([number_channel], dtype=dtype)
         converge_succ_rate = torch.zeros([number_channel], dtype=dtype)
         converge_fail_rate = torch.zeros([number_channel], dtype=dtype)
-        for i in range(e_actual.size(1)):  # iterate over check_type
+        for i in range(e_actual.size(1) if sample_size else 0):  # iterate over check_type
             check_channel = check[:, i]
             e_actual_channel = e_actual[:, i, :]
             e_estimated_channel = e_estimated[:, i, :]
@@ -485,7 +514,7 @@ class MetricState:
                     f"  Converge success rate: {converge_succ_rate[channel]:.6f}"
                 )
 
-        return MetricResult(
+        result = MetricResult(
             {
                 "total_time": total_time,
                 "sample_size": sample_size,
@@ -503,6 +532,16 @@ class MetricState:
                 "converge_succ": converge_succ_rate,
             }
         )
+        for (_, suffix), value in zip(
+            _OPTIONAL_ITERATIONS, (iteration_serial, iteration_parallel)
+        ):
+            if value is not None:
+                values = value.long().flatten()
+                result[f"average_iter_{suffix}"] = (
+                    values.double().mean().item() if values.numel() else 0.0
+                )
+                result[f"distribution_{suffix}"] = torch.bincount(values - 1)
+        return result
 
     def update_metric(self, decoder_idx, batch_metrics):
         """Add one batch's report_metric result for a decoder."""
@@ -522,6 +561,14 @@ class MetricState:
         self.distribution[i] = _add_histogram(
             self.distribution[i], batch_metrics["distribution"]
         )
+        for _, suffix in _OPTIONAL_ITERATIONS:
+            if f"distribution_{suffix}" in batch_metrics:
+                hist = batch_metrics[f"distribution_{suffix}"]
+                getattr(self, f"average_iter_{suffix}")[i] += (
+                    batch_metrics[f"average_iter_{suffix}"] * hist.sum().item()
+                )
+                buffers = getattr(self, f"distribution_{suffix}")
+                buffers[i] = _add_histogram(buffers[i], hist)
 
         for field in self._channel_fields:
             acc = getattr(self, field)[i]
@@ -564,6 +611,14 @@ class MetricState:
             "invoke_rate": invoke_rate,
             "sample_count": float(denom),
         }
+        for _, suffix in _OPTIONAL_ITERATIONS:
+            hist = getattr(self, f"distribution_{suffix}")[i]
+            if hist is not None:
+                count = hist.sum().item()
+                result[f"average_iter_{suffix}"] = (
+                    getattr(self, f"average_iter_{suffix}")[i] / count if count else 0.0
+                )
+                result[f"distribution_{suffix}"] = hist
 
         for field in self._channel_fields:
             avg = [x / denom for x in getattr(self, field)[i]]
@@ -660,13 +715,7 @@ class MetricState:
             iteration_count = raw_dist.numpy().tolist()
 
             if done:
-                total = decoder_metrics["distribution"].sum()
-                cdf = torch.cumsum(decoder_metrics["distribution"].to(torch.float64), dim=0) / total
-                qs = torch.linspace(
-                    0.0, 1.0, 101, dtype=torch.float64, device=decoder_metrics["distribution"].device
-                )
-                indices = torch.searchsorted(cdf, qs, right=False)
-                distribution = (indices + 1).int().tolist()
+                distribution = _iteration_percentiles(decoder_metrics["distribution"])
             else:
                 distribution = raw_dist.numpy().tolist()
 
@@ -755,6 +804,19 @@ class MetricState:
                 "iteration distribution": distribution,
                 "iteration count": iteration_count,
             }
+            for _, suffix in _OPTIONAL_ITERATIONS:
+                if f"distribution_{suffix}" in decoder_metrics:
+                    hist = decoder_metrics[f"distribution_{suffix}"].cpu()
+                    optional_distribution = hist.tolist()
+                    if done and hist.sum().item():
+                        optional_distribution = _iteration_percentiles(hist)
+                    all_metrics_results[decoder_key].update(
+                        {
+                            f"average iteration {suffix}": float(decoder_metrics[f"average_iter_{suffix}"]),
+                            f"iteration distribution {suffix}": optional_distribution,
+                            f"iteration count {suffix}": hist.long().tolist(),
+                        }
+                    )
             # rebatch_opt (e.g. warmup batches) is reported before the timing fields.
             if decoder_metrics.get("rebatch_opt"):
                 all_metrics_results[decoder_key]["rebatch_opt"] = decoder_metrics[
@@ -905,6 +967,27 @@ class MetricState:
                 )
                 hist = [0] * len(hist)
             state.distribution[idx] = torch.tensor(hist, dtype=torch.float64)
+            for _, suffix in _OPTIONAL_ITERATIONS:
+                if f"iteration count {suffix}" in entry:
+                    hist = torch.tensor(
+                        entry[f"iteration count {suffix}"], dtype=torch.long, device=device
+                    )
+                    count = hist.sum().item()
+                    getattr(state, f"distribution_{suffix}")[idx] = hist
+                    getattr(state, f"average_iter_{suffix}")[idx] = (
+                        float(entry[f"average iteration {suffix}"]) * count
+                    )
+                    if count != sc:
+                        logger.warning(
+                            f"{key}: the saved {suffix} iteration histogram covers "
+                            f"{count:g} of {sc:g} samples; resumed {suffix} "
+                            "fields cover recorded/new samples only."
+                        )
+                elif entry.get("algorithm") in ("bp_sf", "bp_sf_lottery"):
+                    logger.warning(
+                        f"{key}: the SF checkpoint has no {suffix} iteration histogram; "
+                        f"resumed {suffix} fields cover recorded/new samples only."
+                    )
             state.average_time_sample_iter[idx] = (
                 float(entry["average time per iteration (s)"]) * sc
             )

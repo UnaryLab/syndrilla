@@ -50,6 +50,9 @@ class create(_Base):
         re-run BP, and on convergence flip those bits back in the estimate.
     """
 
+    _config_keys = ("sf", "topk", "w_min", "w_max", "n_sample")
+    _config_algorithm = "bp_sf"
+
     def __init__(self, decoding_cfg, **kwargs) -> None:
         super(create, self).__init__(decoding_cfg, **kwargs)
 
@@ -89,8 +92,8 @@ class create(_Base):
             )
             self.w_max = 0
         if self.topk <= 0 and self.w_max > 0:
-            logger.warning("SF enabled (w_max>0) but topk<=0; defaulting topk to 20.")
-            self.topk = 20
+            logger.warning("SF enabled (w_max>0) but topk<=0; defaulting topk to 50.")
+            self.topk = 50
 
         # padded CSC [N, max column degree]: the checks on each variable, padded with
         # the dummy check M; used to compute the syndrome shift of a candidate flip
@@ -128,16 +131,15 @@ class create(_Base):
         osc = self._osc[:, :-1]
         self._osc = self._prev_hard = None
 
-        if self.w_max > 0:
-            self._sf_postprocess(
-                syndrome,
-                llr0,
-                io_dict["e_v"],
-                io_dict["llr"],
-                io_dict["converge"],
-                io_dict["iter"],
-                osc,
-            )
+        io_dict["iter_serial"], io_dict["iter_parallel"] = self._sf_postprocess(
+            syndrome,
+            llr0,
+            io_dict["e_v"],
+            io_dict["llr"],
+            io_dict["converge"],
+            io_dict["iter"],
+            osc,
+        )
 
         logger.info("Complete.")
         return io_dict
@@ -152,80 +154,102 @@ class create(_Base):
         """Syndrome-flipping retry on the samples pass-1 BP left unconverged.
 
         For each unconverged sample, the ``topk`` most-oscillating bits are the flip
-        candidates. Weight-``w`` (``w_min..w_max``) combinations of those candidates are
-        tried in ascending weight: the candidate columns are XORed into the syndrome,
-        BP is re-run, and on convergence the candidate bits are flipped back in the
-        estimate. The lowest-indexed (== weight-then-sample ordered) converging trial
-        wins, matching the reference's first-break.
+        candidates, ordered by ascending oscillation count within the selected set.
+        Weight-``w`` (``w_min..w_max``) combinations are sampled separately per shot
+        in ascending weight. Candidate columns are XORed into the syndrome, BP is
+        re-run, and the winning candidate bits are flipped back in the estimate.
+        The returned estimate uses the converging trial with the fewest BP iterations,
+        breaking ties by lowest trial index. This models the reference's first-finishing
+        parallel trial with iteration count as a latency proxy.
 
         Fully vectorized: every ``(unconverged sample x candidate combo)`` trial is
         stacked into a single ``_bp_core`` call rather than looping combo-by-combo.
-        BP message passing is per-sample independent, so a trial's output is identical
-        whether run alone or inside the wide batch -- the result is bit-for-bit the same
-        as the loop, trading the early-exit for one parallel pass (larger peak memory:
+        BP message passing is per-sample independent, so each trial's output is identical
+        whether run alone or inside the wide batch (larger peak memory:
         ``U*C`` rows, where ``U`` = unconverged count, ``C`` = combo count).
         Results are written in place into ``e_out``/``l_out``/``converges``.
+        Returns independent clones of the main-pass ``num_iters`` for serial and
+        parallel counts. Main-pass successes, disabled SF, and calls with no
+        unconverged rows or no combinations retain those initial counts.
+        Serial counts separately model trials in sampled order until first convergence.
+        For ``C`` trials and a zero-based first converging index ``k``, rescued serial
+        counts are ``max_iter * (1 + k) + serial_winner_iters``; all-failed serial counts
+        are ``max_iter * (1 + C)``. Rescued parallel counts are
+        ``max_iter + parallel_winner_iters``; all-failed parallel counts are ``2 * max_iter``.
         """
+        iter_serial = num_iters.clone()
+        iter_parallel = num_iters.clone()
+        if self.w_max <= 0:
+            return iter_serial, iter_parallel
         unconv = torch.where(converges == 0)[0]
         U = unconv.numel()
         if U == 0:
-            return
+            return iter_serial, iter_parallel
 
         N = self.H_shape[1]
         topk = min(self.topk, N)
 
-        # per-sample candidate bit indices, highest oscillation first: [U, topk]
-        cand = torch.argsort(osc[unconv], dim=1, descending=True)[:, :topk]
+        # Top oscillating bits in ascending order; ties break by bit index: [U, topk].
+        cand = torch.argsort(osc[unconv], dim=1, stable=True)[:, -topk:]
 
         combos = [
-            torch.tensor(list(slots), dtype=torch.long, device=self.device)
+            torch.tensor(list(slots), dtype=torch.long, device="cpu")
+            for _ in range(U)
             for w in range(self.w_min, self.w_max + 1)
             for slots in sample_n_choose_k(range(topk), w, self.n_sample)
         ]
-        C = len(combos)
+        C = len(combos) // U
         if C == 0:
-            return
+            return iter_serial, iter_parallel
         # pad the ragged slot rows to a rectangle (sentinel column `topk`), then scatter
         # membership in one shot -- no per-element Python loop.
         padded = torch.nn.utils.rnn.pad_sequence(
             combos, batch_first=True, padding_value=topk
-        )  # [C, Lmax], missing slots point at the dummy column
-        combo_mask = torch.zeros([C, topk + 1], dtype=self.dtype, device=self.device)
+        ).to(self.device)  # [U*C, Lmax], missing slots point at the dummy column
+        combo_mask = torch.zeros([U * C, topk + 1], dtype=self.dtype, device=self.device)
         if padded.numel() > 0:
             combo_mask.scatter_(1, padded, 1.0)
-        combo_mask = combo_mask[:, :topk]  # drop the sentinel column
+        combo_mask = combo_mask.view(U, C, topk + 1)[:, :, :topk]  # drop the sentinel column
 
         # syndrome shift per (sample, combo) = parity of the selected columns: [U, C, M]
         M = self.H_shape[0]
         Hcols = torch.zeros([U, topk, M + 1], dtype=self.dtype, device=self.device)
         Hcols.scatter_(2, self.V_v_row[cand], 1.0)
         Hcols = Hcols[:, :, :M].permute(2, 0, 1)  # H[:, cand]: [M, U, topk]
-        shift = torch.einsum("muk,ck->ucm", Hcols, combo_mask).remainder(2.0)
+        shift = torch.einsum("muk,uck->ucm", Hcols, combo_mask).remainder(2.0)
         new_synd = (syndrome[unconv].unsqueeze(1) + shift).remainder(2.0)  # [U, C, M]
         M = new_synd.size(2)
 
         # one batched BP over all U*C trials
         llr_batch = llr0[unconv].unsqueeze(1).expand(U, C, N).reshape(U * C, N)
-        e_r, l_r, conv_r, _, _ = self._bp_core(new_synd.reshape(U * C, M), llr_batch)
+        e_r, l_r, conv_r, iter_r, _ = self._bp_core(new_synd.reshape(U * C, M), llr_batch)
         e_r = e_r.view(U, C, N)
         l_r = l_r.view(U, C, N)
         conv_r = conv_r.view(U, C)
+        iter_r = iter_r.reshape(U, C)
 
-        # pick the lowest-indexed converging combo per sample (first-break semantics)
+        # serial work stops at first convergence; parallel output uses fewest iterations.
         order = torch.arange(C, device=self.device)
-        sel = (conv_r.to(torch.long) * (C - order)).argmax(dim=1)  # [U]
+        serial_sel = (conv_r.to(torch.long) * (C - order)).argmax(dim=1)  # [U]
+        parallel_sel = iter_r.masked_fill(~conv_r.bool(), self.max_iter + 1).argmin(dim=1)
         has = conv_r.bool().any(dim=1)  # [U]
 
         u_idx = torch.arange(U, device=self.device)
-        chosen_e = e_r[u_idx, sel]  # [U, N]
-        chosen_l = l_r[u_idx, sel]  # [U, N] (never flipped, mirrors the loop)
+        chosen_e = e_r[u_idx, parallel_sel]  # [U, N]
+        chosen_l = l_r[u_idx, parallel_sel]  # [U, N] (never flipped)
 
         # flip the winning combo's candidate bits back in the estimate
         row_flip = torch.zeros([U, N], dtype=self.dtype, device=self.device)
-        row_flip.scatter_(1, cand, combo_mask[sel])
+        row_flip.scatter_(1, cand, combo_mask[u_idx, parallel_sel])
         chosen_e = torch.where(row_flip > 0, 1.0 - chosen_e, chosen_e)
 
         g = unconv[has]
         e_out[g] = chosen_e[has]
         l_out[g] = chosen_l[has]
         converges[g] = 1
+        # SF uses cap=None, so each failed main pass or retry consumes max_iter.
+        iter_serial[unconv] = self.max_iter * (1 + C)
+        iter_serial[g] = self.max_iter * (1 + serial_sel[has]) + iter_r[u_idx, serial_sel][has]
+        iter_parallel[unconv] = 2 * self.max_iter
+        iter_parallel[g] = self.max_iter + iter_r[u_idx, parallel_sel][has]
+        return iter_serial, iter_parallel

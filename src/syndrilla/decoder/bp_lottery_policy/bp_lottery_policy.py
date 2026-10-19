@@ -3,11 +3,18 @@ from loguru import logger
 
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum import create as _NmsPy
 from syndrilla.decoder.bp_lottery.bp_lottery import (
+    LOTTERY_CONFIG_KEYS,
     cn_row_mask,
+    reject_unknown_keys,
     flip_rows,
     rand_rows,
     vn_unsat_count,
 )
+
+
+def nonzero_candidates(mask, posterior):
+    nonzero = mask & (posterior[:, :-1] != 0)
+    return torch.where(nonzero.any(1, keepdim=True), nonzero, mask)
 
 
 class create(_NmsPy):
@@ -30,10 +37,22 @@ class create(_NmsPy):
         'local_reliable',
         'local_connectivity',
     }
+    _config_algorithm = "bp_lottery_policy"
+    _config_keys = ("sign_flip_policy",)
+    _base_config_keys = LOTTERY_CONFIG_KEYS
+
+    @classmethod
+    def _validate_config(cls, cfg):
+        reject_unknown_keys({"algorithm": cls._config_algorithm, **cfg}, cls._config_keys)
+        mode = cfg.get("flip_mode", "lottery")
+        if "pre" in (mode if isinstance(mode, list) else [mode]) or any(
+                key == "pre" or key.startswith("pre_") for key in cfg):
+            raise ValueError("PRE controls are not supported by bp_lottery_policy")
 
     def __init__(self,
                  decoding_cfg,
                  **kwargs) -> None:
+        self._validate_config(decoding_cfg)
         super().__init__(decoding_cfg, **kwargs)
 
         self.random_machine = decoding_cfg.get('random_machine', 'sobol')
@@ -101,6 +120,8 @@ class create(_NmsPy):
         synd_diff = (syndrome + s_est)%2.0
 
         temp_ls = vn_unsat_count(synd_diff.float(), self.V_c_col, self.H_shape[1])
+        allowed = nonzero_candidates(temp_ls > 0, l_v)
+        temp_ls = temp_ls.masked_fill(~allowed, 0)
 
         total_ones = temp_ls.sum(dim=1).to(self.dtype)
 
@@ -131,6 +152,8 @@ class create(_NmsPy):
         synd_diff = (syndrome + s_est)%2.0
 
         temp_ls = vn_unsat_count(synd_diff.float(), self.V_c_col, self.H_shape[1])
+        allowed = nonzero_candidates(temp_ls > 0, l_v)
+        temp_ls = temp_ls.masked_fill(~allowed, 0)
 
         total_ones = temp_ls.sum(dim=1).to(self.dtype)
 
@@ -158,6 +181,8 @@ class create(_NmsPy):
         synd_diff = (syndrome + s_est) % 2.0
 
         temp_ls = vn_unsat_count(synd_diff.float(), self.V_c_col, self.H_shape[1])
+        allowed = nonzero_candidates(temp_ls > 0, l_v)
+        temp_ls = temp_ls.masked_fill(~allowed, 0)
 
         total_ones = temp_ls.sum(dim=1).to(self.dtype)
         valid_mask = total_ones > 0
@@ -215,6 +240,7 @@ class create(_NmsPy):
         chosen_cn_idx = torch.argmax(chosen_cn_onehot, dim=1)  # [B]
 
         connected_vn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, self.H_shape[1])  # [B, N]
+        connected_vn_mask = nonzero_candidates(connected_vn_mask, l_v)
 
         num_connected_vns = connected_vn_mask.sum(dim=1) # [B]
 
@@ -264,6 +290,7 @@ class create(_NmsPy):
         chosen_cn_idx = torch.argmax(chosen_cn, dim=1)  # [B]
 
         cn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, self.H_shape[1])  # [B, N]
+        cn_mask = nonzero_candidates(cn_mask, l_v)
 
         llr = l_v[:, :-1]  # [B, N]
         masked_llr = llr + (~cn_mask).float() * 1e9
@@ -307,13 +334,13 @@ class create(_NmsPy):
 
         N = self.H_shape[1]
         candidate_vn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, N) # [B, N]
+        candidate_vn_mask = nonzero_candidates(candidate_vn_mask, l_v)
 
         vn_unsat_counts = vn_unsat_count(unsat_cn_mask.float(), self.V_c_col, N)
         abs_llr = torch.abs(l_v[:, :-1]) # [B, N]
-        score = vn_unsat_counts * 1e6 - abs_llr
-        masked_score = score + (~candidate_vn_mask).float() * -1e9
-
-        selected_vn = torch.argmax(masked_score, dim=1)
+        count = vn_unsat_counts.masked_fill(~candidate_vn_mask, -1)
+        tie = (count == count.max(dim=1, keepdim=True).values) & candidate_vn_mask
+        selected_vn = abs_llr.masked_fill(~tie, float("inf")).argmin(dim=1)
 
         flip_rows(l_v, selected_vn, self._active)
 
@@ -346,6 +373,7 @@ class create(_NmsPy):
 
         N = self.H_shape[1]
         candidate_vn_mask = cn_row_mask(self.V_c_col, chosen_cn_idx, N) # [B, N]
+        candidate_vn_mask = nonzero_candidates(candidate_vn_mask, l_v)
 
         vn_unsat_counts = vn_unsat_count(unsat_cn_mask.float(), self.V_c_col, N)
 

@@ -73,6 +73,8 @@ def test_cuda_run_to_end_matches_pytorch(algorithm, dtype, skip_converged, monke
 
     cfg, bundle, H, io = _case("cuda", dtype=dtype, skip_converged=skip_converged,
                              random_machine="sobol", rebatch_opt=True, host_check_every=1)
+    if algorithm == "bp_norm_min_sum":
+        cfg.pop("random_machine")
     outputs, histories, flips = [], [], []
     for suffix in ("", "_cuda"):
         module = import_module(f"syndrilla.decoder.{algorithm}.{algorithm}{suffix}")
