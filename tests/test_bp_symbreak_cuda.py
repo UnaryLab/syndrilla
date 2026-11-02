@@ -154,6 +154,7 @@ def test_factory_selects_kernel_and_force_pytorch(check_type):
     eager = create_decoder(cfg=dict(cfg, force_pytorch=True), bundle=bundle)[0]
     assert native.decoder.__class__.__module__.endswith('bp_symbreak_cuda')
     assert eager.decoder.__class__.__module__.endswith('bp_symbreak')
+    assert native.assign == eager.assign == 'syndrome'
     h = bundle.select(check_type)[3]
     io = dict(llr0=torch.full((2, h.shape[1]), 3.), synd=torch.zeros(2, 3, h.shape[0]))
     actual, expected = run(native, io), run(eager, io)
@@ -163,7 +164,7 @@ def test_factory_selects_kernel_and_force_pytorch(check_type):
 
 @GPU
 def test_cap_bypass_empty_batch_and_input_validation():
-    _, bundle, cfg = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=2)
+    _, bundle, cfg = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=2, assign='bp')
     native = CudaSymBreak(dict(cfg, device={'device_type': 'cuda'}), bundle=bundle)
     native.cap = SimpleNamespace(done=True, frac=.5)
     io = dict(llr0=torch.full((2, 2), 3.), synd=torch.tensor([[0, 0], [0, 1]]))
@@ -181,7 +182,7 @@ def test_cap_bypass_empty_batch_and_input_validation():
 
 
 @pytest.mark.parametrize('key,value', [('bp_iters', 0), ('k_max', True),
-    ('max_splits', -1), ('assign', 'bad'), ('dtype', 'float16'),
+    ('max_splits', -1), ('assign', 'bad'), ('split', 'bad'), ('dtype', 'float16'),
     ('check_type', 'bad'), ('early_termination', 1), ('max_iter', 0)])
 def test_shared_validation(key, value):
     _, bundle, cfg = tiny()
@@ -202,8 +203,8 @@ def test_fig6_kernel_split_graph_messages_and_incident_ids(assign):
     c, d = col.shape
     state = split_state(native, col, synd, incoming, reset, splits, splittable, posterior)
     cpu._split(0, col, synd, posterior, posterior <= 0, incoming, reset, splits, splittable)
-    native._ext.split(state, native.opposite_col, native.k_max, native.max_splits,
-                      assign == 'syndrome', True)
+    native._ext.split(state, native.opposite_col, native.bb_yellow, native.k_max,
+                      native.max_splits, assign == 'syndrome', False, True)
     for index, expected in [(0, col), (1, synd), (4, incoming), (5, reset), (17, splittable)]:
         assert torch.equal(state[index][0].cpu(), expected), index
     assert state[9].tolist() == splits.tolist()
@@ -228,7 +229,8 @@ def test_syndrome_kernel_partition_search_and_skip(neighbour, expected):
     state = split_state(native, col, synd, incoming, reset, splits, splittable, posterior)
     before = [value.clone() for value in state]
     changed = cpu._split(0, col, synd, posterior, posterior <= 0, incoming, reset, splits, splittable)
-    native._ext.split(state, native.opposite_col, native.k_max, native.max_splits, True, True)
+    native._ext.split(state, native.opposite_col, native.bb_yellow, native.k_max,
+                      native.max_splits, True, False, True)
     assert changed == (expected is not None)
     for index, value in [(0, col), (1, synd), (4, incoming), (5, reset), (17, splittable)]:
         assert torch.equal(state[index][0].cpu(), value), index
@@ -245,18 +247,78 @@ def test_syndrome_kernel_partition_search_and_skip(neighbour, expected):
 def test_kernel_both_children_cannot_split_again():
     from test_bp_symbreak import graph
     cpu, bundle, cfg = tiny(h=[[1] * 8], g=[[1, 1, 1, 1, 0, 0, 0, 0],
-                                          [1, 0, 0, 1, 1, 1, 0, 0]])
+                                          [1, 0, 0, 1, 1, 1, 0, 0]], assign='bp')
     native = CudaSymBreak(dict(cfg, device={'device_type': 'cuda'}), bundle=bundle)
     col, synd, incoming, reset, splits, splittable = graph(cpu)
     posterior = torch.tensor([1., 2., 3., 4., 10., 20., 30., 40., float('inf')], dtype=torch.float64)
     state = split_state(native, col, synd, incoming, reset, splits, splittable, posterior)
-    native._ext.split(state, native.opposite_col, native.k_max, native.max_splits, False, True)
+    native._ext.split(state, native.opposite_col, native.bb_yellow, native.k_max,
+                      native.max_splits, False, False, True)
     assert state[9].tolist() == [1] and not state[17].any()
     assert (state[0] != 8).any(2).sum() == 2 * native.H_shape[0]
     state[3][0] = torch.tensor([1., 100., 100., 1., 1., 1., 100., 100., float('inf')],
                                dtype=torch.float64, device='cuda')
     assert torch.isin(state[0][0], torch.tensor([0, 3, 4, 5], device='cuda')).sum(1).tolist() == [2, 2]
     before = [value.clone() for value in state]
-    native._ext.split(state, native.opposite_col, native.k_max, native.max_splits, False, True)
+    native._ext.split(state, native.opposite_col, native.bb_yellow, native.k_max,
+                      native.max_splits, False, False, True)
     for index in (0, 1, 4, 5, 6, 9, 17):
         assert torch.equal(state[index], before[index]), index
+
+
+@GPU
+@pytest.mark.parametrize('check_type', ['hx', 'hz'])
+@pytest.mark.parametrize('assign', ['bp', 'syndrome'])
+@pytest.mark.parametrize('dtype', ['float32', 'float64'])
+@pytest.mark.parametrize('early', [True, False])
+def test_bb_split_cpu_torch_cuda_parity(check_type, assign, dtype, early):
+    from test_bp_symbreak_bb import bb
+    cpu, bundle, cfg = bb(check_type, split='bb', assign=assign, dtype=dtype,
+        max_iter=12, bp_iters=1, max_splits=3, k_max=10, early_termination=early)
+    n, m = cpu.H_shape[1], cpu.H_shape[0]
+    synd = torch.zeros(8, m, dtype=cpu.dtype)
+    synd[1:, :7] = torch.eye(7, dtype=cpu.dtype)
+    io = dict(llr0=torch.full((8, n), 3., dtype=cpu.dtype), synd=synd)
+    expected = run(cpu, io)
+    assert expected['splits'].any()
+    gpu_cfg = dict(cfg, device={'device_type': 'cuda'})
+    for decoder in (TorchSymBreak, CudaSymBreak):
+        actual = run(decoder(gpu_cfg, bundle=bundle), io)
+        for key in ('e_v', 'converge', 'iter', 'splits', 'defer'):
+            assert torch.equal(actual[key].cpu(), expected[key]), key
+        tolerance = 1e-12 if dtype == 'float64' else 1e-5
+        torch.testing.assert_close(actual['llr'].cpu(), expected['llr'],
+                                   rtol=tolerance, atol=tolerance)
+
+
+@GPU
+@pytest.mark.parametrize('check_type', ['hx', 'hz'])
+@pytest.mark.parametrize('blocked', [(), ('yellow',), ('blue',), ('yellow', 'blue')])
+def test_bb_kernel_zero_neighbours_and_colored_graph(check_type, blocked):
+    from test_bp_symbreak import graph
+    from test_bp_symbreak_bb import bb
+    cpu, bundle, cfg = bb(check_type, split='bb', assign='syndrome')
+    native = CudaSymBreak(dict(cfg, device={'device_type': 'cuda'}), bundle=bundle)
+    col, synd, incoming, reset, splits, splittable = graph(cpu)
+    n, m = cpu.H_shape[1], cpu.H_shape[0]
+    overlap = torch.isin(cpu.V_c_col, cpu.opposite_col[0]).sum(1)
+    c = int(((overlap > 0) & (overlap % 2 == 0)).nonzero()[0])
+    parent = col[c].clone()
+    yellow, blue = parent[cpu.bb_yellow[parent]], parent[~cpu.bb_yellow[parent]]
+    synd.zero_()
+    synd[c] = 1
+    for offset, color in enumerate(blocked):
+        col[m + offset, 0] = (yellow if color == 'yellow' else blue)[0]
+        synd[m + offset] = 1
+    splits[0] = len(blocked)
+    posterior = torch.ones(n + 1, dtype=torch.float64)
+    posterior[n] = float('inf')
+    state = split_state(native, col, synd, incoming, reset, splits, splittable, posterior)
+    changed = cpu._split(0, col, synd, posterior, posterior <= 0,
+                         incoming, reset, splits, splittable)
+    native._ext.split(state, native.opposite_col, native.bb_yellow, native.k_max,
+                      native.max_splits, True, True, True)
+    assert changed == (len(blocked) < 2)
+    for index, expected in [(0, col), (1, synd), (4, incoming), (5, reset), (17, splittable)]:
+        assert torch.equal(state[index][0].cpu(), expected), index
+    assert state[9].tolist() == splits.tolist()

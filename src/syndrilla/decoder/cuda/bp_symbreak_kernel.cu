@@ -1,5 +1,5 @@
 // SymBreak study port: Yin et al., https://arxiv.org/abs/2412.02885,
-// Algorithm 1 and Sec. IV-C, V. The torch module defines the unspecified choices.
+// Algorithm 1 and Sec. IV-C, V, VI-B. The torch module defines the unspecified choices.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -125,9 +125,9 @@ __global__ void monitor_split(
     int64_t* col, T* syndrome, const T* lv, T* msg, bool* reset, int64_t* incident,
     const uint8_t* hard, bool* active, int64_t* splits, const int64_t* mismatch,
     int64_t* monitor, int64_t* previous, bool* keep, bool* splittable,
-    const int64_t* opposite, int64_t C, int64_t D, int64_t N, int64_t M,
+    const int64_t* opposite, const bool* yellow, int64_t C, int64_t D, int64_t N, int64_t M,
     int64_t VD, int64_t G, int64_t GD, int64_t B, int64_t kmax,
-    int64_t max_splits, bool guided, bool early) {
+    int64_t max_splits, bool guided, bool bb_split, bool early) {
     int64_t b = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (b >= B || !active[b]) return;
     int64_t d = mismatch[b], E = C * D, N1 = N + 1;
@@ -172,7 +172,24 @@ __global__ void monitor_split(
     int64_t k = chosen_overlap / 2, count_first = k % 2 ? k : k - 1;
     int64_t count_other = max(int64_t(0), chosen_degree / 2 - count_first);
     int s1 = 0;
-    if (guided) {
+    if (bb_split) {
+        bool yellow_zero = true, blue_zero = true;
+        for (int64_t j = 0; j < D; ++j) {
+            int64_t v = col[base + j];
+            bool retain = v != N && yellow[v];
+            keep[b * D + j] = retain;
+            if (v == N) continue;
+            if (guided) {
+                bool zero = zero_neighbours(v, col + b * E, syndrome + b * C, C, D, cbest);
+                if (retain) yellow_zero &= zero;
+                else blue_zero &= zero;
+            } else if (retain) s1 ^= hard[b * N1 + v];
+        }
+        if (guided) {
+            if (!yellow_zero && !blue_zero) return;
+            if (!yellow_zero) s1 = int(syndrome[b * C + cbest]);
+        }
+    } else if (guided) {
         int64_t allowed_overlap = 0, allowed_other = 0;
         for (int64_t j = 0; j < D; ++j) {
             int64_t v = col[base + j];
@@ -286,10 +303,15 @@ void step(State s, torch::Tensor original_col, double beta, double limit, int64_
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void split(State s, torch::Tensor opposite, int64_t kmax, int64_t max_splits, bool guided, bool early) {
+void split(State s, torch::Tensor opposite, torch::Tensor yellow, int64_t kmax,
+           int64_t max_splits, bool guided, bool bb_split, bool early) {
     check_state(s);
     TORCH_CHECK(opposite.is_cuda() && opposite.is_contiguous() && opposite.scalar_type() == at::kLong,
                 "opposite columns must be contiguous CUDA int64");
+    TORCH_CHECK(yellow.is_cuda() && yellow.is_contiguous() && yellow.scalar_type() == at::kBool &&
+                yellow.device() == s[LV].device(), "split colors must be contiguous CUDA bool on the state device");
+    TORCH_CHECK(!bb_split || (yellow.dim() == 1 && yellow.numel() == s[LV].size(1) - 1),
+                "split: bb needs one color per qubit");
     int64_t B = s[COL].size(0);
     if (!B) return;
     c10::cuda::CUDAGuard guard(s[LV].device());
@@ -300,9 +322,10 @@ void split(State s, torch::Tensor opposite, int64_t kmax, int64_t max_splits, bo
             s[HARD].data_ptr<uint8_t>(), s[ACTIVE].data_ptr<bool>(), s[SPLITS].data_ptr<int64_t>(),
             s[DIFF].data_ptr<int64_t>(), s[MONITOR].data_ptr<int64_t>(), s[PREVIOUS].data_ptr<int64_t>(),
             s[KEEP].data_ptr<bool>(), s[SPLITTABLE].data_ptr<bool>(), opposite.data_ptr<int64_t>(),
+            yellow.data_ptr<bool>(),
             s[COL].size(1), s[COL].size(2),
             s[LV].size(1) - 1, s[ORIGINAL].size(1), s[VN].size(2),
-            opposite.size(0), opposite.size(1), B, kmax, max_splits, guided, early);
+            opposite.size(0), opposite.size(1), B, kmax, max_splits, guided, bb_split, early);
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

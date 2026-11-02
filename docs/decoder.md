@@ -683,10 +683,11 @@ With early termination on, the first converging trial wins and its siblings stop
 
 ### 3.19. bp_symbreak
 
-This study decoder implements Algorithm 1 and the generic split in Sec. IV-C of
+This study decoder implements Algorithm 1, the generic split in Sec. IV-C and
+the BB-specific split in Sec. VI-B of
 [SymBreak, Yin et al.](https://arxiv.org/abs/2412.02885). It uses normalized min-sum
 BP and the same global normalization schedule as `bp_norm_min_sum`. The paper
-does not fix this BP variant. It does not use the BB-specific split in Sec. VI.
+does not fix this BP variant.
 Example: [bp_symbreak_hx.decoding.yaml](../examples/alist/bp_symbreak_hx.decoding.yaml).
 
 | Key under `decoding.config` | Meaning | Default |
@@ -694,7 +695,24 @@ Example: [bp_symbreak_hx.decoding.yaml](../examples/alist/bp_symbreak_hx.decodin
 | `bp_iters` | Positive number of BP updates between split attempts | `10` |
 | `k_max` | Positive stagnation monitor limit | `3` |
 | `max_splits` | Nonnegative per-shot split limit | `10` |
-| `assign` | Syndrome assignment: `bp` or `syndrome` | `bp` |
+| `assign` | Syndrome assignment: `bp` or `syndrome` | `syndrome` |
+| `split` | Split rule: `generic` (Sec. IV-C) or `bb` (Sec. VI-B) | `generic` |
+
+`split: bb` uses a fixed two-layer qubit coloring that the decoder derives from
+both check matrices. Each check has half of its qubits in each layer. Each
+check and opposite check that share qubits have an odd number of shared qubits
+in each layer, so each split child breaks the degeneracy. On BB codes this
+coloring is the column block split of Hx = [A|B]. The choice of the opposite
+check and of the check to split does not change. The split keeps the qubits of
+one layer in the parent check and moves the other layer to the new check. With
+`assign: bp`, the kept side gets the parity of its hard decisions. With
+`assign: syndrome`, a side qualifies for zero when all its other adjacent checks
+in the current split graph have zero syndrome. If both sides qualify, the kept
+side gets zero. If neither side qualifies, the split is skipped. A matrix pair
+that has no valid coloring, for example a code with odd-degree checks, raises
+`ValueError` when the decoder is built. The CUDA kernels use the same coloring
+and split rules and match the torch decoder.
+Example: [bp_symbreak_bb_hx.decoding.yaml](../examples/alist/bp_symbreak_bb_hx.decoding.yaml).
 
 `max_iter` is the total BP budget, including all split stages. A partial final
 block uses the remaining budget. Convergence is checked against the original

@@ -1,4 +1,4 @@
-"""SymBreak, Yin et al., arXiv:2412.02885, Algorithm 1, Sec. IV-C and V.
+"""SymBreak, Yin et al., arXiv:2412.02885, Algorithm 1, Sec. IV-C, V and VI-B.
 
 Source: https://arxiv.org/abs/2412.02885. This is a study implementation.
 Implementation contract, including deterministic choices not fixed by the paper:
@@ -12,13 +12,20 @@ Implementation contract, including deterministic choices not fixed by the paper:
   the split without substituting another opposite check.
 * Message reset: moved edges send their channel LLR on the next iteration;
   all other edge messages persist. Splits and their syndromes are shot-local.
-* Syndrome-guided mode searches balanced qubit partitions in lexicographic
+* Generic syndrome-guided mode searches balanced qubit partitions in lexicographic
   qubit-id order, with floor(size / 2) on the first side for odd rows. Its
   overlap is k for odd k, or k - 1 or k + 1 for even k, out of 2k qubits.
   The first side must have only zero-syndrome adjacent checks other than the
   parent; no adjacent checks also qualifies. Assign it zero and the other
   side the parent's syndrome. The paper gives no rule when no partition
   qualifies; this implementation skips that split without another selection.
+* split=bb uses the fixed two-layer coloring from both BB matrices. Yellow
+  qubits stay in the parent row; blue qubits move to the new row. Check selection
+  is unchanged. With assign=bp, the yellow syndrome is its hard-decision parity.
+  With assign=syndrome, a side qualifies for zero when all its other adjacent
+  checks in the current split graph have zero syndrome. If both qualify, yellow
+  gets zero; if neither qualifies, skip the split. Empty neighbour sets qualify.
+  The paper does not fix these tie, neighbour and skip choices.
 * The first BP block establishes the previous mismatch count. K is updated at
   later block boundaries. Convergence and cap checks use the original matrix
   only at block ends. The finite-budget convention also checks a final partial
@@ -31,7 +38,7 @@ Implementation contract, including deterministic choices not fixed by the paper:
 
 Remaining deviations from the paper are the NMS variant and beta schedule,
 the finite BP and split budgets, the optional cap and full-budget controls,
-and finite-message clipping. The BB-specific split from Sec. VI is not used.
+and finite-message clipping. The defaults are split=generic and assign=syndrome.
 
 Optimization groups and explicit member overrides use the shared NMS rules.
 Active-row compaction, BP buffer reuse and per-shot incident-edge gathering are
@@ -52,7 +59,7 @@ from syndrilla.decoder.knobs import reject_unknown_keys
 
 
 class create(Nms):
-    _config_keys = ("bp_iters", "k_max", "max_splits", "assign")
+    _config_keys = ("bp_iters", "k_max", "max_splits", "assign", "split")
     _config_algorithm = "bp_symbreak"
 
     def __init__(self, decoding_cfg, **kwargs):
@@ -66,9 +73,12 @@ class create(Nms):
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{key} must be an integer >= {minimum}")
             setattr(self, key, value)
-        self.assign = decoding_cfg.get("assign", "bp")
+        self.assign = decoding_cfg.get("assign", "syndrome")
         if self.assign not in ("bp", "syndrome"):
             raise ValueError("assign must be bp or syndrome")
+        self.split_mode = decoding_cfg.get("split", "generic")
+        if self.split_mode not in ("generic", "bb"):
+            raise ValueError("split must be generic or bb")
         if decoding_cfg.get("dtype", "float64") not in ("float32", "float64"):
             raise ValueError("dtype must be float32 or float64")
         if decoding_cfg.get("check_type", "hx") not in ("hx", "hz"):
@@ -77,6 +87,16 @@ class create(Nms):
         self.algo = "bp_symbreak"
         other = "hz" if self.check_type == "hx" else "hx"
         self.register_buffer("opposite_col", kwargs["bundle"].select(other)[2].to(self.device))
+        yellow = torch.empty(0, dtype=torch.bool, device=self.device)
+        if self.split_mode == "bb":
+            from syndrilla.decoder.bp_symbreak.bb_layers import bb_layers
+            bundle = kwargs["bundle"]
+            try:
+                yellow = bb_layers(bundle.select("hx")[2], bundle.select("hz")[2],
+                                   self.H_shape[1]).to(self.device)
+            except ValueError as exc:
+                raise ValueError(f"split: bb requires BB matrices: {exc}") from exc
+        self.register_buffer("bb_yellow", yellow)
         # Masking is per shot because check edges can move to different rows.
         self.dummy_idx = self.dummy_idx[:0]
 
@@ -115,7 +135,23 @@ class create(Nms):
             slots = slots[torch.argsort(qubits[slots], stable=True)]
             return slots[torch.argsort(reliability[qubits[slots]], descending=True, stable=True)]
         k = int(count[c]) // 2
-        if self.assign == "syndrome":
+        if self.split_mode == "bb":
+            slots = (qubits != n).nonzero().flatten()
+            yellow = self.bb_yellow[qubits[slots]]
+            first = slots[yellow]
+            if self.assign == "syndrome":
+                for zero_side, side in enumerate((first, slots[~yellow])):
+                    neighbours = (col.unsqueeze(2) == qubits[side]).any(2).any(1)
+                    neighbours[c] = False
+                    if not syndrome[neighbours].any():
+                        s1 = (syndrome[c].to(torch.uint8) if zero_side else
+                              syndrome.new_zeros((), dtype=torch.uint8))
+                        break
+                else:
+                    return False
+            else:
+                s1 = hard[qubits[first]].to(torch.uint8).sum().remainder(2)
+        elif self.assign == "syndrome":
             slots = (qubits != n).nonzero().flatten()
             slots = slots[torch.argsort(qubits[slots], stable=True)]
             allowed_overlap = (k,) if k % 2 else (k - 1, k + 1)

@@ -115,8 +115,9 @@ class create(TorchSymBreak):
                         cap_stopped = bool(state[8].any() and self.i < self.max_iter)
                         break
                 if self.i % self.bp_iters == 0 and self.i != self.max_iter:
-                    self._ext.split(state, self.opposite_col, self.k_max,
-                                    self.max_splits, self.assign == 'syndrome', self.early_termination)
+                    self._ext.split(state, self.opposite_col, self.bb_yellow, self.k_max,
+                                    self.max_splits, self.assign == 'syndrome',
+                                    self.split_mode == 'bb', self.early_termination)
                 if self.early_termination and not state[8].any():
                     break
             save_outputs()

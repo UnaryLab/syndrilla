@@ -22,7 +22,7 @@ def one_thread():
 def test_all_groups_off_preserve_outputs_and_member_overrides(device, bp_iters):
     if device == 'cuda' and not torch.cuda.is_available():
         pytest.skip('CUDA unavailable')
-    _, bundle, cfg = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=bp_iters, k_max=3)
+    _, bundle, cfg = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=bp_iters, k_max=3, assign='bp')
     cfg['device'] = {'device_type': device}
     cls = CudaSymBreak if device == 'cuda' else TorchSymBreak
     default = cls(cfg, bundle=bundle)
@@ -43,7 +43,7 @@ def test_all_groups_off_preserve_outputs_and_member_overrides(device, bp_iters):
 
 
 def test_torch_compaction_and_buffer_allocation_paths():
-    _, bundle, cfg = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=2, k_max=3)
+    _, bundle, cfg = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=2, k_max=3, assign='bp')
     io = dict(llr0=torch.full((12, 2), 3.), synd=torch.tensor([[0, 0]] * 10 + [[0, 1]] * 2))
     for reuse in [True, False]:
         dec = TorchSymBreak(dict(cfg, reuse_buffers=reuse), bundle=bundle)
@@ -76,7 +76,7 @@ def test_all_groups_off_real_surface(device):
     from syndrilla.utils import parse_device_dtype, read_yaml
     root = Path(__file__).resolve().parents[1]
     cfg = dict(device={'device_type': device}, dtype='float64', check_type='hx',
-               max_iter=100, rebatch_opt=False, compile=False)
+               max_iter=100, rebatch_opt=False, compile=False, assign='bp')
     bundle = load_matrices(read_yaml(str(root / 'examples/alist/surface_10.matrix.yaml'))['matrix'],
                            *parse_device_dtype(cfg))
     h = bundle.select('hx')[3].to_dense().cpu().double()

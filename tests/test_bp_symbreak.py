@@ -54,7 +54,7 @@ def graph(dec):
 
 
 def test_fig6_bp_split_and_moved_edge_reset():
-    dec, _, _ = tiny(g=[[1, 0, 1, 1, 0, 1]])
+    dec, _, _ = tiny(g=[[1, 0, 1, 1, 0, 1]], assign='bp')
     col, synd, incoming, reset, splits, splittable = graph(dec)
     posterior = torch.tensor([10., -60., -15., 5., 50., -20., float('inf')])
     old = incoming.clone()
@@ -80,6 +80,12 @@ def test_syndrome_guided_excludes_parent_and_uses_neighbour_checks():
     assert dec._split(0, col, synd, posterior, posterior <= 0, incoming, reset, splits, splittable)
     assert col[0][col[0] < 6].tolist() == [0, 1, 2]
     assert synd[:2].tolist() == [0, 1]  # The empty set of neighbour checks is valid.
+
+
+def test_assign_defaults_to_syndrome():
+    dec, _, settings = tiny()
+    assert 'assign' not in settings
+    assert dec.assign == 'syndrome'
 
 
 @pytest.mark.parametrize('neighbour,expected', [
@@ -123,7 +129,7 @@ def test_syndrome_partition_balances_degree_and_overlap(degree, overlap, expecte
 
 def test_both_children_cannot_split_again_with_another_opposite_check():
     dec, _, _ = tiny(h=[[1] * 8], g=[[1, 1, 1, 1, 0, 0, 0, 0],
-                                     [1, 0, 0, 1, 1, 1, 0, 0]])
+                                     [1, 0, 0, 1, 1, 1, 0, 0]], assign='bp')
     col, synd, incoming, reset, splits, splittable = graph(dec)
     posterior = torch.tensor([1., 2., 3., 4., 10., 20., 30., 40., float('inf')])
     assert dec._split(0, col, synd, posterior, posterior <= 0, incoming, reset, splits, splittable)
@@ -249,7 +255,7 @@ def test_partial_final_block_checks_final_state():
 
 
 def test_unary_splits_are_finite_and_shot_local():
-    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=1, k_max=3)
+    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=1, k_max=3, assign='bp')
     llr = torch.full((2, 2), 3.)
     synd = torch.tensor([[0, 0], [0, 1]])
     original = {'llr0': llr.clone(), 'synd': synd.clone()}
@@ -290,7 +296,7 @@ def test_cpu_fixed_smoke(name):
     llr = torch.full_like(errors, math.log((1 - p) / p))
     with torch.no_grad():
         plain = Nms(settings, bundle=bundle)(dict(llr0=llr, synd=synd))
-        split = SymBreak(settings, bundle=bundle)(dict(llr0=llr, synd=synd))
+        split = SymBreak(dict(settings, assign='bp'), bundle=bundle)(dict(llr0=llr, synd=synd))
     counts = {key: int((value['converge'] == 0).sum())
               for key, value in [('nms_never', plain), ('symbreak_never', split)]}
     print(f'{name} p={p} seed=0 shots=512 max_iter=100 {counts} splits={int(split["splits"].sum())}')
@@ -320,7 +326,7 @@ def test_d_monitor_decrements_when_mismatch_decreases():
 
 
 def test_moved_edges_use_channel_on_next_bp_iteration():
-    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=1, k_max=3)
+    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=1, k_max=3, assign='bp')
     original = dec.cn_update
     reset_edges = []
     native_split = dec._split
@@ -340,7 +346,7 @@ def test_moved_edges_use_channel_on_next_bp_iteration():
 
 
 def test_stable_equal_reliability_choice_and_split_budget():
-    dec, _, _ = tiny(bp_iters=1, max_splits=1)
+    dec, _, _ = tiny(bp_iters=1, max_splits=1, assign='bp')
     col, synd, incoming, reset, splits, splittable = graph(dec)
     posterior = torch.tensor([2., 2., 2., 2., 2., 2., float('inf')])
     dec._split(0, col, synd, posterior, posterior <= 0, incoming, reset, splits, splittable)
@@ -350,7 +356,7 @@ def test_stable_equal_reliability_choice_and_split_budget():
 
 
 def test_adaptive_cap_and_bypass():
-    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=2)
+    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], bp_iters=2, assign='bp')
     dec.cap = SimpleNamespace(done=True, frac=.5)
     io = dict(llr0=torch.full((2, 2), 3.), synd=torch.tensor([[0, 0], [0, 1]]))
     out = dec(dict(io))
@@ -380,7 +386,7 @@ def test_factory_rounds_split_output_shape():
 
 
 def test_equal_check_reliability_selects_lowest_row():
-    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]])
+    dec, _, _ = tiny(h=[[1, 1], [1, 1]], g=[[1, 1]], assign='bp')
     col, synd, incoming, reset, splits, splittable = graph(dec)
     old = col[1].clone()
     posterior = torch.tensor([2., 2., float('inf')])

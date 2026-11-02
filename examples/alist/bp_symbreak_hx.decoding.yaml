@@ -10,4 +10,3 @@ decoding:
     bp_iters: 10
     k_max: 3
     max_splits: 10
-    assign: bp
