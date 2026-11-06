@@ -39,7 +39,7 @@ def bundle(H):
 def decoder(**extra):
     H = torch.tensor([[1, 1, 0, 0], [0, 1, 1, 1], [0, 0, 1, 0]])
     cfg = dict(device={"device_type": "cpu"}, dtype="float64", max_iter=8,
-               compile=False, rebatch_opt=False)
+               compile=False, rebatch_opt=False, vn_pick="max_unsat", vn_pick_tie_break=True)
     cfg.update(extra)
     dec = lottery.create(cfg, bundle=bundle(H))
     dec.i, dec._B, dec.batch_size = 1, 3, 3
@@ -50,6 +50,64 @@ def decoder(**extra):
     llr = torch.tensor([[0.5, -2, 1, 4, float("inf")]], dtype=dec.dtype).repeat(3, 1)
     syndrome = torch.tensor([[1, 1, 1], [1, 1, 1], [0, 0, 0]], dtype=dec.dtype)
     return dec, llr, syndrome
+
+
+@pytest.mark.parametrize("algorithm", ["bp_lottery", "bp_lottery_quant", "bp_lottery_layered",
+                                      "bp_lottery_pre", "bp_sf_lottery"])
+def test_default_vn_pick_is_min_llr_without_tie_break(algorithm, seeded_inputs):
+    module = import_module(f"syndrilla.decoder.{algorithm}.{algorithm}")
+    dec = module.create(seeded_inputs["cfg"], bundle=bundle(seeded_inputs["H"]))
+    assert dec.cn_pick == "rand_unsat"
+    assert dec.vn_pick == "min_llr" and dec.vn_pick_tie_break is False
+
+
+@pytest.mark.parametrize("mode,expected", [("rand_unsat", 1), ("all_unsat", 1), ("all", 3)])
+def test_min_llr_prefers_smallest_nonzero_candidate(mode, expected):
+    dec, llr, syndrome = decoder(cn_pick=mode, vn_pick="min_llr", vn_pick_tie_break=False)
+    dec._draw_r = lambda n: torch.zeros(n, dtype=dec.dtype)
+    llr[:, :-1] = llr.new_tensor([0., -2., 3., .25])
+    syndrome[:2, 1:] = 0
+    before = llr.clone()
+    dec.sign_flip_cn_rand_new(syndrome, torch.zeros_like(syndrome), llr)
+    assert dec.last_flip_vn[0] == expected
+    assert_negation(dec, before, llr, expected)
+
+
+@pytest.mark.parametrize("flag,expected", [(False, 0), (True, 1)])
+def test_min_llr_ties_use_unsatisfied_count_only_when_enabled(flag, expected):
+    dec, llr, syndrome = decoder(cn_pick="all", vn_pick="min_llr", vn_pick_tie_break=flag)
+    llr[:, :-1] = llr.new_tensor([-.5, .5, -.5, 4.])
+    before = llr.clone()
+    dec.sign_flip_cn_rand_new(syndrome, torch.zeros_like(syndrome), llr)
+    assert dec.last_flip_vn[0] == expected
+    assert_negation(dec, before, llr, expected)
+
+
+def test_min_llr_phase_list_and_sobol_stream(seeded_inputs):
+    choices = ["min_llr", "max_unsat", "min_llr"]
+    cfg = {**seeded_inputs["cfg"], "flip_phase_iters": [2, 4], "vn_pick": choices}
+    dec = lottery.create(cfg, bundle=bundle(seeded_inputs["H"]))
+    for iteration, pick in ((1, "min_llr"), (3, "max_unsat"), (5, "min_llr")):
+        lottery.set_phase(dec, iteration)
+        assert dec.vn_pick == pick
+    with torch.no_grad():
+        dec({key: seeded_inputs[key].clone() for key in ("synd", "llr0")})
+    assert not hasattr(dec, "r_v")
+    assert choices == ["min_llr", "max_unsat", "min_llr"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_default_min_llr_cuda_matches_torch(seeded_inputs):
+    cfg = {**seeded_inputs["cfg"], "device": {"device_type": "cuda"}}
+    outputs = []
+    for module in (lottery, lottery_cuda):
+        dec = module.create(cfg, bundle=bundle(seeded_inputs["H"]))
+        assert dec.vn_pick == "min_llr" and dec.vn_pick_tie_break is False
+        with torch.no_grad():
+            outputs.append(dec({key: seeded_inputs[key].clone() for key in ("synd", "llr0")}))
+        assert not hasattr(dec, "r_v")
+    for key in ("e_v", "converge", "iter"):
+        assert torch.equal(outputs[0][key], outputs[1][key]), key
 
 
 def assert_negation(dec, before, after, variable):
@@ -228,7 +286,8 @@ def test_vn_pick(value, vn):
 def test_max_unsat_exact_llr_tie_break(module, count, small, large, smaller_index):
     H = torch.ones(count, 2, dtype=torch.long)
     dec = module.create(dict(device={"device_type": "cpu"}, dtype="float32",
-                             max_iter=2, compile=False, rebatch_opt=False), bundle=bundle(H))
+                             max_iter=2, compile=False, rebatch_opt=False,
+                             vn_pick="max_unsat", vn_pick_tie_break=True), bundle=bundle(H))
     dec.i, dec._B, dec._hook_rows = 1, 1, None
     dec._active = torch.tensor([True])
     dec.r = torch.zeros(2, 1)
@@ -267,8 +326,8 @@ def test_invalid_vn_pick_tie_break(module, value):
         module.create({"vn_pick_tie_break": value})
 
 
-@pytest.mark.parametrize("pick", ["max_unsat", "random"])
-def test_zero_filter_backend_parity_and_empty_pool(pick):
+@pytest.mark.parametrize("pick,expected_pick", [("min_llr", 0), ("max_unsat", 1), ("random", 1)])
+def test_zero_filter_backend_parity_and_empty_pool(pick, expected_pick):
     H = torch.tensor([[1, 1, 0], [0, 1, 1]])
     outputs = []
     for backend in ("cpu", "pytorch", "cuda"):
@@ -284,7 +343,7 @@ def test_zero_filter_backend_parity_and_empty_pool(pick):
         syndrome = ((hard[:, :-1] @ H.to(dec.device, dec.dtype).T) + 1) % 2
         dec._iter_hook(1, llr, hard, torch.ones(3, device=dec.device, dtype=torch.bool), syndrome)
         assert dec.last_flip_cn.tolist() == [0, 0, 0]
-        assert dec.last_flip_vn.tolist() == [1, 1, 0]
+        assert dec.last_flip_vn.tolist() == [expected_pick, expected_pick, 0]
         assert dec.last_flip_valid.tolist() == [True, True, True]
         expected = llr.new_tensor([[0., 0., 2., float("inf")], [0., 0., 0., float("inf")],
                                    [-2., 0., 0., float("inf")]])
@@ -351,7 +410,7 @@ def test_global_max_unsat_matches_global_optimal(compact_frac):
            "compile": False, "rebatch_opt": False, "max_iter": 20, "early_termination": True,
            "compact_frac": compact_frac, "force_pytorch": True,
            "cn_pick": "all_unsat",
-           "vn_pick": "max_unsat"}
+           "vn_pick": "max_unsat", "vn_pick_tie_break": True}
     matrices = load_matrices(read_yaml("examples/alist/surface_10.matrix.yaml")["matrix"],
                              *parse_device_dtype(cfg))
     H = matrices.select("hx")[3].to_dense().double()

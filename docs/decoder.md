@@ -188,8 +188,8 @@ A single flip at iteration `t` uses `flip_phase_iters: [t-1, t]` and `flip_mode:
 |--------------------------------------|--------------------------------------------------------------------------|--------------|
 | `decoding.config.cn_pick`            | Candidate set: `rand_unsat`, `max_err_unsat`, `all_unsat` or `all`       | `rand_unsat` |
 | `decoding.config.cn_pick_tie_break`  | Breaks `max_err_unsat` ties with the sampler draw; must be a bool        | `true`       |
-| `decoding.config.vn_pick`            | Variable pick in the candidate set: `max_unsat` or `random` | `max_unsat`  |
-| `decoding.config.vn_pick_tie_break`  | Enables the second sort key of `vn_pick`; must be a bool                 | `true`       |
+| `decoding.config.vn_pick`            | Variable pick in the candidate set: `min_llr`, `max_unsat` or `random`   | `min_llr`    |
+| `decoding.config.vn_pick_tie_break`  | Enables the second sort key of `vn_pick`; must be a bool                 | `false`      |
 
 The `cn_pick` values:
 - `rand_unsat` uses the sampler draw to select one unsatisfied check uniformly. The candidates are the variables on that check.
@@ -200,6 +200,7 @@ The `cn_pick` values:
 `cn_pick_tie_break` has an effect only with `max_err_unsat`.
 
 The `vn_pick` values:
+- `min_llr` selects the candidate with the smallest `|LLR|`. With `vn_pick_tie_break: true`, ties go to the most unsatisfied checks, then to the lowest index. With `false`, ties go to the lowest index.
 - `max_unsat` selects the candidate with the most unsatisfied checks. With `vn_pick_tie_break: true`, ties go to the smallest `|LLR|`, then to the lowest index. With `false`, ties go to the lowest index.
 - `random` selects one candidate uniformly. It ignores `vn_pick_tie_break`. With `sobol`, it uses a second Sobol stream, so the check draws stay the same as with the other `vn_pick` values. With `system`, it draws one more value per row from the global RNG.
 
@@ -208,7 +209,9 @@ Zero posterior candidates are skipped when a nonzero candidate exists in the poo
 
 A flip sets the picked variable's posterior to `-LLR`. Invalid pick values or a tie-break key that is not a bool raise `ValueError`.
 
-The default setting (`rand_unsat`, `max_unsat`, both tie-breaks `true`) picks an unsatisfied check from the sampler draw, then on that check the variable with the most unsatisfied checks, with ties broken by the smallest `|LLR|`, and negates its posterior. Every lottery path accepts these keys with the same meaning: the PyTorch module, the CUDA module, `bp_lottery_quant` (Section 3.5), `bp_sf_lottery` (Section 3.14) and `bp_lottery_layered` (Section 3.17).
+`vn_pick_tie_break` sets the second sort key for `min_llr` and `max_unsat`. The pick applies after the zero-posterior skip above, so `min_llr` selects the smallest nonzero `|LLR|` when the pool has one.
+
+The default setting (`rand_unsat`, `min_llr`, `cn_pick_tie_break: true`, `vn_pick_tie_break: false`) picks an unsatisfied check from the sampler draw, then on that check the variable with the smallest `|LLR|`, with ties to the lowest index, and negates its posterior. Every lottery path accepts these keys with the same meaning: the PyTorch module, the CUDA module, `bp_lottery_quant` (Section 3.5), `bp_sf_lottery` (Section 3.14), `bp_lottery_layered` (Section 3.17) and `bp_lottery_pre` (Section 3.18).
 
 **Phase controls.** `bp_lottery` supports phase controls in its PyTorch and CUDA paths.
 
@@ -236,7 +239,7 @@ With `max_iter <= 40`, the default PRE phase is empty. It performs no initial ch
 
 These two keys require a `pre` phase. Ranking and the first single-bit check occur at the phase boundary, before the first PRE update. A phase at the start of the decode begins at its first check. Each later window reranks and skips tried nodes. Only complete windows within the main budget run; a phase with no full window still performs its initial single-bit check. After its candidate budget, ordinary lottery continues. Quantized and layered lottery inherit the PRE phase. The separate policy decoder uses its own pick rules and does not support this phase.
 
-**CPU and GPU results.** On one device the PyTorch module and the CUDA kernels give the same shots. Between CPU and GPU the aggregate rates agree, but individual shots can differ. The cause is floating-point summation order, which differs between CPU and GPU. With the default knobs, the sign-flip picks one variable by the largest number of unsatisfied checks, with ties broken by the smallest `|LLR|`, and such ties are frequent. A difference in the last bit of an LLR can therefore pick a different variable, and that shot's trajectory diverges from there. It holds at every `dtype`. `bp_norm_min_sum` makes no such pick and gives the same shots on CPU and GPU; `bp_sf` can differ (Section 3.13).
+**CPU and GPU results.** On one device the PyTorch module and the CUDA kernels give the same shots. Between CPU and GPU the aggregate rates agree, but individual shots can differ. The cause is floating-point summation order, which differs between CPU and GPU. With the default knobs, the sign-flip picks the candidate with the smallest `|LLR|`. A difference in the last bit of an LLR can therefore pick a different variable, and that shot's trajectory diverges from there. It holds at every `dtype`. `bp_norm_min_sum` makes no such pick and gives the same shots on CPU and GPU; `bp_sf` can differ (Section 3.13).
 
 ### 3.5. bp_lottery_quant
 Lottery BP with fixed-point quantized messages. Example configuration (`lottery_bp_quant_hx.decoding.yaml`):

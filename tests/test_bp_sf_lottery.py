@@ -27,10 +27,11 @@ def _surface10(backend, algorithm="bp_sf_lottery", **extra):
         compile=False,
         random_machine="sobol",
         flip_phase_iters=[2], flip_mode=["off", "lottery"],
+        vn_pick="max_unsat", vn_pick_tie_break=True,
     )
     cfg.update(extra)
     if algorithm == "bp_sf":
-        for key in ("random_machine", "flip_phase_iters", "flip_mode"):
+        for key in ("random_machine", "flip_phase_iters", "flip_mode", "vn_pick", "vn_pick_tie_break"):
             cfg.pop(key, None)
     matrix_cfg = read_yaml("examples/alist/surface_10.matrix.yaml")["matrix"]
     bundle = load_matrices(matrix_cfg, *parse_device_dtype(cfg))

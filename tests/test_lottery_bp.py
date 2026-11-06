@@ -26,10 +26,12 @@ def _surface10_system_outputs(mod, extra=None, batches=((0, 16, 0.03), (1, 16, 0
         compile=False,
         random_machine="system",
         flip_mode="lottery",
+        vn_pick="max_unsat",
+        vn_pick_tie_break=True,
     )
     cfg.update(extra or {})
     if not mod.create._config_algorithm.startswith("bp_lottery"):
-        for key in ("random_machine", "flip_phase_iters", "flip_mode"):
+        for key in ("random_machine", "flip_phase_iters", "flip_mode", "vn_pick", "vn_pick_tie_break"):
             cfg.pop(key, None)
     mcfg = read_yaml("examples/alist/surface_10.matrix.yaml")["matrix"]
     bundle = load_matrices(mcfg, *parse_device_dtype(cfg))

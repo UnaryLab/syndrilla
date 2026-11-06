@@ -78,7 +78,8 @@ def test_layered_lottery_converges_at_least_layered(surface):
     counts = {}
     for name, cls in (("layered_lottery", lottery_cuda.create),
                       ("layered", layered_cuda.create)):
-        settings = plain_layered_config(cfg()) if name == "layered" else cfg()
+        settings = (plain_layered_config(cfg()) if name == "layered" else
+                    cfg(vn_pick="max_unsat", vn_pick_tie_break=True))
         counts[name] = int(run(cls(settings, bundle=surface[0]), surface)["converge"].sum())
     print(f"Converged out of 1000: {counts}")
     assert counts["layered_lottery"] >= counts["layered"], counts

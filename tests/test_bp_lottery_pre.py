@@ -18,7 +18,7 @@ def surface(backend="cpu", algorithm="bp_lottery_pre", without_pre=False, **extr
         pytest.skip("CUDA not available")
     cfg = dict(device={"device_type": "cpu" if backend == "cpu" else "cuda"},
                dtype="float64", check_type="hx", max_iter=12, compile=False,
-               rebatch_opt=False, random_machine="sobol")
+               rebatch_opt=False, random_machine="sobol", vn_pick="max_unsat", vn_pick_tie_break=True)
     if algorithm == "bp_lottery_pre" and not without_pre:
         cfg["pre_parallel_max_lambda"] = 15
     cfg.update(extra)

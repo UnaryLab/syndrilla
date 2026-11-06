@@ -17,7 +17,7 @@ LOTTERY_CONFIG_KEYS = BASE_CONFIG_KEYS.union({
 
 STUDY_KNOBS = {
     "cn_pick": ("rand_unsat", "max_err_unsat", "all_unsat", "all"),
-    "vn_pick": ("max_unsat", "random"),
+    "vn_pick": ("min_llr", "max_unsat", "random"),
 }
 
 
@@ -122,7 +122,7 @@ def read_cn_pick_tie_break(cfg):
 
 
 def read_vn_pick_tie_break(cfg):
-    value = cfg.get("vn_pick_tie_break", True)
+    value = cfg.get("vn_pick_tie_break", False)
     if not isinstance(value, bool):
         raise ValueError("vn_pick_tie_break must be a bool")
     return value
@@ -174,6 +174,12 @@ def select_flip_vn(dec, unsat_cn_mask, l_v, e_v):
 
 def pick_vn(dec, candidate_vn_mask, vn_unsat_counts, llr):
     """Select one node from the candidate pool."""
+    if dec.vn_pick == "min_llr":
+        values = llr.masked_fill(~candidate_vn_mask, float("inf"))
+        tie = (values == values.min(dim=1, keepdim=True).values) & candidate_vn_mask
+        if dec.vn_pick_tie_break:
+            return vn_unsat_counts.masked_fill(~tie, -1).argmax(dim=1)
+        return tie.long().argmax(dim=1)
     batch_size = len(llr)
     count = vn_unsat_counts.masked_fill(~candidate_vn_mask, -1)
     tie = (count == count.max(dim=1, keepdim=True).values) & candidate_vn_mask
@@ -217,10 +223,12 @@ class create(PrePhase, _NmsPy):
             all_unsat selects from all VNs touching an unsatisfied CN
             all selects from every VN, with no syndrome filter
         cn_pick_tie_break: bool (default True), draws uniformly among max_err_unsat ties
-        vn_pick: max_unsat (default) | random
+        vn_pick: min_llr (default) | max_unsat | random
+            min_llr selects the VN with the smallest |LLR|, ties to most unsatisfied CNs
             max_unsat selects the VN with the most unsatisfied CNs, ties to min |LLR|
             random selects uniformly over the candidate set
-        vn_pick_tie_break: bool (default True), enables the second key; random ignores it
+        vn_pick_tie_break: bool (default False), enables the second key; random ignores it
+            remaining ties use the lowest VN index
     """
 
     _config_algorithm = "bp_lottery"
