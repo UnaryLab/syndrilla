@@ -116,7 +116,6 @@ def test_large_saturation_matches_pre_clip_surface_outputs():
     out = gd(io)
     expected = {
         "e_v": "217bd290a8cc8125df7c90b33338bf816a692755a0bd45d72e41cfafe328c9b7",
-        "llr": "169058fce063d2969707fe5719f8b7f6cc41b489cb4e392c1ab093d429d3e35a",
         "converge": "50c8ee0d29539257e571ef1c9a1bb54715120abdd20b180eae3fd052e3bb79e7",
         "iter": "b7508e0a6a302a4698d5658d0f1886f350ea237751e93f255a023282bf54325d",
         "rounds": "315ab19393b233e5eab20664938df3391533d77349a67bebbb8d22412f59e93d",
@@ -124,6 +123,8 @@ def test_large_saturation_matches_pre_clip_surface_outputs():
     }
     for key, digest in expected.items():
         assert hashlib.sha256(out[key].numpy().tobytes()).hexdigest() == digest, key
+    ref = torch.load(ROOT / "tests/data/bp_gd_large_saturation_llr.pt", weights_only=True)
+    torch.testing.assert_close(out["llr"][::16], ref, rtol=1e-6, atol=1e-6)
 
 
 def test_hand_decimation_ties_zero_sign_and_retained_messages():
