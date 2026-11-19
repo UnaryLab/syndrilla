@@ -5,7 +5,7 @@ from syndrilla.decoder.bp_lottery.bp_lottery import (
     flip_rows,
     is_flip_iter,
     rand_rows,
-    vn_unsat_count,
+    select_flip_vn,
 )
 from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant import (
     create as _QuantPy,
@@ -15,21 +15,22 @@ from syndrilla.decoder.bp_norm_min_sum_quant.bp_norm_min_sum_quant import (
 class create(_LotteryPy, _QuantPy):
     """
     Quantized lottery BP: bp_norm_min_sum_quant (rounding, eager or compiled step,
-    row compaction) with the quantized lottery sign-flip in _iter_hook from
-    iteration flip_start_iter + 1 on. The Sobol value of iteration i is
+    row compaction) with the quantized lottery sign-flip in _iter_hook during
+    lottery phases. The Sobol value of iteration i is
     fp2fxp(r[i - 1]).
 
-    Accepts every bp_norm_min_sum_quant key plus
+    Accepts every bp_norm_min_sum_quant and bp_lottery key, including
         random_machine: 'sobol' (default) | 'system'   RNG for the flip pick
-        flip_start_iter: int (default 4)                 flips start after this iteration
-        flip_interval: int >= 1 (default 1)              iterations between flips
     """
+
+    _config_algorithm = "bp_lottery_quant"
+    _config_keys = ("int_width", "frac_width")
 
     def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__(decoding_cfg, **kwargs)
         self.algo = "bp_lottery_quant"
 
-    def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
+    def _native_iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Sign-flip at the end of each flip iteration i (is_flip_iter) on the
         unconverged rows; the next iteration reads the flipped l_v. e_v may be in
         the decoder dtype or uint8 (CUDA port)."""
@@ -37,32 +38,25 @@ class create(_LotteryPy, _QuantPy):
             return
         self.i = i
         e_b = (e_v != 0).to(torch.uint8)
+        self._flip_e_v = e_b
         s_est = (e_b[:, self.V_c_col].sum(dim=2, dtype=torch.uint8) & 1).to(self.dtype)
         self.sign_flip(syndrome, s_est, l_v, active)
 
-    def sign_flip(self, syndrome, s_est, l_v, active):
-        """Flip the sign of one variable's LLR per row with an unsatisfied check:
-        the variable at position floor(r * (U - 1)) in the cumulative count of
-        unsatisfied checks per variable, U the total count."""
-        synd_diff = (syndrome + s_est) % 2.0
-
-        temp_ls = vn_unsat_count(synd_diff.float(), self.V_c_col, self.H_shape[1])
-
-        total_ones = temp_ls.sum(dim=1).to(self.dtype)
-
-        valid_mask = total_ones > 0
-
-        n = l_v.shape[0]
+    def _draw_r(self, n):
         if self.random_machine.lower() == "system":
-            r = rand_rows(self, n)
-        else:  # sobol
-            r = self._q(self.r[self.i - 1]).repeat(n)
+            return rand_rows(self, n)
+        if self.vn_pick == "random":
+            self.r_v[self.i - 1] = self._q(self.r_v[self.i - 1])
+        return self._q(self.r[self.i - 1]).repeat(n)
 
-        target = torch.where(valid_mask, torch.floor(r * (total_ones - 1)), 0.0)
-        target = target.unsqueeze(1)
-        cumsum_x = torch.cumsum(temp_ls, dim=1)
-        mask = cumsum_x >= target + 1
-        selected_indices = torch.argmax(mask.float(), dim=1)
-
-        flip_rows(l_v, selected_indices, valid_mask & active)
+    def sign_flip(self, syndrome, s_est, l_v, active):
+        """Select and flip VNs with the shared lottery rule."""
+        unsat_cn_mask = ((syndrome + s_est) % 2.0).bool()
+        chosen_cn_idx, selected_vn = select_flip_vn(
+            self, unsat_cn_mask, l_v, getattr(self, "_flip_e_v", None)
+        )
+        self.last_flip_cn = chosen_cn_idx
+        self.last_flip_vn = selected_vn
+        self.last_flip_valid = unsat_cn_mask.any(dim=1) & active
+        flip_rows(l_v, selected_vn, self.last_flip_valid)
         return l_v

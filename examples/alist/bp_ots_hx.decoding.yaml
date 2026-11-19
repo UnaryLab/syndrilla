@@ -1,0 +1,11 @@
+decoding:
+  algorithm: bp_ots
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    max_iter: 181
+    interval: 10
+    strength: 10.0

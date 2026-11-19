@@ -585,6 +585,8 @@ def _main(in_main_thread):
                     bt.converge_all[i],
                     bt.converge_all[i + 1],
                     i,
+                    iteration_serial=bt.iter_serial_all[i],
+                    iteration_parallel=bt.iter_parallel_all[i],
                 )
                 metrics.update_metric(i, batch_result)
 

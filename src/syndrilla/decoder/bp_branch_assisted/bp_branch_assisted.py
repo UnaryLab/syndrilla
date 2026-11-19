@@ -7,6 +7,7 @@ from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.bp_lottery.bp_lottery import vn_unsat_count
 from syndrilla.decoder.bp_norm_min_sum.bp_norm_min_sum_cuda import _build_vn_adj
 from syndrilla.decoder.relay_bp.relay_bp import _step, create as _RelayPy
+from syndrilla.decoder.knobs import BASE_CONFIG_KEYS, reject_unknown_keys
 
 
 class create(torch.nn.Module):
@@ -14,6 +15,10 @@ class create(torch.nn.Module):
     This class creates a bsfbp decoder on a single GPU
     based on this paper: Branch-Assisted Sign-Flipping Belief Propagation Decoding for Topological Quantum Codes Based on Hypergraph Product Structure
     """
+    _config_algorithm = "bp_branch_assisted"
+    _base_config_keys = BASE_CONFIG_KEYS
+    _config_keys = frozenset({"max_b_iter", "random_machine"})
+
     def __init__(self,
                  decoding_cfg,
                  **kwargs) -> None:
@@ -39,6 +44,10 @@ class create(torch.nn.Module):
         """
 
         super(create, self).__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
 
         logger.info('Creating bsfbp decoder.')
 

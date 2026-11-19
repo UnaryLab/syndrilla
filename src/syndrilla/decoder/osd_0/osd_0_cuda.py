@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, knob, reject_unknown_keys
 
 _EXT = None  # module-level cache; compiled once per Python process
 
@@ -129,30 +129,41 @@ class create(nn.Module):
         device:
           device_type : cuda           (only cuda is supported)
           device_idx  : int            (default: 0)
-        force_per_step  : bool         (optional; selects the modular debug path)
+        fused       : bool         (default true; false selects the modular path)
         workspace_bytes : int          (optional; GPU workspace cap per chunk, default 4 GiB)
-        osd_early_stop  : bool         (default true; false passes no syndrome to the
+        early_stop  : bool         (default true; false passes no syndrome to the
                                         scan, so it runs to rank(H); turns
-                                        osd_prefix_scan off)
-        osd_prefix_scan : bool         (default true; false sorts the whole order once)
-        osd_solve_by_pivots : bool     (default true; false eliminates over rank(H)
+                                        prefix_scan off)
+        prefix_scan : bool         (default true; false sorts the whole order once)
+        solve_by_pivots : bool     (default true; false eliminates over rank(H)
                                         columns instead of the largest pivot count)
-        osd_skip_converged : bool      (default true; false decodes every sample and
+        skip_converged : bool      (default true; false decodes every sample and
                                         keeps the result only where converge is 0)
-        osd_column_scan : bool         (default true; false skips the scan and
+        column_scan : bool         (default true; false skips the scan and
                                         eliminates over all N columns of the order)
         pruning_opt     : bool         (default true; false makes the defaults of
-                                        osd_early_stop, osd_prefix_scan,
-                                        osd_solve_by_pivots and osd_skip_converged
+                                        early_stop, prefix_scan,
+                                        solve_by_pivots and skip_converged
                                         false)
         memory_opt      : bool         (default true; false makes the defaults of
-                                        osd_column_scan false and of workspace_bytes
+                                        column_scan false and of workspace_bytes
                                         1 << 60)
-        fusion_opt, mapping_opt, gather_opt : no OSD members, ignored
     """
+
+    _config_algorithm = "osd_0"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset({
+        "fused", "workspace_bytes", "early_stop", "prefix_scan",
+        "solve_by_pivots", "skip_converged", "column_scan",
+        "packed_transform", "pruning_opt", "memory_opt",
+    })
 
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         logger.info("Creating osd_0_cuda decoder.")
 
         if not torch.cuda.is_available():
@@ -192,23 +203,23 @@ class create(nn.Module):
         self.H_shape = H_shape
         self.V_c_col = nn.Parameter(V_c_col.to(self.device), requires_grad=False)
         self.M, self.N = int(H_shape[0]), int(H_shape[1])
-        self.force_per_step = bool(decoding_cfg.get("force_per_step", False))
+        self.fused = bool(knob(decoding_cfg, "fused", True))
         self.workspace_bytes = int(knob(decoding_cfg, "workspace_bytes", 4 << 30))
-        self.osd_early_stop = bool(knob(decoding_cfg, "osd_early_stop", True))
-        self.osd_prefix_scan = (
-            bool(knob(decoding_cfg, "osd_prefix_scan", True)) and self.osd_early_stop
+        self.early_stop = bool(knob(decoding_cfg, "early_stop", True))
+        self.prefix_scan = (
+            bool(knob(decoding_cfg, "prefix_scan", True)) and self.early_stop
         )
-        self.osd_solve_by_pivots = bool(knob(decoding_cfg, "osd_solve_by_pivots", True))
-        self.osd_skip_converged = bool(knob(decoding_cfg, "osd_skip_converged", True))
-        self.osd_column_scan = bool(knob(decoding_cfg, "osd_column_scan", True))
+        self.solve_by_pivots = bool(knob(decoding_cfg, "solve_by_pivots", True))
+        self.skip_converged = bool(knob(decoding_cfg, "skip_converged", True))
+        self.column_scan = bool(knob(decoding_cfg, "column_scan", True))
         # Rows of T the pivot scan stores per sample (Tr, TuT); see _scan.
         self.pool_rows = min(self.M, max(64, (self.M + 5) // 6))
         self.pool_cols = min(self.M, max(64, (self.M + 2) // 3))
         # Columns of the reliability order the scan tries first, see forward;
-        # the whole order without osd_prefix_scan or osd_column_scan.
+        # the whole order without prefix_scan or column_scan.
         self.prefix = (
             self.N // 16
-            if self.N >= 1 << 14 and self.osd_prefix_scan and self.osd_column_scan
+            if self.N >= 1 << 14 and self.prefix_scan and self.column_scan
             else self.N
         )
         self.last_pivot_pos = (
@@ -292,8 +303,8 @@ class create(nn.Module):
         )
         nc = converge == 0 if defer is None else (converge == 0) & ~defer
         idx = nc.nonzero(as_tuple=True)[0].to(dev)
-        # samples OSD decodes: all non-deferred ones without osd_skip_converged
-        if self.osd_skip_converged:
+        # samples OSD decodes: all non-deferred ones without skip_converged
+        if self.skip_converged:
             run = idx
         elif defer is None:
             run = torch.arange(B, device=dev)
@@ -328,7 +339,7 @@ class create(nn.Module):
                     last = max(last, self.last_pivot_pos)
                 self.scan_stats, self.last_pivot_pos = stats, last
                 logger.debug("osd_0_cuda: (order width, samples solved): {}", stages)
-            e_v[idx] = e_sub if self.osd_skip_converged else e_sub[nc.to(dev)[run]]
+            e_v[idx] = e_sub if self.skip_converged else e_sub[nc.to(dev)[run]]
             iter_out = iter_out.to(dev)
             iter_out[idx] = self.num_max_iter
 
@@ -347,7 +358,7 @@ class create(nn.Module):
         """OSD-0 for every sample, in chunks that keep the GPU workspace under
         workspace_bytes: scan chunks sized by _scan_bytes, and elimination
         batches sized by the chunk's largest pivot count K (rank(H) without
-        osd_solve_by_pivots). Without osd_column_scan the chunks skip the scan and
+        solve_by_pivots). Without column_scan the chunks skip the scan and
         eliminate over all columns of order, and scan_stats is None."""
         B, M, N, rank = order.shape[0], self.M, self.N, self.A_rank
         e = torch.zeros(B, N, dtype=torch.uint8, device=self.device)
@@ -357,10 +368,10 @@ class create(nn.Module):
         stats = []
         for i in range(0, B, chunk):
             o, s = order[i : i + chunk], synd_u8[i : i + chunk]
-            if self.osd_column_scan:
-                # without osd_early_stop the scan gets no syndrome and never stops
+            if self.column_scan:
+                # without early_stop the scan gets no syndrome and never stops
                 piv_pos, found, stopped, end = self._scan(
-                    o, rank, s if self.osd_early_stop else None
+                    o, rank, s if self.early_stop else None
                 )
                 if o.shape[1] == N and bool(((found != rank) & ~stopped).any()):
                     raise RuntimeError("osd_0_cuda: pivot count differs from rank(H).")
@@ -371,7 +382,7 @@ class create(nn.Module):
                     self.last_pivot_pos = max(
                         self.last_pivot_pos, int(last[found > 0].max())
                     )
-                if not self.osd_solve_by_pivots:
+                if not self.solve_by_pivots:
                     K = rank
                 # Pivot columns in order; past a sample's own pivot count, column N
                 # (empty) pads the row to K.
@@ -513,7 +524,7 @@ class create(nn.Module):
         row_pcol = torch.full((B, M), -1, dtype=torch.int32, device=dev)
         found = torch.zeros(B, dtype=torch.int32, device=dev)
         if (
-            not self.force_per_step
+            self.fused
             and self._ext.fused_smem_bytes(M, Wk) <= self._smem_limit
         ):
             self._ext.osd0_fused(ws, row_pcol, found, K, rank, self._block_size)

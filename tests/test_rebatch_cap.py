@@ -63,7 +63,7 @@ def _bp(impl, bundle, frac=None, declined=None):
         dec = bp_py.create(_py_cfg("cuda-eager"), bundle=bundle)
     else:
         cfg = dict(device=DEV, check_type="hx", max_iter=MAX_ITER)
-        cfg["force_per_step"] = impl == "cuda-per_step"
+        cfg["persistent_kernel"] = impl == "cuda-persistent"
         dec = bp_gpu.create(cfg, bundle=bundle)
     dec.cap = None
     if frac is not None:
@@ -179,7 +179,7 @@ def test_osd_skips_deferred_rows(bp_out, osd, skip):
     rows, passes defer through, and matches the no-mask run on the other rows."""
     bundle, io, defer = bp_out
     dec = osd.create(
-        dict(device=DEV, dtype="float64", check_type="hx", osd_skip_converged=skip),
+        dict(device=DEV, dtype="float64", check_type="hx", skip_converged=skip),
         bundle=bundle,
     )
 

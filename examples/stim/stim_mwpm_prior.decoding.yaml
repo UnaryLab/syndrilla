@@ -8,4 +8,3 @@ decoding:
   config:
     # |llr0|: PyMatching Matching.from_detector_error_model(dem), or from_check_matrix(H, weights=log((1-p)/p))
     weights: prior
-    num_workers: 32

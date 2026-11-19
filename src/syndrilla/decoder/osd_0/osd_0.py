@@ -1,7 +1,7 @@
 import torch
 from loguru import logger
 
-from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, knob, reject_unknown_keys
 from syndrilla.decoder.osd_0.osd_0_cuda import create as _osd_0_cuda
 from syndrilla.utils import parse_device_dtype
 
@@ -33,31 +33,42 @@ class create(torch.nn.Module):
         workspace_bytes : int (optional, default 4 GiB; samples are sorted and
                           scanned in chunks whose working memory fits it, see
                           _scan_chunks; inputs and the [B, N] outputs are outside it)
-        osd_early_stop  : bool (default true; false scans the whole order and
-                          turns osd_prefix_scan off)
-        osd_prefix_scan : bool (default true; false sorts the whole order once)
-        osd_solve_by_pivots : bool (default true; false back-substitutes over
+        early_stop  : bool (default true; false scans the whole order and
+                          turns prefix_scan off)
+        prefix_scan : bool (default true; false sorts the whole order once)
+        solve_by_pivots : bool (default true; false back-substitutes over
                           M pivot slots instead of the largest pivot count)
-        osd_skip_converged : bool (default true; false decodes every sample and
+        skip_converged : bool (default true; false decodes every sample and
                           keeps the result only where converge is 0)
-        osd_column_scan : bool (default true; false runs a dense Gauss-Jordan
+        column_scan : bool (default true; false runs a dense Gauss-Jordan
                           on [H | s] over the whole order, see _gauss_jordan)
-        osd_packed_transform : bool (default true; false keeps T as a dense
+        packed_transform : bool (default true; false keeps T as a dense
                           bool matrix, see _scan_dense)
         pruning_opt     : bool (default true; false makes the defaults of
-                          osd_early_stop, osd_prefix_scan, osd_solve_by_pivots
-                          and osd_skip_converged false)
+                          early_stop, prefix_scan, solve_by_pivots
+                          and skip_converged false)
         memory_opt      : bool (default true; false makes the defaults of
-                          osd_column_scan and osd_packed_transform false and of
+                          column_scan and packed_transform false and of
                           workspace_bytes 1 << 60)
-        fusion_opt, mapping_opt, gather_opt : no OSD members, ignored
     """
+
+    _config_algorithm = "osd_0"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset({
+        "workspace_bytes", "early_stop", "prefix_scan",
+        "solve_by_pivots", "skip_converged", "column_scan",
+        "packed_transform", "pruning_opt", "memory_opt",
+    })
 
     def __init__(self,
                     decoding_cfg,
                     **kwargs) -> None:
 
         super(create, self).__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         logger.info('Creating osd-0 decoder.')
 
         # set up default device
@@ -79,16 +90,16 @@ class create(torch.nn.Module):
         self.num_max_iter = H_shape[1]
         self.cols = self._column_rows(bundle.select(check_type)[3].to(self.device))
         self.workspace_bytes = int(knob(decoding_cfg, 'workspace_bytes', 4 << 30))
-        self.osd_early_stop = bool(knob(decoding_cfg, 'osd_early_stop', True))
-        self.osd_prefix_scan = bool(knob(decoding_cfg, 'osd_prefix_scan', True)) and self.osd_early_stop
-        self.osd_solve_by_pivots = bool(knob(decoding_cfg, 'osd_solve_by_pivots', True))
-        self.osd_skip_converged = bool(knob(decoding_cfg, 'osd_skip_converged', True))
-        self.osd_column_scan = bool(knob(decoding_cfg, 'osd_column_scan', True))
-        self.osd_packed_transform = bool(knob(decoding_cfg, 'osd_packed_transform', True))
+        self.early_stop = bool(knob(decoding_cfg, 'early_stop', True))
+        self.prefix_scan = bool(knob(decoding_cfg, 'prefix_scan', True)) and self.early_stop
+        self.solve_by_pivots = bool(knob(decoding_cfg, 'solve_by_pivots', True))
+        self.skip_converged = bool(knob(decoding_cfg, 'skip_converged', True))
+        self.column_scan = bool(knob(decoding_cfg, 'column_scan', True))
+        self.packed_transform = bool(knob(decoding_cfg, 'packed_transform', True))
         # Columns of the reliability order the scan tries first, as in
-        # osd_0_cuda; the whole order without osd_prefix_scan or osd_column_scan.
+        # osd_0_cuda; the whole order without prefix_scan or column_scan.
         N = int(H_shape[1])
-        self.prefix = N // 16 if N >= 1 << 14 and self.osd_prefix_scan and self.osd_column_scan else N
+        self.prefix = N // 16 if N >= 1 << 14 and self.prefix_scan and self.column_scan else N
 
         logger.info('Complete.')
 
@@ -104,8 +115,8 @@ class create(torch.nn.Module):
         defer = io_dict['defer'].to(device=converge.device, dtype=torch.bool) if 'defer' in io_dict else None
         nc = converge == 0 if defer is None else (converge == 0) & ~defer
         idx = nc.nonzero(as_tuple=True)[0].to(device)
-        # samples OSD decodes: all non-deferred ones without osd_skip_converged
-        if self.osd_skip_converged:
+        # samples OSD decodes: all non-deferred ones without skip_converged
+        if self.skip_converged:
             run = idx
         else:
             run = torch.arange(B, device=device) if defer is None else (~defer).nonzero(as_tuple=True)[0].to(device)
@@ -130,7 +141,7 @@ class create(torch.nn.Module):
                 e_sub[redo], stopped[redo] = self._scan_chunks(llr_sub[redo], synd_sub[redo], width)
 
         final_result = io_dict['e_v'].clone().to(dtype=torch.uint8, device=device)
-        final_result[idx] = e_sub if self.osd_skip_converged else e_sub[nc.to(device)[run]]
+        final_result[idx] = e_sub if self.skip_converged else e_sub[nc.to(device)[run]]
         if idx.numel() > 0:
             iter_out = iter_out.to(device)
             iter_out[idx] = self.num_max_iter
@@ -174,15 +185,15 @@ class create(torch.nn.Module):
         16*D*U; the per-row vectors (a T column, its nonzero indices, the pivot
         rows and columns), 64*(M+1); the packed per-sample vectors, 48*U; and
         the order (its sort and the kept int64 copy) plus the uint8 estimate,
-        60*N. Without osd_packed_transform the chunks run _scan_dense, without
-        osd_column_scan _gauss_jordan, each sized by the bytes in its docstring."""
+        60*N. Without packed_transform the chunks run _scan_dense, without
+        column_scan _gauss_jordan, each sized by the bytes in its docstring."""
         M = synd.shape[1]
         N, D = self.cols.shape[0] - 1, self.cols.shape[1]
         U = (M >> 6) + 1  # bit M exists and stays zero
         cols = self.cols.to(synd.device)
-        if not self.osd_column_scan:
+        if not self.column_scan:
             scan, per_sample = self._gauss_jordan, 3 * M * (N + 1) + 60 * N
-        elif not self.osd_packed_transform:
+        elif not self.packed_transform:
             scan, per_sample = self._scan_dense, 2 * M * (M + 1) + M * D + 24 * M + 48 * N
         else:
             scan = self._scan
@@ -204,14 +215,14 @@ class create(torch.nn.Module):
         each k in T_p. Pivot rows are not updated, so the pivot rows of T @ H
         are upper triangular in pivot order. The reduced syndrome T @ s follows
         the same row operations, and a sample stops once it is zero on every
-        row without a pivot (never without osd_early_stop).
+        row without a pivot (never without early_stop).
 
         Solve: back substitution on the pivot rows. y starts as T @ s; the
         last pivot (in scan order) whose row holds a bit of y is final, so its
         column is set in e and y ^= T @ h_c. This repeats until y is zero on
         every pivot row: the loop runs the batch maximum of popcount(e) steps,
         with one host sync each. It reads the first K pivot slots, K the batch
-        maximum pivot count (M without osd_solve_by_pivots); the slots past a
+        maximum pivot count (M without solve_by_pivots); the slots past a
         sample's pivot count hold row M and column N, which are inert."""
         order = _osd_0_cuda._order_prefix(llr, width).long()
         B, W = order.shape
@@ -246,7 +257,7 @@ class create(torch.nn.Module):
         piv_r = torch.full((B, M + 1), M, dtype=torch.long, device=dev)
         piv_c = torch.full((B, M + 1), N, dtype=torch.long, device=dev)
         found = torch.zeros(B, dtype=torch.long, device=dev)
-        live = (sres != 0).any(1) | (not self.osd_early_stop)  # not yet stopped
+        live = (sres != 0).any(1) | (not self.early_stop)  # not yet stopped
         piece = max(1, B * (M + 1) // 4)  # T rows per update step
         j = 0
         while j < W and (j & 7 or bool(live.any())):
@@ -268,11 +279,11 @@ class create(torch.nn.Module):
             for a in range(0, bi.numel(), piece):
                 b_, k_ = bi[a:a + piece], ki[a:a + piece]
                 TuT[b_, k_] ^= v[b_]
-            live &= ((sres & alive) != 0).any(1) | (not self.osd_early_stop)
+            live &= ((sres & alive) != 0).any(1) | (not self.early_stop)
             j += 1
 
         e = torch.zeros(B, N + 1, dtype=torch.uint8, device=dev)
-        K = (int(found.max()) if self.osd_solve_by_pivots else M) if B else 0
+        K = (int(found.max()) if self.solve_by_pivots else M) if B else 0
         pr, pc = piv_r[:, :K], piv_c[:, :K]  # padded with row M / column N
         y = sres
         while K:
@@ -305,7 +316,7 @@ class create(torch.nn.Module):
         alive = torch.ones(B, M, dtype=torch.bool, device=dev)  # rows without a pivot
         # H column of each pivot row; N for rows without a pivot
         row_col = torch.full((B, M), N, dtype=torch.long, device=dev)
-        done = ~sres.any(1) & self.osd_early_stop
+        done = ~sres.any(1) & self.early_stop
         j = 0
         while j < W and not bool(done.all()):
             c = order[:, j]
@@ -323,7 +334,7 @@ class create(torch.nn.Module):
                 sres ^= v & sres[ar, p][:, None]
                 alive[ar[has], p[has]] = False
                 row_col[ar[has], p[has]] = c[has]
-                done |= ~(sres & alive).any(1) & self.osd_early_stop
+                done |= ~(sres & alive).any(1) & self.early_stop
             j += 1
         e = torch.zeros(B, N + 1, dtype=torch.uint8, device=dev)
         # rows without a pivot land in column N

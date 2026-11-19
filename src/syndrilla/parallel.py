@@ -86,8 +86,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from itertools import zip_longest
 
 import yaml
+
+_OPTIONAL_ITERATIONS = ("serial", "parallel")
 
 # flags of syndrilla.main that the launcher refuses, with the reason
 REFUSED = [
@@ -104,6 +107,8 @@ POOLED_NOTE = (
     "# by sample count; iteration distribution is recomputed from the summed iteration\n"
     "# count; average time per batch is total time over batch count; seed is null and\n"
     "# rebatch_opt is left out (not pooled).\n"
+    "# Optional serial/parallel iteration averages use their recorded histogram counts;\n"
+    "# when coverage is partial, only recorded samples contribute.\n"
 )
 
 
@@ -216,6 +221,8 @@ def pool_results(results):
                 out[name] = percentiles(hist)
             elif name == "rebatch_opt":
                 continue
+            elif name.endswith(tuple(f" {suffix}" for suffix in _OPTIONAL_ITERATIONS)):
+                continue
             elif name == "total time (s)":
                 out[name] = sum(float(e[name]) for e in entries)
             elif name == "average time per batch (s)":
@@ -224,6 +231,25 @@ def pool_results(results):
                 out[name] = {k: avg([e[name][k] for e in entries]) for k in value}
             else:
                 out[name] = avg([e[name] for e in entries])
+        for suffix in _OPTIONAL_ITERATIONS:
+            count_key = f"iteration count {suffix}"
+            mean_key = f"average iteration {suffix}"
+            recorded = [e for e in entries if count_key in e]
+            if recorded:
+                optional_hist = [
+                    sum(col) for col in zip_longest(
+                        *(e[count_key] for e in recorded), fillvalue=0
+                    )
+                ]
+                count = sum(optional_hist)
+                out[count_key] = optional_hist
+                out[f"iteration distribution {suffix}"] = (
+                    percentiles(optional_hist) if count else optional_hist
+                )
+                out[mean_key] = (
+                    sum(float(e[mean_key]) * sum(e[count_key]) for e in recorded) / count
+                    if count else 0.0
+                )
         pooled[key] = out
 
     full = dict(first["decoder_full"])

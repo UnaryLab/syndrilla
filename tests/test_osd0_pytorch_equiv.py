@@ -261,11 +261,11 @@ def test_cpu_chunked(ref, case):
         assert torch.equal(got, want) and torch.equal(got, r["e_v"]), f"prefix={prefix}"
 
 
-@pytest.mark.parametrize("group", ["pruning_opt", "memory_opt", "osd_packed_transform"])
+@pytest.mark.parametrize("group", ["pruning_opt", "memory_opt", "packed_transform"])
 @pytest.mark.parametrize("case", ["surface10", "inconsistent"])
 def test_cpu_group_off(ref, case, group):
-    """With `group` false (osd_packed_transform alone too, since memory_opt
-    also turns osd_column_scan off), e_v and iter equal the default run with a small
+    """With `group` false (packed_transform alone too, since memory_opt
+    also turns column_scan off), e_v and iter equal the default run with a small
     prefix (12 columns on surface10, 15 on the inconsistent H), so early stop
     and the prefix retry take a path there; every other sample is marked
     converged with a random input e_v."""
@@ -288,7 +288,7 @@ def test_cpu_group_off(ref, case, group):
     want = _run(on, synd, llr, H, converge.clone(), e_in.clone(), iter_in.clone())
     assert len(calls) > 1  # the prefix retry ran
     off = osd_cpu.create(dict(cpu, **{group: False}), bundle=bundle)
-    if group == "osd_packed_transform":
+    if group == "packed_transform":
         off.prefix = k
     got = _run(off, synd, llr, H, converge.clone(), e_in.clone(), iter_in.clone())
     for key in ("e_v", "iter"):
@@ -296,14 +296,16 @@ def test_cpu_group_off(ref, case, group):
 
 
 def test_cpu_knob_resolution():
-    """osd_early_stop false turns osd_prefix_scan off; a key written explicitly
-    wins over its group key; groups without OSD members are ignored."""
+    """early_stop false turns prefix_scan off; a key written explicitly
+    wins over its group key; groups without OSD members have no effect."""
     bundle = inconsistent_case()[0]
     cpu = {"device": {"device_type": "cpu"}}
-    dec = osd_cpu.create(dict(cpu, osd_early_stop=False), bundle=bundle)
-    assert not dec.osd_prefix_scan and dec.osd_solve_by_pivots
-    dec = osd_cpu.create(dict(cpu, pruning_opt=False, osd_skip_converged=True, mapping_opt=False), bundle=bundle)
-    assert not (dec.osd_early_stop or dec.osd_prefix_scan or dec.osd_solve_by_pivots)
-    assert dec.osd_skip_converged and dec.osd_column_scan
+    dec = osd_cpu.create(dict(cpu, early_stop=False), bundle=bundle)
+    assert not dec.prefix_scan and dec.solve_by_pivots
+    dec = osd_cpu.create(dict(cpu, pruning_opt=False, skip_converged=True), bundle=bundle)
+    assert not (dec.early_stop or dec.prefix_scan or dec.solve_by_pivots)
+    assert dec.skip_converged and dec.column_scan
     dec = osd_cpu.create(dict(cpu, memory_opt=False), bundle=bundle)
-    assert not (dec.osd_column_scan or dec.osd_packed_transform) and dec.workspace_bytes == 1 << 60
+    assert not (dec.column_scan or dec.packed_transform) and dec.workspace_bytes == 1 << 60
+    dec = osd_cpu.create(dict(cpu, mapping_opt=False), bundle=bundle)
+    assert dec.prefix_scan and dec.column_scan

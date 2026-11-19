@@ -38,6 +38,9 @@ class create(_BaseCuda):
         frac_width : int (default 4)   fractional bits
     """
 
+    _config_keys = ("int_width", "frac_width")
+    _config_algorithm = "bp_norm_min_sum_quant"
+
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__(decoding_cfg, **kwargs)
         self.intwidth = decoding_cfg.get("int_width", 3)

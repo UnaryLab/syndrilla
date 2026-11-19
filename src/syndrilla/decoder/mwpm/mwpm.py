@@ -7,15 +7,24 @@ import torch
 from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, reject_unknown_keys
 
 _MAX_PYMATCHING_WEIGHT = (1 << 24) - 1
 
 
 class create(torch.nn.Module):
-    """PyMatching v2 decoding; num_workers and mp_min_batch are accepted but unused."""
+    """PyMatching v2 decoding."""
+
+    _config_algorithm = "mwpm"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset({"weights", "skip_converged"})
 
     def __init__(self, decoding_cfg, **kwargs):
         super().__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         logger.info("Creating mwpm decoder (PyMatching).")
 
         self.weights = decoding_cfg.get("weights", "prior")

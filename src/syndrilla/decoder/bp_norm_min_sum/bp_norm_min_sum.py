@@ -5,7 +5,7 @@ from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
 from syndrilla.decoder.decoder import RebatchSpeedup
-from syndrilla.decoder.knobs import knob
+from syndrilla.decoder.knobs import BASE_CONFIG_KEYS, knob, reject_unknown_keys
 
 # compact the per-iteration state to the unconverged samples once fewer than this
 # fraction of the rows decoded since the last compaction are still unconverged
@@ -58,6 +58,10 @@ class create(torch.nn.Module):
     MRO supplies the hooks.
     """
 
+    _base_config_keys = BASE_CONFIG_KEYS
+    _config_keys = ()
+    _config_algorithm = "bp_norm_min_sum"
+
     def _iter_hook(self, i, l_v, e_v, active, syndrome) -> None:
         """Called at the end of iteration i, after the convergence update and the
         early-exit checks (so not on the iteration that breaks the loop: all rows
@@ -94,6 +98,8 @@ class create(torch.nn.Module):
 
         Parameters:
             max_iter: the number of maximum iteration of bp decoder
+            early_termination: bool, default True. False runs all max_iter
+                iterations and returns the final state for every sample.
             i: the number of iterations running the decoder
 
             H_matrix: loaded ldpc matrix, either hx or hz, as 2d tensor
@@ -127,6 +133,10 @@ class create(torch.nn.Module):
                 every iteration and compacts by plain indexing.
         """
 
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         super(create, self).__init__()
 
         logger.info("Creating bp decoder.")
@@ -218,7 +228,12 @@ class create(torch.nn.Module):
         self.algo = "bp_norm_min_sum"
         self.num_max_iter = self.max_iter
 
-        self.cap = RebatchSpeedup.from_cfg(decoding_cfg)
+        self.early_termination = decoding_cfg.get("early_termination", True)
+        if not isinstance(self.early_termination, bool):
+            raise ValueError("early_termination must be a bool")
+        self.cap = (
+            RebatchSpeedup.from_cfg(decoding_cfg) if self.early_termination else None
+        )
         self.cap_bypass = False  # set by main: True -> decode this batch uncapped
         self.cap_active_last = False  # set per forward: True if the cap stopped early
 
@@ -423,6 +438,13 @@ class create(torch.nn.Module):
 
                 s_est = self.syndrome_estimation(e_v)
 
+            if not self.early_termination:
+                if hooked:
+                    self._hook_rows = rows
+                    active = ~torch.all(s_est == syndrome, dim=1)
+                    self._iter_hook(self.i, l_v, e_v, active, syndrome)
+                continue
+
             # different samples from the same batch may terminated at different iteration (pick the smallest one)
             indices = torch.all(s_est == syndrome, 1).nonzero()
             checker = torch.where(it_rows == -1.0)[0]
@@ -493,6 +515,8 @@ class create(torch.nn.Module):
         e_out[dst] = e_v[checker]
         l_out[dst] = l_v[checker]
         num_iters[dst] = self.i  # actual stop iter (== max_iter unless the cap broke early)
+        if not self.early_termination:
+            converges[:] = torch.all(s_est == syndrome, dim=1)
         self._exit_hook(l_out, e_out, num_iters, converges)
         self.cap_active_last = cap_stopped
         # rows main drops and decodes again: the unconverged rows of a batch the

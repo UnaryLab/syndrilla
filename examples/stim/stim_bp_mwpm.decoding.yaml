@@ -8,4 +8,3 @@ decoding:
   config:
     - max_iter: 50
     - weights: posterior
-      num_workers: 32

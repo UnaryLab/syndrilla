@@ -1,0 +1,16 @@
+decoding:
+  algorithm: bp_sf_lottery
+  check_type: hz
+  dtype: float64
+  device:
+    device_type: cuda
+    device_idx: 0
+  config:
+    max_iter: 100
+    random_machine: sobol
+    # syndrome-flipping (SF) post-processing on samples BP leaves unconverged
+    sf:
+      topk: 50      # number of most-oscillating bits used as flip candidates
+      w_min: 1      # minimum flip weight
+      w_max: 10     # maximum flip weight
+      n_sample: 10  # max combinations sampled per weight

@@ -1,0 +1,10 @@
+decoding:
+  algorithm: bp_gd
+  check_type: hx
+  dtype: float64
+  device:
+    device_type: cpu
+  config:
+    max_iter: 181
+    round_iters: 10
+    llr_max: 25

@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn as nn
 from loguru import logger
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, reject_unknown_keys
 
 _EXT = None  # module-level cache; compiled once per Python process
 
@@ -84,8 +85,16 @@ class create(nn.Module):
     # cap the per-launch scratch tensor (bytes) so large batches chunk instead of OOM
     _SCRATCH_BUDGET_BYTES = 256 * 1024 * 1024
 
+    _config_algorithm = "union_find"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset()
+
     def __init__(self, decoding_cfg: dict, **kwargs) -> None:
         super().__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         logger.info("Creating union_find_cuda decoder.")
 
         if not torch.cuda.is_available():

@@ -7,6 +7,7 @@ import torch
 from loguru import logger
 
 from syndrilla.utils import parse_device_dtype
+from syndrilla.decoder.knobs import SHARED_CONFIG_KEYS, reject_unknown_keys
 
 Edge = Tuple[int, int]  # always (min(u,v), max(u,v)), matching C++ Edge{u,v}
 
@@ -415,8 +416,16 @@ def decode_shot(lattice: Lattice, syndrome) -> np.ndarray:
 class create(torch.nn.Module):
     """Union-Find decoder consuming one of the bundle's Hx/Hz (toric/graphlike) matrices."""
 
+    _config_algorithm = "union_find"
+    _base_config_keys = SHARED_CONFIG_KEYS
+    _config_keys = frozenset()
+
     def __init__(self, decoding_cfg, **kwargs) -> None:
         super().__init__()
+        reject_unknown_keys(
+            decoding_cfg, self._base_config_keys.union(self._config_keys),
+            decoding_cfg.get("algorithm", self._config_algorithm),
+        )
         logger.info("Creating union-find decoder.")
 
         self.device, _ = parse_device_dtype(decoding_cfg)
